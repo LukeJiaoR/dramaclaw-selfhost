@@ -47,20 +47,44 @@ def test_dc_image_2_selection_maps_to_newapi_gpt_image2(monkeypatch, tmp_path):
     monkeypatch.setenv("NEWAPI_API_KEY", "newapi-token")
     monkeypatch.setenv("NEWAPI_BASE_URL", "http://newapi.test/v1")
     monkeypatch.setenv("NEWAPI_IMAGE_MODEL", "LingShan-G2")
+    monkeypatch.setenv("PROP_REF_IMAGE_MODEL", "LingShan-G2")
     monkeypatch.setenv("DEFAULT_CHARACTER_IMAGE_SELECTION", "newapi_gpt_image2")
 
     import novelvideo.config as config
 
     config = importlib.reload(config)
 
-    assert config.character_image_selection_options()["newapi_gpt_image2"] == "LingShan-G2"
+    assert (
+        config.character_image_selection_options()["newapi_gpt_image2"] == "LingShan-G2"
+    )
     assert config.get_character_image_selection() == "newapi_gpt_image2"
 
-    image_config = config.get_grid_generation_config(selection_override="newapi_gpt_image2")
+    image_config = config.get_grid_generation_config(
+        selection_override="newapi_gpt_image2"
+    )
     assert image_config["provider"] == "newapi"
     assert image_config["api_key"] == "newapi-token"
     assert image_config["base_url"] == "http://newapi.test/v1"
     assert image_config["model"] == "LingShan-G2"
+
+
+def test_provider_hub_image_selection_uses_independent_gateway(monkeypatch):
+    import importlib
+    import novelvideo.config as config
+
+    monkeypatch.setenv("PROVIDER_HUB_BASE_URL", "http://provider-hub.test/v1")
+    monkeypatch.setenv("PROVIDER_HUB_IMAGE_MODEL", "DC-image")
+    monkeypatch.setenv("DEFAULT_CHARACTER_IMAGE_SELECTION", "provider_hub_image")
+
+    config = importlib.reload(config)
+    image_config = config.get_grid_generation_config(
+        selection_override="provider_hub_image"
+    )
+
+    assert image_config["provider"] == "openai"
+    assert image_config["model"] == "DC-image"
+    assert image_config["base_url"] == "http://provider-hub.test/v1"
+    assert image_config["api_key"] == "provider-hub-local"
 
 
 def test_dc_banana_2_selection_maps_to_newapi_nanobanana2(monkeypatch, tmp_path):
@@ -74,10 +98,15 @@ def test_dc_banana_2_selection_maps_to_newapi_nanobanana2(monkeypatch, tmp_path)
 
     config = importlib.reload(config)
 
-    assert config.character_image_selection_options()["newapi_nanobanana2"] == "LingShan-NB-2"
+    assert (
+        config.character_image_selection_options()["newapi_nanobanana2"]
+        == "LingShan-NB-2"
+    )
     assert config.get_character_image_selection() == "newapi_nanobanana2"
 
-    image_config = config.get_grid_generation_config(selection_override="newapi_nanobanana2")
+    image_config = config.get_grid_generation_config(
+        selection_override="newapi_nanobanana2"
+    )
     assert image_config["provider"] == "newapi"
     assert image_config["api_key"] == "newapi-token"
     assert image_config["base_url"] == "http://newapi.test/v1"
@@ -93,6 +122,7 @@ def test_fixed_asset_image_providers_default_to_newapi_when_env_is_empty(monkeyp
     ):
         monkeypatch.setenv(key, "")
     monkeypatch.setenv("NEWAPI_IMAGE_MODEL", "LingShan-G2")
+    monkeypatch.setenv("PROP_REF_IMAGE_MODEL", "LingShan-G2")
 
     import novelvideo.config as config
 
@@ -110,7 +140,9 @@ def test_fixed_asset_image_providers_default_to_newapi_when_env_is_empty(monkeyp
 
     assert nanobanana_prop.resolve_prop_reference_image_model() == "LingShan-G2"
     assert scene_reference_images._scene_image_provider("master", None) == "newapi"
-    assert scene_reference_images._scene_image_provider("reverse_master", None) == "newapi"
+    assert (
+        scene_reference_images._scene_image_provider("reverse_master", None) == "newapi"
+    )
 
 
 def test_newapi_sketch_config_defaults_to_dc_image2_low_quality(monkeypatch):
@@ -178,7 +210,9 @@ def test_newapi_sketch_config_defaults_to_dc_image2_low_quality(monkeypatch):
 
     assert image_bytes == b"sketch"
     assert error == ""
-    assert posted["timeout"] == nanobanana_grid.NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS == 1800.0
+    assert (
+        posted["timeout"] == nanobanana_grid.NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS == 1800.0
+    )
     assert posted["json"]["model"] == "LingShan-G2"
     assert posted["json"]["quality"] == "low"
     assert (posted["json"]["width"], posted["json"]["height"]) == (688, 1024)
@@ -835,7 +869,11 @@ def test_newapi_image_call_preserves_reference_image_extensions(monkeypatch):
                 ("face.jpg", b"jpg-bytes", "image/jpeg"),
                 (b"webp-bytes", "image/webp"),
             ],
-            image_config={"aspect_ratio": "3:4", "image_size": "1K", "quality": "medium"},
+            image_config={
+                "aspect_ratio": "3:4",
+                "image_size": "1K",
+                "quality": "medium",
+            },
             base_url="http://newapi.test/v1",
         )
     )
@@ -878,7 +916,9 @@ def test_newapi_image_http_error_logs_redacted_request_context(monkeypatch, capl
         def raise_for_status(self):
             raise httpx.HTTPStatusError(
                 "bad response",
-                request=httpx.Request("POST", "http://newapi.test/v1/images/generations"),
+                request=httpx.Request(
+                    "POST", "http://newapi.test/v1/images/generations"
+                ),
                 response=self,
             )
 
@@ -905,8 +945,12 @@ def test_newapi_image_http_error_logs_redacted_request_context(monkeypatch, capl
         async def reserve_current_model_call_credit(self, **_kwargs):
             return "reservation_1"
 
-        async def refund_model_call_credit_reservation(self, reservation_id, *, metadata=None):
-            refunds.append({"reservation_id": reservation_id, "metadata": metadata or {}})
+        async def refund_model_call_credit_reservation(
+            self, reservation_id, *, metadata=None
+        ):
+            refunds.append(
+                {"reservation_id": reservation_id, "metadata": metadata or {}}
+            )
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setattr(nanobanana_grid, "upload_image_bytes", fake_upload_image_bytes)
@@ -919,7 +963,11 @@ def test_newapi_image_http_error_logs_redacted_request_context(monkeypatch, capl
             model="LingShan-G2",
             prompt="sensitive prompt body",
             reference_images=[b"ref-a"],
-            image_config={"aspect_ratio": "2:1", "image_size": "2K", "quality": "medium"},
+            image_config={
+                "aspect_ratio": "2:1",
+                "image_size": "2K",
+                "quality": "medium",
+            },
             base_url="http://newapi.test/v1",
         )
     )
@@ -975,7 +1023,9 @@ def test_newapi_image_http_5xx_does_not_retry_in_app(monkeypatch):
         def raise_for_status(self):
             raise httpx.HTTPStatusError(
                 "bad gateway",
-                request=httpx.Request("POST", "http://newapi.test/v1/images/generations"),
+                request=httpx.Request(
+                    "POST", "http://newapi.test/v1/images/generations"
+                ),
                 response=self,
             )
 
@@ -1001,7 +1051,11 @@ def test_newapi_image_http_5xx_does_not_retry_in_app(monkeypatch):
             api_key="newapi-token",
             model="LingShan-G2",
             prompt="retry prompt",
-            image_config={"aspect_ratio": "2:1", "image_size": "2K", "quality": "medium"},
+            image_config={
+                "aspect_ratio": "2:1",
+                "image_size": "2K",
+                "quality": "medium",
+            },
             base_url="http://newapi.test/v1",
         )
     )
@@ -1101,7 +1155,9 @@ def test_newapi_character_portrait_reraises_insufficient_credit(monkeypatch, tmp
         )
 
 
-def test_newapi_character_portrait_raise_on_error_preserves_provider_detail(monkeypatch, tmp_path):
+def test_newapi_character_portrait_raise_on_error_preserves_provider_detail(
+    monkeypatch, tmp_path
+):
     import novelvideo.config as config
     from novelvideo.generators import image_generator, nanobanana_character
 
@@ -1154,7 +1210,9 @@ def test_newapi_scene_master_uses_text_only_nanobanana2(monkeypatch, tmp_path):
         fake_call_newapi_image_api,
     )
     monkeypatch.setattr(scene_reference_images, "SCENE_MASTER_IMAGE_PROVIDER", "newapi")
-    monkeypatch.setattr(scene_reference_images, "SCENE_MASTER_IMAGE_MODEL", "LingShan-NB-2")
+    monkeypatch.setattr(
+        scene_reference_images, "SCENE_MASTER_IMAGE_MODEL", "LingShan-NB-2"
+    )
 
     scene = NovelScene(
         name="古董店",
@@ -1188,7 +1246,9 @@ def test_newapi_scene_master_uses_text_only_nanobanana2(monkeypatch, tmp_path):
     assert "从店门可以直接看到收银台" in captured["prompt"]
 
 
-def test_newapi_scene_time_plate_master_injects_time_and_base_reference(monkeypatch, tmp_path):
+def test_newapi_scene_time_plate_master_injects_time_and_base_reference(
+    monkeypatch, tmp_path
+):
     from novelvideo.generators import scene_reference_images
     from novelvideo.models import NovelScene
 
@@ -1209,7 +1269,9 @@ def test_newapi_scene_time_plate_master_injects_time_and_base_reference(monkeypa
     )
     _patch_scene_newapi_gateway(monkeypatch)
     monkeypatch.setattr(scene_reference_images, "SCENE_MASTER_IMAGE_PROVIDER", "newapi")
-    monkeypatch.setattr(scene_reference_images, "SCENE_MASTER_IMAGE_MODEL", "LingShan-NB-2")
+    monkeypatch.setattr(
+        scene_reference_images, "SCENE_MASTER_IMAGE_MODEL", "LingShan-NB-2"
+    )
 
     scene = NovelScene(
         name="古董店_夜晚",
@@ -1237,7 +1299,9 @@ def test_newapi_scene_time_plate_master_injects_time_and_base_reference(monkeypa
     assert "Keep the same architecture" in captured["prompt"]
 
 
-def test_newapi_scene_variant_plate_master_keeps_described_lighting(monkeypatch, tmp_path):
+def test_newapi_scene_variant_plate_master_keeps_described_lighting(
+    monkeypatch, tmp_path
+):
     from novelvideo.generators import scene_reference_images
     from novelvideo.models import NovelScene
 
@@ -1258,7 +1322,9 @@ def test_newapi_scene_variant_plate_master_keeps_described_lighting(monkeypatch,
     )
     _patch_scene_newapi_gateway(monkeypatch)
     monkeypatch.setattr(scene_reference_images, "SCENE_MASTER_IMAGE_PROVIDER", "newapi")
-    monkeypatch.setattr(scene_reference_images, "SCENE_MASTER_IMAGE_MODEL", "LingShan-NB-2")
+    monkeypatch.setattr(
+        scene_reference_images, "SCENE_MASTER_IMAGE_MODEL", "LingShan-NB-2"
+    )
 
     scene = NovelScene(
         name="城市街道_雨夜版",
@@ -1276,7 +1342,9 @@ def test_newapi_scene_variant_plate_master_keeps_described_lighting(monkeypatch,
         )
     )
 
-    assert output_path == tmp_path / "assets" / "scenes" / "城市街道_雨夜版" / "master.png"
+    assert (
+        output_path == tmp_path / "assets" / "scenes" / "城市街道_雨夜版" / "master.png"
+    )
     assert captured["reference_images"] == [
         ("base_scene_master_master.png", b"base-master-bytes", "image/png")
     ]
@@ -1308,7 +1376,9 @@ def test_newapi_reverse_master_uses_master_reference_nanobanana2(monkeypatch, tm
         fake_call_newapi_image_api,
     )
     _patch_scene_newapi_gateway(monkeypatch)
-    monkeypatch.setattr(scene_reference_images, "SCENE_REVERSE_MASTER_IMAGE_PROVIDER", "newapi")
+    monkeypatch.setattr(
+        scene_reference_images, "SCENE_REVERSE_MASTER_IMAGE_PROVIDER", "newapi"
+    )
     monkeypatch.setattr(
         scene_reference_images,
         "SCENE_REVERSE_MASTER_IMAGE_MODEL",
@@ -1332,7 +1402,9 @@ def test_newapi_reverse_master_uses_master_reference_nanobanana2(monkeypatch, tm
         )
     )
 
-    assert output_path == tmp_path / "assets" / "scenes" / "古董店" / "reverse_master.png"
+    assert (
+        output_path == tmp_path / "assets" / "scenes" / "古董店" / "reverse_master.png"
+    )
     assert output_path.read_bytes() == b"scene-reverse"
     assert captured["api_key"] == "newapi-token"
     assert captured["base_url"] == "http://newapi.test/v1"
@@ -1369,7 +1441,9 @@ def test_newapi_reverse_master_can_use_gpt_image2_quality_medium(monkeypatch, tm
         fake_call_newapi_image_api,
     )
     _patch_scene_newapi_gateway(monkeypatch)
-    monkeypatch.setattr(scene_reference_images, "SCENE_REVERSE_MASTER_IMAGE_PROVIDER", "newapi")
+    monkeypatch.setattr(
+        scene_reference_images, "SCENE_REVERSE_MASTER_IMAGE_PROVIDER", "newapi"
+    )
     monkeypatch.setattr(
         scene_reference_images,
         "SCENE_REVERSE_MASTER_IMAGE_MODEL",
@@ -1538,7 +1612,9 @@ def test_newapi_prop_reference_reraises_insufficient_credit(monkeypatch, tmp_pat
     monkeypatch.setenv("PROP_REF_IMAGE_MODEL", "LingShan-G2")
     importlib.reload(config)
     nanobanana_prop = importlib.reload(nanobanana_prop)
-    monkeypatch.setattr(nanobanana_prop, "_call_newapi_image_api", fake_call_newapi_image_api)
+    monkeypatch.setattr(
+        nanobanana_prop, "_call_newapi_image_api", fake_call_newapi_image_api
+    )
     monkeypatch.setattr(
         nanobanana_prop,
         "get_grid_generation_config",
@@ -1602,7 +1678,7 @@ def test_freezone_single_image_generation_routes_newapi(monkeypatch, tmp_path):
         "aspect_ratio": "1:1",
         "image_size": "2K",
         "quality": "medium",
-    "request_schema": {},
+        "request_schema": {},
         "model_params": {},
     }
 

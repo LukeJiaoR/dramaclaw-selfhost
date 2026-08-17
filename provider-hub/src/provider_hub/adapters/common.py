@@ -45,9 +45,7 @@ def auth_headers(service: ServiceConfig) -> dict[str, str]:
 
 def response_headers(headers: httpx.Headers) -> dict[str, str]:
     return {
-        key: value
-        for key, value in headers.items()
-        if key.lower() not in HOP_HEADERS
+        key: value for key, value in headers.items() if key.lower() not in HOP_HEADERS
     }
 
 

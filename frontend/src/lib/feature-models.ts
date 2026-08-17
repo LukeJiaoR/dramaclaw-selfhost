@@ -33,6 +33,7 @@ export const FEATURE_MODEL_GROUPS: readonly FeatureModelGroup[] = [
         requiresVision: true,
       },
       { id: "SEEDANCE2_PROMPT_COMPOSER", defaultModel: "DC-seedance2-prompt-composer-LLM" },
+      { id: "VIDEO_PROMPT_TRANSLATOR", defaultModel: "DC-video-prompt-translator-LLM" },
     ],
   },
   {
@@ -41,6 +42,11 @@ export const FEATURE_MODEL_GROUPS: readonly FeatureModelGroup[] = [
       {
         id: "GLOBAL_VIDEO_IDENTITY_DETECTOR",
         defaultModel: "DC-video-identity-detector-LLM",
+        requiresVision: true,
+      },
+      {
+        id: "SKETCH_GATE",
+        defaultModel: "DC-sketch-visual-gate-LLM",
         requiresVision: true,
       },
     ],
@@ -100,7 +106,24 @@ export const FEATURE_MODEL_GROUPS: readonly FeatureModelGroup[] = [
   },
   {
     key: "directorWorld",
-    features: [{ id: "STAGING_PROP", defaultModel: "DC-staging-prop-planner-LLM" }],
+    features: [
+      { id: "STAGING_PROP", defaultModel: "DC-staging-prop-planner-LLM" },
+      {
+        id: "BLOCK_WORLD",
+        defaultModel: "DC-block-world-builder-LLM",
+        requiresVision: true,
+      },
+      {
+        id: "SCENE_OVERLAP",
+        defaultModel: "DC-scene-overlap-analyzer-LLM",
+        requiresVision: true,
+      },
+      {
+        id: "SCENE_SPATIAL_CONTRACT",
+        defaultModel: "DC-scene-spatial-contract-LLM",
+        requiresVision: true,
+      },
+    ],
   },
   {
     key: "novelImport",
@@ -143,7 +166,9 @@ export const FEATURE_MODEL_PRODUCT_GROUPS: readonly FeatureModelGroup[] = [
     features: [
       productFeature("GLOBAL_VIDEO_OPTIMIZER"),
       productFeature("SEEDANCE2_PROMPT_COMPOSER"),
+      productFeature("VIDEO_PROMPT_TRANSLATOR"),
       productFeature("GLOBAL_VIDEO_IDENTITY_DETECTOR"),
+      productFeature("SKETCH_GATE"),
       productFeature("IDENTITY_PLANNER_CAST"),
       productFeature("IDENTITY_PLANNER_ANALYSIS"),
       productFeature("IDENTITY_PLANNER_APPEARANCE"),
@@ -152,6 +177,9 @@ export const FEATURE_MODEL_PRODUCT_GROUPS: readonly FeatureModelGroup[] = [
       productFeature("EPISODE_PROP_PLANNER"),
       productFeature("EPISODE_SCENE_RECONCILE"),
       productFeature("NARRATED_SCENE_ASSET"),
+      productFeature("BLOCK_WORLD"),
+      productFeature("SCENE_OVERLAP"),
+      productFeature("SCENE_SPATIAL_CONTRACT"),
     ],
   },
   { key: "xiadao", features: [productFeature("HERMES")] },

@@ -801,13 +801,7 @@ def resolve_model_config(args: argparse.Namespace) -> tuple[str, str, str | None
     provider = (
         os.environ.get("BLOCK_WORLD_MODEL_PROVIDER") or os.environ.get("MODEL_PROVIDER") or "openai"
     ).lower()
-    model = (
-        args.model
-        or os.environ.get("BLOCK_WORLD_MODEL")
-        or os.environ.get("OPENAI_TEXT_MODEL")
-        or os.environ.get("MODEL_NAME")
-        or "gpt-5.4"
-    )
+    model = args.model or os.environ.get("BLOCK_WORLD_MODEL") or "DC-block-world-builder-LLM"
     base_url = (
         args.base_url
         or os.environ.get("BLOCK_WORLD_BASE_URL")
@@ -835,6 +829,10 @@ def resolve_model_config(args: argparse.Namespace) -> tuple[str, str, str | None
         )
 
     api_key = next((value for value in key_candidates if value), "")
+    if not api_key:
+        from novelvideo.llm_gateway import get_llm_gateway_credentials
+
+        api_key, base_url = get_llm_gateway_credentials()
     return model, api_key, base_url
 
 
@@ -902,8 +900,8 @@ def main() -> None:
         model, api_key, base_url = resolve_model_config(args)
         if not api_key:
             raise SystemExit(
-                "Model API key is missing; set BLOCK_WORLD_API_KEY / OPENROUTER_API_KEY / "
-                "OPENAI_API_KEY, or use --prompt-only / --from-code for offline testing"
+                "Text/vision gateway API key is missing; configure Provider Hub, or use "
+                "--prompt-only / --from-code for offline testing"
             )
         image_path = Path(args.image) if args.image else None
         if image_path is not None and not image_path.exists():

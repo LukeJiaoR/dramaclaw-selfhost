@@ -14,6 +14,9 @@ from novelvideo.config import (
     NEWAPI_NANOBANANA2_MODEL,
     OPENAI_API_KEY,
     OPENAI_IMAGE_MODEL,
+    PROVIDER_HUB_API_KEY,
+    PROVIDER_HUB_BASE_URL,
+    PROVIDER_HUB_IMAGE_MODEL,
     OPENROUTER_API_KEY,
     OPENROUTER_GPT_IMAGE2_MODEL,
     SCENE_ASSET_MODEL,
@@ -121,7 +124,9 @@ def _master_references(
     base_scene_id = str(getattr(scene, "base_scene_id", "") or "").strip()
     if not base_scene_id:
         return []
-    base_ref = _reference_tuple_from_path(_scene_dir(project_dir, base_scene_id) / "master.png")
+    base_ref = _reference_tuple_from_path(
+        _scene_dir(project_dir, base_scene_id) / "master.png"
+    )
     if base_ref is None:
         return []
     return [(f"base_scene_master_{base_ref[0]}", base_ref[1], base_ref[2])]
@@ -379,7 +384,9 @@ def _reverse_master_prompt(
     is_exterior = scene_type in {"exterior", "outdoor", "outside", "nature", "street"}
     location_word = "outdoor location" if is_exterior else "interior space"
     space_word = "location" if is_exterior else "room"
-    back_word = "back side / opposite side of the location" if is_exterior else "back wall"
+    back_word = (
+        "back side / opposite side of the location" if is_exterior else "back wall"
+    )
     side_word = "flanking environment" if is_exterior else "side walls"
 
     if has_master_reference:
@@ -560,8 +567,14 @@ def _scene_image_model(
         if kind in {"master", "reverse_master"}:
             return NEWAPI_NANOBANANA2_MODEL
         return SCENE_ASSET_MODEL or NEWAPI_IMAGE_MODEL
+    if provider == "provider_hub":
+        return PROVIDER_HUB_IMAGE_MODEL
     if provider == "openai":
-        return SCENE_ASSET_MODEL or os.environ.get("SCENE_ASSET_OPENAI_MODEL") or OPENAI_IMAGE_MODEL
+        return (
+            SCENE_ASSET_MODEL
+            or os.environ.get("SCENE_ASSET_OPENAI_MODEL")
+            or OPENAI_IMAGE_MODEL
+        )
     if provider in {"huimeng", "huimengi"}:
         return SCENE_ASSET_MODEL or HUIMENG_IMAGE_MODEL
     return (
@@ -656,8 +669,12 @@ async def generate_scene_reference_image(
     )
     provider = _scene_image_provider(kind, provider)
 
-    if provider == "openai":
-        api_key = OPENAI_API_KEY or ""
+    if provider in {"openai", "provider_hub"}:
+        api_key = (
+            PROVIDER_HUB_API_KEY or "provider-hub-local"
+            if provider == "provider_hub"
+            else OPENAI_API_KEY or ""
+        )
         selected_model = _scene_image_model(kind, provider, model)
         image_bytes, _text, error = await _call_openai_image_api(
             api_key=api_key,
@@ -665,6 +682,7 @@ async def generate_scene_reference_image(
             prompt=prompt,
             reference_images=references or None,
             image_config=_scene_image_config(selected_model),
+            base_url=PROVIDER_HUB_BASE_URL if provider == "provider_hub" else None,
         )
     elif provider == "newapi":
         from novelvideo.config import get_effective_newapi_gateway_config

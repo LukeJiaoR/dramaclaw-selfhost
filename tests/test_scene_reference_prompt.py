@@ -57,7 +57,9 @@ def test_scene_reference_prompt_keeps_variant_delta_out_of_scene_description():
     assert "地面湿润有积水" not in scene_description
 
 
-async def test_scene_reference_newapi_uses_normalized_gateway_base_url(monkeypatch, tmp_path):
+async def test_scene_reference_newapi_uses_normalized_gateway_base_url(
+    monkeypatch, tmp_path
+):
     from novelvideo.generators import scene_reference_images
 
     captured: dict[str, str | None] = {}
@@ -82,6 +84,7 @@ async def test_scene_reference_newapi_uses_normalized_gateway_base_url(monkeypat
         project_dir=tmp_path,
         scene=NovelScene(name="Hall", environment_prompt="wide hall"),
         kind="master",
+        provider="newapi",
     )
 
     assert captured["base_url"] == "https://relayclaw.cdnfg.com/v1"

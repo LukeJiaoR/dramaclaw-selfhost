@@ -101,15 +101,21 @@ def get_pydantic_model(
             model name. The request transport remains NewAPI.
         model_name_override: Override the model name sent to NewAPI.
     """
-    provider = (provider_override or os.environ.get("MODEL_PROVIDER", "volcengine")).lower()
+    provider = (
+        provider_override or os.environ.get("MODEL_PROVIDER", "volcengine")
+    ).lower()
     provider = PROVIDER_ALIASES.get(provider, provider)
 
     if provider not in PROVIDER_PRESETS:
         available = list(PROVIDER_PRESETS.keys()) + list(PROVIDER_ALIASES.keys())
-        raise ValueError(f"Unknown provider: {provider}. " f"Available: {', '.join(available)}")
+        raise ValueError(
+            f"Unknown provider: {provider}. Available: {', '.join(available)}"
+        )
 
     preset = PROVIDER_PRESETS[provider]
-    model_name = model_name_override or os.environ.get("MODEL_NAME", preset["default_model"])
+    model_name = model_name_override or os.environ.get(
+        "MODEL_NAME", preset["default_model"]
+    )
 
     if provider == "openrouter" and model_name.startswith("openrouter/"):
         model_name = model_name[len("openrouter/") :]
@@ -386,7 +392,9 @@ OSS_STATIC_REQUIRE_READY = os.environ.get("OSS_STATIC_REQUIRE_READY", "1") not i
     "False",
     "",
 }
-OSS_STATIC_READY_PROBE_ATTEMPTS = int(os.environ.get("OSS_STATIC_READY_PROBE_ATTEMPTS", "3"))
+OSS_STATIC_READY_PROBE_ATTEMPTS = int(
+    os.environ.get("OSS_STATIC_READY_PROBE_ATTEMPTS", "3")
+)
 OSS_STATIC_READY_PROBE_DELAY_SECONDS = float(
     os.environ.get("OSS_STATIC_READY_PROBE_DELAY_SECONDS", "0.15")
 )
@@ -398,7 +406,9 @@ OSS_STATIC_PRESIGN_EXPIRES = int(os.environ.get("OSS_STATIC_PRESIGN_EXPIRES", "3
 # IndexTTS2 配置
 # =============================================================================
 
-INDEXTTS2_PROVIDER = os.environ.get("INDEXTTS2_PROVIDER", "newapi").strip().lower() or "newapi"
+INDEXTTS2_PROVIDER = (
+    os.environ.get("INDEXTTS2_PROVIDER", "newapi").strip().lower() or "newapi"
+)
 if INDEXTTS2_PROVIDER not in {"newapi", "fal"}:
     INDEXTTS2_PROVIDER = "newapi"
 FAL_API_KEY = os.environ.get("FAL_API_KEY", "") or os.environ.get("FAL_KEY", "")
@@ -467,7 +477,9 @@ def get_newapi_runtime_credentials(
 
 INDEXTTS2_NEWAPI_MODEL = os.environ.get("INDEXTTS2_NEWAPI_MODEL", "index-tts-2")
 INDEXTTS2_RECORD_PROVIDER = "newapi" if INDEXTTS2_PROVIDER == "newapi" else "fal.ai"
-INDEXTTS2_RECORD_MODEL = INDEXTTS2_NEWAPI_MODEL if INDEXTTS2_PROVIDER == "newapi" else "IndexTTS2"
+INDEXTTS2_RECORD_MODEL = (
+    INDEXTTS2_NEWAPI_MODEL if INDEXTTS2_PROVIDER == "newapi" else "IndexTTS2"
+)
 NEWAPI_IMAGE_MODEL = os.environ.get("NEWAPI_IMAGE_MODEL", "LingShan-G2")
 NEWAPI_NANOBANANA2_MODEL = os.environ.get("NEWAPI_NANOBANANA2_MODEL", "LingShan-NB-2")
 SCENE_MASTER_IMAGE_PROVIDER = (
@@ -475,9 +487,12 @@ SCENE_MASTER_IMAGE_PROVIDER = (
 )
 SCENE_MASTER_IMAGE_MODEL = os.environ.get("SCENE_MASTER_IMAGE_MODEL", "")
 SCENE_REVERSE_MASTER_IMAGE_PROVIDER = (
-    os.environ.get("SCENE_REVERSE_MASTER_IMAGE_PROVIDER", "").strip().lower() or "newapi"
+    os.environ.get("SCENE_REVERSE_MASTER_IMAGE_PROVIDER", "").strip().lower()
+    or "newapi"
 )
-SCENE_REVERSE_MASTER_IMAGE_MODEL = os.environ.get("SCENE_REVERSE_MASTER_IMAGE_MODEL", "")
+SCENE_REVERSE_MASTER_IMAGE_MODEL = os.environ.get(
+    "SCENE_REVERSE_MASTER_IMAGE_MODEL", ""
+)
 SCENE_360_IMAGE_PROVIDER = (
     os.environ.get("SCENE_360_IMAGE_PROVIDER", "").strip().lower() or "newapi"
 )
@@ -492,9 +507,9 @@ PROP_REF_IMAGE_MODEL = os.environ.get("PROP_REF_IMAGE_MODEL", "")
 # 火山引擎图像生成配置
 # =============================================================================
 
-VOLCENGINE_VISUAL_API_KEY = os.environ.get("VOLCENGINE_VISUAL_API_KEY") or os.environ.get(
-    "ARK_API_KEY"
-)
+VOLCENGINE_VISUAL_API_KEY = os.environ.get(
+    "VOLCENGINE_VISUAL_API_KEY"
+) or os.environ.get("ARK_API_KEY")
 VOLCENGINE_VISUAL_ENDPOINT = os.environ.get(
     "VOLCENGINE_VISUAL_ENDPOINT", "https://ark.cn-beijing.volces.com/api/v3"
 )
@@ -548,7 +563,9 @@ def get_style_preset(
 # LLM 临时媒体中转（给 newAPI/视觉模型拉取本地参考图）
 # =============================================================================
 
-MEDIA_RELAY_PROVIDER = os.environ.get("MEDIA_RELAY_PROVIDER", "aliyun_oss").strip().lower()
+MEDIA_RELAY_PROVIDER = (
+    os.environ.get("MEDIA_RELAY_PROVIDER", "aliyun_oss").strip().lower()
+)
 MEDIA_RELAY_TTL_SECONDS = int(os.environ.get("MEDIA_RELAY_TTL_SECONDS", "1800"))
 
 OSS_RELAY_ENDPOINT = os.environ.get("OSS_RELAY_ENDPOINT", "oss-cn-chengdu.aliyuncs.com")
@@ -589,7 +606,9 @@ def get_image_config() -> dict:
     from novelvideo.services.style_service import StyleService
 
     all_styles = StyleService.list_all_styles()
-    style_presets = {s["id"]: StyleService.get_legacy_style_preset(s["id"]) for s in all_styles}
+    style_presets = {
+        s["id"]: StyleService.get_legacy_style_preset(s["id"]) for s in all_styles
+    }
 
     return {
         "api_key": VOLCENGINE_VISUAL_API_KEY,
@@ -636,8 +655,12 @@ COSYVOICE_SPEECH_RATE = float(os.environ.get("COSYVOICE_SPEECH_RATE", "1.2"))
 TTS_CHARS_PER_SECOND = float(os.environ.get("TTS_CHARS_PER_SECOND", "5.8"))
 
 # Dialogue beat TTS 配置（角色台词使用不同语速）
-COSYVOICE_DIALOGUE_SPEECH_RATE = float(os.environ.get("COSYVOICE_DIALOGUE_SPEECH_RATE", "1.0"))
-TTS_DIALOGUE_CHARS_PER_SECOND = float(os.environ.get("TTS_DIALOGUE_CHARS_PER_SECOND", "4.45"))
+COSYVOICE_DIALOGUE_SPEECH_RATE = float(
+    os.environ.get("COSYVOICE_DIALOGUE_SPEECH_RATE", "1.0")
+)
+TTS_DIALOGUE_CHARS_PER_SECOND = float(
+    os.environ.get("TTS_DIALOGUE_CHARS_PER_SECOND", "4.45")
+)
 
 
 def get_tts_config() -> dict:
@@ -734,8 +757,12 @@ NEWAPI_VIDEO_DURATION_BOUNDS = os.environ.get(
 VIDEO_BACKEND = os.environ.get("VIDEO_BACKEND", f"newapi_{DEFAULT_VIDEO_MODEL}")
 
 # Seedance 模型（火山方舟）
-SEEDANCE_FAST_MODEL = os.environ.get("SEEDANCE_FAST_MODEL", "doubao-seedance-1-0-pro-fast-251015")
-SEEDANCE_PRO_MODEL = os.environ.get("SEEDANCE_PRO_MODEL", "doubao-seedance-1-5-pro-251215")
+SEEDANCE_FAST_MODEL = os.environ.get(
+    "SEEDANCE_FAST_MODEL", "doubao-seedance-1-0-pro-fast-251015"
+)
+SEEDANCE_PRO_MODEL = os.environ.get(
+    "SEEDANCE_PRO_MODEL", "doubao-seedance-1-5-pro-251215"
+)
 
 # HuiMeng 视频聚合 API
 HUIMENGI_BASE_URL = os.environ.get("HUIMENGI_BASE_URL", "https://api.huimengi.com")
@@ -753,7 +780,11 @@ COMFYUI_VIDEO_URL = os.environ.get("COMFYUI_VIDEO_URL", "http://localhost:9527")
 COMFYUI_WORKFLOW = os.environ.get("COMFYUI_WORKFLOW", "gguf")
 
 # ComfyUI 是否使用 SSL（HTTPS/WSS），云服务器通常需要开启
-COMFYUI_USE_SSL = os.environ.get("COMFYUI_USE_SSL", "false").lower() in ("true", "1", "yes")
+COMFYUI_USE_SSL = os.environ.get("COMFYUI_USE_SSL", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # 默认视频分辨率（竖屏）
 VIDEO_RESOLUTION = os.environ.get("VIDEO_RESOLUTION", "720x1280")
@@ -810,6 +841,12 @@ def get_video_config() -> dict:
 GOOGLE_AI_API_KEY = os.environ.get("GOOGLE_AI_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+PROVIDER_HUB_BASE_URL = (
+    os.environ.get("PROVIDER_HUB_BASE_URL", "http://host.docker.internal:18001/v1")
+    .strip()
+    .rstrip("/")
+)
+PROVIDER_HUB_API_KEY = os.environ.get("PROVIDER_HUB_API_KEY", "")
 HUIMENGI_API_KEY = os.environ.get("HUIMENGI_API_KEY")
 OPENROUTER_GPT_IMAGE2_MODEL = os.environ.get(
     "OPENROUTER_GPT_IMAGE2_MODEL", "openai/gpt-5.4-image-2"
@@ -826,8 +863,11 @@ NANOBANANA_PROVIDER = os.environ.get("NANOBANANA_PROVIDER", "openrouter")
 
 NANOBANANA_MODEL = os.environ.get("NANOBANANA_MODEL", "gemini-3.1-flash-image-preview")
 OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
+PROVIDER_HUB_IMAGE_MODEL = os.environ.get("PROVIDER_HUB_IMAGE_MODEL", "DC-image")
 HUIMENG_IMAGE_MODEL = os.environ.get("HUIMENG_IMAGE_MODEL", "image-2")
-HUIMENG_IMAGE_OFFICIAL_MODEL = os.environ.get("HUIMENG_IMAGE_OFFICIAL_MODEL", "image-2-official")
+HUIMENG_IMAGE_OFFICIAL_MODEL = os.environ.get(
+    "HUIMENG_IMAGE_OFFICIAL_MODEL", "image-2-official"
+)
 HUIMENG_NANOBANANA2_MODEL = os.environ.get("HUIMENG_NANOBANANA2_MODEL", "nb-2")
 SCENE_360_PROVIDER = os.environ.get("SCENE_360_PROVIDER") or NANOBANANA_PROVIDER
 SCENE_360_HUIMENG_MODEL = os.environ.get("SCENE_360_HUIMENG_MODEL", HUIMENG_IMAGE_MODEL)
@@ -838,16 +878,21 @@ OPENAI_SKETCH_IMAGE_QUALITY = os.environ.get("OPENAI_SKETCH_IMAGE_QUALITY", "low
 _DEFAULT_SKETCH_SELECTION_EXPLICIT = "DEFAULT_SKETCH_IMAGE_SELECTION" in os.environ
 _DEFAULT_RENDER_SELECTION_EXPLICIT = "DEFAULT_RENDER_IMAGE_SELECTION" in os.environ
 DEFAULT_SKETCH_IMAGE_SELECTION = os.environ.get(
-    "DEFAULT_SKETCH_IMAGE_SELECTION", "newapi_gpt_image2"
+    "DEFAULT_SKETCH_IMAGE_SELECTION", "provider_hub_image"
 )
 DEFAULT_RENDER_IMAGE_SELECTION = os.environ.get(
-    "DEFAULT_RENDER_IMAGE_SELECTION", "newapi_gpt_image2"
+    "DEFAULT_RENDER_IMAGE_SELECTION", "provider_hub_image"
 )
-CHARACTER_IMAGE_SELECTION = os.environ.get("CHARACTER_IMAGE_SELECTION") or os.environ.get(
-    "DEFAULT_CHARACTER_IMAGE_SELECTION"
-)
+CHARACTER_IMAGE_SELECTION = os.environ.get(
+    "CHARACTER_IMAGE_SELECTION"
+) or os.environ.get("DEFAULT_CHARACTER_IMAGE_SELECTION")
 
 IMAGE_GENERATION_SELECTIONS: dict[str, dict[str, str]] = {
+    "provider_hub_image": {
+        "label": "Provider Hub",
+        "provider": "provider_hub",
+        "model": PROVIDER_HUB_IMAGE_MODEL,
+    },
     "huimeng_gpt_image2": {
         "label": "HuiMeng GPT Image 2",
         "provider": "huimeng",
@@ -891,6 +936,7 @@ IMAGE_GENERATION_SELECTIONS: dict[str, dict[str, str]] = {
 }
 
 VISIBLE_IMAGE_GENERATION_SELECTION_KEYS = (
+    "provider_hub_image",
     "newapi_gpt_image2",
     "newapi_nanobanana2",
 )
@@ -970,7 +1016,10 @@ def _visible_image_generation_selection(value: str | None) -> str:
     ):
         return candidate
     alias = LEGACY_IMAGE_GENERATION_SELECTION_ALIASES.get(candidate)
-    if alias in VISIBLE_IMAGE_GENERATION_SELECTION_KEYS and alias in IMAGE_GENERATION_SELECTIONS:
+    if (
+        alias in VISIBLE_IMAGE_GENERATION_SELECTION_KEYS
+        and alias in IMAGE_GENERATION_SELECTIONS
+    ):
         return alias
     return ""
 
@@ -980,7 +1029,7 @@ def _default_image_generation_selection(fallback: str | None = None) -> str:
         fallback,
         DEFAULT_SKETCH_IMAGE_SELECTION,
         DEFAULT_RENDER_IMAGE_SELECTION,
-        "newapi_gpt_image2",
+        "provider_hub_image",
         *VISIBLE_IMAGE_GENERATION_SELECTION_KEYS,
     ):
         selection = _visible_image_generation_selection(candidate)
@@ -1000,7 +1049,9 @@ def normalize_image_generation_selection(
     return _default_image_generation_selection(fallback)
 
 
-def image_generation_selection_label(value: str | None, *, fallback: str | None = None) -> str:
+def image_generation_selection_label(
+    value: str | None, *, fallback: str | None = None
+) -> str:
     selection = normalize_image_generation_selection(value, fallback=fallback)
     return IMAGE_GENERATION_SELECTIONS[selection]["label"]
 
@@ -1049,7 +1100,9 @@ def infer_image_generation_selection(
         return "huimeng_gpt_image2"
     if provider_norm == "huimeng" and model_norm == "image-2-official":
         return "huimeng_image2_official"
-    return normalize_image_generation_selection(fallback, fallback=DEFAULT_SKETCH_IMAGE_SELECTION)
+    return normalize_image_generation_selection(
+        fallback, fallback=DEFAULT_SKETCH_IMAGE_SELECTION
+    )
 
 
 def _image_provider_config(
@@ -1073,7 +1126,11 @@ def _image_provider_config(
             if not NANOBANANA_MODEL.startswith("google/")
             else NANOBANANA_MODEL
         )
-        return {"provider": provider, "api_key": OPENROUTER_API_KEY, "model": resolved_model}
+        return {
+            "provider": provider,
+            "api_key": OPENROUTER_API_KEY,
+            "model": resolved_model,
+        }
     if provider in {"huimeng", "huimengi"}:
         return {
             "provider": "huimeng",
@@ -1086,6 +1143,14 @@ def _image_provider_config(
             "api_key": OPENAI_API_KEY,
             "model": model or OPENAI_IMAGE_MODEL,
         }
+    if provider == "provider_hub":
+        return {
+            "provider": "openai",
+            # The OpenAI SDK requires a non-empty key even when Hub auth is disabled.
+            "api_key": PROVIDER_HUB_API_KEY or "provider-hub-local",
+            "model": model or PROVIDER_HUB_IMAGE_MODEL,
+            "base_url": PROVIDER_HUB_BASE_URL,
+        }
     if provider == "newapi":
         gateway = get_effective_newapi_gateway_config()
         return {
@@ -1095,7 +1160,11 @@ def _image_provider_config(
             "base_url": gateway.base_url,
         }
 
-    return {"provider": "google", "api_key": GOOGLE_AI_API_KEY, "model": model or NANOBANANA_MODEL}
+    return {
+        "provider": "google",
+        "api_key": GOOGLE_AI_API_KEY,
+        "model": model or NANOBANANA_MODEL,
+    }
 
 
 def get_grid_generation_config(

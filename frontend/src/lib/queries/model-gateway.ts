@@ -538,7 +538,7 @@ export function useClearComfyUIConfig() {
   });
 }
 
-/** 更新 NewAPI 中已存在的供应商渠道 key / Base URL，不改模型映射。 */
+/** 更新当前模型网关中已存在的供应商服务凭据，不改模型映射。 */
 export function useSyncProviderChannel() {
   const qc = useQueryClient();
   return useMutation({
@@ -558,7 +558,7 @@ export function useSyncProviderChannel() {
   });
 }
 
-/** 写入单个 NewAPI 渠道。 */
+/** 写入单个功能模型渠道；Provider Hub 模式会生成精确模型路由。 */
 export function useSaveCustomChannel() {
   const qc = useQueryClient();
   return useMutation({
@@ -626,7 +626,7 @@ export function useSaveMediaRelayConfig() {
   });
 }
 
-/** 批量写入 NewAPI 渠道（功能模型映射保存）。后端支持部分成功。 */
+/** 批量写入功能模型渠道；Provider Hub 模式会生成精确模型路由。 */
 export function useSaveCustomChannelsBatch() {
   const qc = useQueryClient();
   return useMutation({

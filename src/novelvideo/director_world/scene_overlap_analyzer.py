@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import io
 import json
 import os
@@ -13,10 +12,10 @@ import re
 from pathlib import Path
 from typing import Any
 
-import httpx
 from PIL import Image, ImageDraw, ImageFont
 
 from novelvideo.config import OUTPUT_DIR
+from novelvideo.llm_gateway import call_llm_gateway
 
 # Demo defaults for standalone/manual runs. In production stage_asset_tasks
 # always passes absolute --master/--reverse/--output-dir, so these are never used.
@@ -26,7 +25,7 @@ DEFAULT_SCENE_DIR = PROJECT_DIR / "assets/scenes" / DEFAULT_SCENE_NAME
 DEFAULT_MASTER = DEFAULT_SCENE_DIR / "master.png"
 DEFAULT_REVERSE = DEFAULT_SCENE_DIR / "reverse_master.png"
 DEFAULT_OUTPUT_DIR = DEFAULT_SCENE_DIR / "overlap_continuation_test"
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "DC-scene-overlap-analyzer-LLM"
 
 
 def load_env() -> None:
@@ -228,48 +227,25 @@ but still classify the join.
 """.strip()
 
 
-async def ask_openrouter(*, image_path: Path, prompt: str, api_key: str, model: str) -> str:
-    image_bytes = image_path.read_bytes()
-    data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
-    payload = {
-        "model": model,
-        "temperature": 0.0,
-        "max_tokens": 2200,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://supertale.local/scene-overlap",
-        "X-Title": "SuperTale Scene Overlap Analyzer",
-    }
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        response.raise_for_status()
-        data = response.json()
-    choices = data.get("choices") or []
-    if not choices:
-        return ""
-    content = (choices[0].get("message") or {}).get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        return "".join(
-            str(part.get("text") or "") for part in content if isinstance(part, dict)
-        ).strip()
-    return ""
+async def ask_openrouter(
+    *,
+    image_path: Path,
+    prompt: str,
+    api_key: str,
+    model: str,
+    base_url: str | None = None,
+) -> str:
+    return await call_llm_gateway(
+        prompt=prompt,
+        image_paths=[image_path],
+        model=model,
+        api_key_override=api_key or None,
+        base_url_override=base_url,
+        temperature=0.0,
+        max_tokens=2200,
+        response_format={"type": "json_object"},
+        timeout_seconds=120.0,
+    )
 
 
 def parse_json(text: str) -> dict[str, Any]:
@@ -444,14 +420,14 @@ async def run(args: argparse.Namespace) -> None:
     prompt = build_prompt(args.scene_name)
     (output_dir / "overlap_continuation_prompt.txt").write_text(prompt, encoding="utf-8")
 
-    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY") or ""
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is missing")
     raw_text = await ask_openrouter(
         image_path=sheet_path,
         prompt=prompt,
-        api_key=api_key,
+        api_key=args.api_key,
         model=args.model,
+        base_url=(args.base_url or "https://openrouter.ai/api/v1")
+        if args.api_key
+        else None,
     )
     (output_dir / "overlap_continuation_raw_response.txt").write_text(raw_text, encoding="utf-8")
     analysis = parse_json(raw_text)
@@ -480,8 +456,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master", default=str(DEFAULT_MASTER))
     parser.add_argument("--reverse", default=str(DEFAULT_REVERSE))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--model", default=os.environ.get("OPENROUTER_VISION_MODEL", DEFAULT_MODEL))
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("SCENE_OVERLAP_MODEL", DEFAULT_MODEL),
+    )
     parser.add_argument("--api-key", default="")
+    parser.add_argument("--base-url", default="")
     parser.add_argument("--edge-ratio", type=float, default=0.36)
     return parser.parse_args()
 

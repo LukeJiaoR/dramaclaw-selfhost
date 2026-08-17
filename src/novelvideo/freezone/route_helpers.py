@@ -20,13 +20,23 @@ from novelvideo.api.schemas import (
     FreezoneTemplateEditRequest,
 )
 from novelvideo.config import IMAGE_GENERATION_SELECTIONS
-from novelvideo.freezone.paths import resolve_static_url_to_path, safe_upload_filename, uploads_dir
+from novelvideo.freezone.paths import (
+    resolve_static_url_to_path,
+    safe_upload_filename,
+    uploads_dir,
+)
 from novelvideo.freezone.video_node import load_video_character_library
 from novelvideo.task_identity import task_state_key
 
-FREEZONE_DEFAULT_IMAGE_SELECTION = "newapi_gpt_image2"
+FREEZONE_DEFAULT_IMAGE_SELECTION = "provider_hub_image"
 FREEZONE_DEFAULT_IMAGE_MODEL = FREEZONE_DEFAULT_IMAGE_SELECTION
-SUPPORTED_FREEZONE_IMAGE_PROVIDERS = {"huimeng", "newapi", "openrouter", "openai"}
+SUPPORTED_FREEZONE_IMAGE_PROVIDERS = {
+    "huimeng",
+    "newapi",
+    "openrouter",
+    "openai",
+    "provider_hub",
+}
 FREEZONE_IMAGE_CAMERA_OPTIONS = {
     "camera_bodies": [
         {"id": "panavision_dxl2", "label": "Panavision DXL2"},
@@ -257,13 +267,15 @@ FREEZONE_IMAGE_STYLE_TEMPLATES = [
 ]
 
 
-def resolve_freezone_image_provider(provider: Optional[str], *, strict: bool = True) -> str:
+def resolve_freezone_image_provider(
+    provider: Optional[str], *, strict: bool = True
+) -> str:
     """把 Freezone 图片 provider 归一化到当前支持的 SuperTale 范围内。"""
     if provider and provider.strip():
         normalized = provider.strip().lower()
         if normalized not in SUPPORTED_FREEZONE_IMAGE_PROVIDERS:
             if not strict:
-                return "newapi"
+                return "provider_hub"
             raise HTTPException(
                 400,
                 "unsupported freezone image provider: "
@@ -271,7 +283,7 @@ def resolve_freezone_image_provider(provider: Optional[str], *, strict: bool = T
             )
         return normalized
 
-    return "newapi"
+    return "provider_hub"
 
 
 def new_freezone_job_id() -> str:
@@ -310,7 +322,9 @@ def accepted_job_response(
         "data": {
             "task_type": task_type,
             "job_id": job_id,
-            "task_key": task_state_key(task_type, username, project, episode=0, scope=job_id),
+            "task_key": task_state_key(
+                task_type, username, project, episode=0, scope=job_id
+            ),
         },
     }
 
@@ -346,7 +360,9 @@ def build_camera_prompt(camera: Optional[FreezoneImageCameraConfig]) -> str:
     )
 
 
-def merge_prompt_with_camera(prompt: str, camera: Optional[FreezoneImageCameraConfig]) -> str:
+def merge_prompt_with_camera(
+    prompt: str, camera: Optional[FreezoneImageCameraConfig]
+) -> str:
     camera_block = build_camera_prompt(camera)
     base = (prompt or "").strip()
     if base and camera_block:
@@ -356,7 +372,9 @@ def merge_prompt_with_camera(prompt: str, camera: Optional[FreezoneImageCameraCo
     return base
 
 
-def resolve_freezone_image_style_template(style: Optional[FreezoneImageStyleConfig]) -> Optional[dict]:
+def resolve_freezone_image_style_template(
+    style: Optional[FreezoneImageStyleConfig],
+) -> Optional[dict]:
     if style is None:
         return None
     template_id = str(style.template_id or "").strip()
@@ -398,7 +416,9 @@ def load_video_character_items_by_ids(project_dir: Path, ids: list[str]) -> list
     mapping = {str(item.get("id")): item for item in items}
     missing = [item_id for item_id in ids if item_id not in mapping]
     if missing:
-        raise HTTPException(404, f"video character library item not found: {missing[0]}")
+        raise HTTPException(
+            404, f"video character library item not found: {missing[0]}"
+        )
     return [mapping[item_id] for item_id in ids]
 
 
@@ -445,7 +465,9 @@ def start_freezone_gen_job(
     reference_paths = resolve_url_list(project_dir, reference_urls)
     ensure_existing_paths(reference_paths, field_name="reference")
 
-    raise HTTPException(503, "freezone gen task requires project task backend（当前 runner: Celery）")
+    raise HTTPException(
+        503, "freezone gen task requires project task backend（当前 runner: Celery）"
+    )
 
 
 def start_freezone_edit_job(
@@ -474,7 +496,9 @@ def start_freezone_edit_job(
     extra_paths = resolve_url_list(project_dir, extra_reference_urls)
     ensure_existing_paths(extra_paths, field_name="reference")
 
-    raise HTTPException(503, "freezone edit task requires project task backend（当前 runner: Celery）")
+    raise HTTPException(
+        503, "freezone edit task requires project task backend（当前 runner: Celery）"
+    )
 
 
 def notes_suffix(*, style: str, notes: str, user_prompt: str) -> str:
@@ -635,7 +659,9 @@ RELIGHTING CONTRACT:
 
 
 def build_template_edit_prompt(body: FreezoneTemplateEditRequest) -> str:
-    user_block = f"\n\nUser prompt:\n{body.prompt.strip()}" if body.prompt.strip() else ""
+    user_block = (
+        f"\n\nUser prompt:\n{body.prompt.strip()}" if body.prompt.strip() else ""
+    )
     templates: dict[str, tuple[str, str]] = {
         "multi_camera_nine_grid": (
             "original",
@@ -895,7 +921,10 @@ def resolve_outpaint_aspect_ratio(source_path: Path, target_aspect_ratio: str) -
     current_ratio = width / height
     closest_ratio = min(
         supported_ratios,
-        key=lambda ratio: abs((parse_aspect_ratio(ratio)[0] / parse_aspect_ratio(ratio)[1]) - current_ratio),
+        key=lambda ratio: abs(
+            (parse_aspect_ratio(ratio)[0] / parse_aspect_ratio(ratio)[1])
+            - current_ratio
+        ),
     )
     return closest_ratio
 

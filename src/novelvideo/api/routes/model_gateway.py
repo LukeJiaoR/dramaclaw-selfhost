@@ -38,6 +38,11 @@ from novelvideo.official_media_catalog_remote import (
     check_official_media_catalog_update,
 )
 from novelvideo.model_gateway_runtime import refresh_model_gateway_runtime
+from novelvideo.provider_hub_admin import (
+    is_provider_hub_gateway,
+    sync_provider_hub_channel_payload,
+    update_provider_hub_service_credentials,
+)
 from novelvideo.shared.runtime_env import is_ce_effective
 from novelvideo.media_model_request_schema import validate_media_model_catalog_config
 from novelvideo.newapi_provisioner import (
@@ -948,17 +953,27 @@ async def sync_custom_newapi_provider_channel(
             if body.base_url is not None
             else saved_channel.get("baseUrl", "")
         )
-        cfg = _get_provisioner_config_from_request(body.new_api_base_url, body.database)
-        admin = ensure_admin_access_token(cfg)
-        update_kwargs: dict[str, Any] = {
-            "provider": provider,
-            "upstream_key": upstream_key,
-            "base_url": base_url,
-        }
-        saved_channel_type = int(saved_channel.get("type") or 0)
-        if saved_channel_type > 0:
-            update_kwargs["channel_type"] = saved_channel_type
-        result = update_provider_channel_credentials(cfg, admin, **update_kwargs)
+        if is_provider_hub_gateway(body.new_api_base_url):
+            result = await update_provider_hub_service_credentials(
+                gateway_base_url=str(body.new_api_base_url or ""),
+                provider=provider,
+                upstream_key=upstream_key,
+                upstream_base_url=str(base_url or ""),
+            )
+        else:
+            cfg = _get_provisioner_config_from_request(
+                body.new_api_base_url, body.database
+            )
+            admin = ensure_admin_access_token(cfg)
+            update_kwargs: dict[str, Any] = {
+                "provider": provider,
+                "upstream_key": upstream_key,
+                "base_url": base_url,
+            }
+            saved_channel_type = int(saved_channel.get("type") or 0)
+            if saved_channel_type > 0:
+                update_kwargs["channel_type"] = saved_channel_type
+            result = update_provider_channel_credentials(cfg, admin, **update_kwargs)
         saved = []
         if result.get("ok"):
             saved = save_newapi_provider_channels(
@@ -1014,10 +1029,18 @@ async def sync_custom_newapi_provider_channel(
 async def create_custom_newapi_channel(body: CreateChannelBody) -> dict[str, Any]:
     try:
         require_ce_gateway_management()
-        cfg = _get_provisioner_config_from_request(body.new_api_base_url, body.database)
-        admin = ensure_admin_access_token(cfg)
         payload = _build_channel_payload_from_spec(body)
-        result = upsert_channel(cfg, admin, payload)
+        if is_provider_hub_gateway(body.new_api_base_url):
+            result = await sync_provider_hub_channel_payload(
+                gateway_base_url=str(body.new_api_base_url or ""),
+                provider=body.provider,
+                payload=payload,
+            )
+            cfg = _get_provisioner_config_from_request(None, body.database)
+        else:
+            cfg = _get_provisioner_config_from_request(body.new_api_base_url, body.database)
+            admin = ensure_admin_access_token(cfg)
+            result = upsert_channel(cfg, admin, payload)
     except PermissionError as exc:
         raise _permission_error(exc) from exc
     except ValueError as exc:
@@ -1029,8 +1052,8 @@ async def create_custom_newapi_channel(body: CreateChannelBody) -> dict[str, Any
         "ok": result["ok"],
         "data": {
             "newApiAdminBaseUrl": cfg.admin_base_url,
-            "httpStatus": result["httpStatus"],
-            "newApiResponse": result["newApiResponse"],
+            "httpStatus": result.get("httpStatus", 200),
+            "newApiResponse": result.get("newApiResponse", result),
             "action": result.get("action"),
             "channelId": result.get("channelId"),
             "sentPayload": _mask_sent_channel_payload(
@@ -1044,10 +1067,13 @@ async def create_custom_newapi_channel(body: CreateChannelBody) -> dict[str, Any
 async def create_custom_newapi_channels_batch(
     body: CreateChannelsBatchBody,
 ) -> dict[str, Any]:
+    provider_hub_mode = is_provider_hub_gateway(body.new_api_base_url)
     try:
         require_ce_gateway_management()
-        cfg = _get_provisioner_config_from_request(body.new_api_base_url, body.database)
-        admin = ensure_admin_access_token(cfg)
+        cfg = _get_provisioner_config_from_request(
+            None if provider_hub_mode else body.new_api_base_url, body.database
+        )
+        admin = None if provider_hub_mode else ensure_admin_access_token(cfg)
     except PermissionError as exc:
         raise _permission_error(exc) from exc
     except ValueError as exc:
@@ -1059,12 +1085,19 @@ async def create_custom_newapi_channels_batch(
     for index, channel in enumerate(body.channels):
         try:
             payload = _build_channel_payload_from_spec(channel)
-            result = upsert_channel(cfg, admin, payload)
+            if provider_hub_mode:
+                result = await sync_provider_hub_channel_payload(
+                    gateway_base_url=str(body.new_api_base_url or ""),
+                    provider=channel.provider,
+                    payload=payload,
+                )
+            else:
+                result = upsert_channel(cfg, admin, payload)
             item: dict[str, Any] = {
                 "index": index,
                 "ok": result["ok"],
-                "httpStatus": result["httpStatus"],
-                "newApiResponse": result["newApiResponse"],
+                "httpStatus": result.get("httpStatus", 200),
+                "newApiResponse": result.get("newApiResponse", result),
                 "action": result.get("action"),
                 "channelId": result.get("channelId"),
                 "sentPayload": _mask_sent_channel_payload(

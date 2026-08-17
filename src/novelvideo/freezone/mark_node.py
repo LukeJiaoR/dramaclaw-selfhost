@@ -17,7 +17,7 @@ from novelvideo.freezone.vision_gateway import (
 )
 
 
-FREEZONE_MARK_PROVIDER = "newapi"
+FREEZONE_MARK_PROVIDER = "provider_hub"
 
 
 def build_mark_detection_task(
@@ -137,8 +137,10 @@ async def detect_freezone_mark(
         box_height=box_height,
     )
     chosen = (provider or FREEZONE_MARK_PROVIDER).lower()
-    if chosen != "newapi":
-        raise ValueError("Freezone mark detection only supports the NewAPI gateway")
+    if chosen == "newapi":
+        chosen = "provider_hub"
+    if chosen != "provider_hub":
+        raise ValueError("Freezone mark detection only supports the Provider Hub gateway")
     used_model, text = await call_freezone_vision_model(
         prompt=prompt,
         images=[

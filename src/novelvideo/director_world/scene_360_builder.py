@@ -127,10 +127,14 @@ def build_prompt(
 ) -> str:
     style_preset = get_style_preset(style, project_dir=str(PROJECT_DIR))
     style_instructions = (
-        style_preset.get("gemini_style_instructions") or style_preset.get("style_keywords") or ""
+        style_preset.get("gemini_style_instructions")
+        or style_preset.get("style_keywords")
+        or ""
     )
     avoid_instructions = (
-        style_preset.get("gemini_avoid_instructions") or style_preset.get("negative_prompt") or ""
+        style_preset.get("gemini_avoid_instructions")
+        or style_preset.get("negative_prompt")
+        or ""
     )
     reference_lines = ["INPUT IMAGE ROLES:"]
     if has_master:
@@ -178,7 +182,9 @@ def build_prompt(
             ]
         )
     if has_topology_strip:
-        topology_ref_index = 1 + int(has_master) + int(has_reverse) + int(has_direction_guide)
+        topology_ref_index = (
+            1 + int(has_master) + int(has_reverse) + int(has_direction_guide)
+        )
         reference_lines.extend(
             [
                 f"- Reference image {topology_ref_index} (topology_strip_2to1.jpg) = ABSTRACT 360 TOPOLOGY MAP.",
@@ -516,13 +522,24 @@ def make_direction_alignment_guide(
         px = x0 + (panel_w - image.width) // 2
         py = label_h + (panel_h - image.height) // 2
         canvas.paste(image, (px, py))
-        draw.rectangle([x0, label_h, x0 + panel_w - 1, label_h + panel_h - 1], outline="black")
+        draw.rectangle(
+            [x0, label_h, x0 + panel_w - 1, label_h + panel_h - 1], outline="black"
+        )
         center_x = x0 + panel_w // 2
-        draw.line([center_x, label_h, center_x, label_h + panel_h], fill=(0, 170, 255), width=3)
+        draw.line(
+            [center_x, label_h, center_x, label_h + panel_h],
+            fill=(0, 170, 255),
+            width=3,
+        )
         draw.text((x0 + 10, 8), title, fill="black", font=title_font)
         draw.text((x0 + 10, 34), subtitle, fill=(80, 80, 80), font=small_font)
         draw.text((x0 + 10, 60), "SCREEN LEFT", fill=(180, 20, 20), font=small_font)
-        draw.text((x0 + panel_w - 112, 60), "SCREEN RIGHT", fill=(20, 90, 180), font=small_font)
+        draw.text(
+            (x0 + panel_w - 112, 60),
+            "SCREEN RIGHT",
+            fill=(20, 90, 180),
+            font=small_font,
+        )
         draw.text((center_x - 42, 60), "CENTER", fill=(0, 120, 180), font=small_font)
 
     guide_path = output_dir / "reference_3_direction_alignment_guide.jpg"
@@ -592,9 +609,13 @@ def make_topology_strip_2to1(
         (width - 1, "#ff3b30", "100% seam\nsame LEFT side"),
     ]
     for x, color, label in bands:
-        draw.line((x, 0, x, height), fill=color, width=8 if x not in (0, width - 1) else 16)
+        draw.line(
+            (x, 0, x, height), fill=color, width=8 if x not in (0, width - 1) else 16
+        )
         box_w = 330 if x not in (quarter_w, quarter_w + half_w) else 485
-        tx = max(8, min(width - box_w - 8, x + 10 if x < width // 2 else x - box_w - 10))
+        tx = max(
+            8, min(width - box_w - 8, x + 10 if x < width // 2 else x - box_w - 10)
+        )
         draw.rectangle((tx, 16, tx + box_w, 112), fill="#111111")
         draw.text((tx + 12, 24), label, fill=color, font=small_font)
 
@@ -667,7 +688,9 @@ def load_overlap_continuation_analysis(
         analysis_path = repo_path(raw_arg)
     elif master_path is not None:
         analysis_path = (
-            master_path.parent / "overlap_continuation_test" / "overlap_continuation_analysis.json"
+            master_path.parent
+            / "overlap_continuation_test"
+            / "overlap_continuation_analysis.json"
         )
     else:
         return None, None, ""
@@ -675,7 +698,9 @@ def load_overlap_continuation_analysis(
     if not analysis_path.exists():
         return None, None, ""
     if not explicit and master_path is not None and reverse_path is not None:
-        latest_input_mtime = max(master_path.stat().st_mtime, reverse_path.stat().st_mtime)
+        latest_input_mtime = max(
+            master_path.stat().st_mtime, reverse_path.stat().st_mtime
+        )
         if analysis_path.stat().st_mtime < latest_input_mtime:
             return None, None, ""
 
@@ -685,10 +710,14 @@ def load_overlap_continuation_analysis(
         return None, None, ""
     prompt_insert = str(data.get("pano_prompt_insert") or "").strip()
     front_unique = [
-        str(item).strip() for item in data.get("front_unique_items") or [] if str(item).strip()
+        str(item).strip()
+        for item in data.get("front_unique_items") or []
+        if str(item).strip()
     ]
     back_unique = [
-        str(item).strip() for item in data.get("back_unique_items") or [] if str(item).strip()
+        str(item).strip()
+        for item in data.get("back_unique_items") or []
+        if str(item).strip()
     ]
     unique_lines: list[str] = []
     if front_unique or back_unique:
@@ -730,7 +759,9 @@ def load_scene_spatial_contract(
         contract_path = repo_path(raw_arg)
     elif master_path is not None:
         contract_path = (
-            master_path.parent / "scene_spatial_contract" / "scene_spatial_contract.json"
+            master_path.parent
+            / "scene_spatial_contract"
+            / "scene_spatial_contract.json"
         )
     else:
         return None, ""
@@ -738,7 +769,9 @@ def load_scene_spatial_contract(
     if not contract_path.exists():
         return None, ""
     if not explicit and master_path is not None and reverse_path is not None:
-        latest_input_mtime = max(master_path.stat().st_mtime, reverse_path.stat().st_mtime)
+        latest_input_mtime = max(
+            master_path.stat().st_mtime, reverse_path.stat().st_mtime
+        )
         if contract_path.stat().st_mtime < latest_input_mtime:
             return None, ""
     try:
@@ -767,7 +800,9 @@ def make_contact_sheet(
         img.thumbnail((cell_w, cell_h), Image.Resampling.LANCZOS)
         x0 = idx * cell_w
         draw.text((x0 + 8, 6), label, fill="black", font=fnt)
-        sheet.paste(img, (x0 + (cell_w - img.width) // 2, label_h + (cell_h - img.height) // 2))
+        sheet.paste(
+            img, (x0 + (cell_w - img.width) // 2, label_h + (cell_h - img.height) // 2)
+        )
     sheet.save(output_dir / "scene_360_contact.jpg", quality=92)
 
 
@@ -780,7 +815,9 @@ async def run(args: argparse.Namespace) -> int:
         or SCENE_360_DEFAULT_QUALITY
     ).strip()
     args.image_size = str(
-        args.image_size or os.environ.get("SCENE_360_IMAGE_SIZE") or SCENE_360_DEFAULT_IMAGE_SIZE
+        args.image_size
+        or os.environ.get("SCENE_360_IMAGE_SIZE")
+        or SCENE_360_DEFAULT_IMAGE_SIZE
     ).strip()
     provider = str(
         args.provider
@@ -847,7 +884,9 @@ async def run(args: argparse.Namespace) -> int:
                 max_side=SCENE_360_MASTER_REF_MAX_SIDE,
                 quality=SCENE_360_MASTER_REF_JPEG_QUALITY,
             )
-            master_refs.append(("REF 2 reverse visual bible (sent to model)", reverse_ref))
+            master_refs.append(
+                ("REF 2 reverse visual bible (sent to model)", reverse_ref)
+            )
             reverse_ref_path = reverse_ref
             reverse_thumb = make_master_reference(
                 reverse_master,
@@ -856,15 +895,19 @@ async def run(args: argparse.Namespace) -> int:
                 max_side=SCENE_360_MASTER_THUMB_MAX_SIDE,
                 quality=SCENE_360_MASTER_THUMB_JPEG_QUALITY,
             )
-            master_refs.append(("REF 2 reverse thumbnail copy (debug only)", reverse_thumb))
+            master_refs.append(
+                ("REF 2 reverse thumbnail copy (debug only)", reverse_thumb)
+            )
             reference_images.append(image_tuple(reverse_ref))
             has_reverse_ref = True
 
     if has_master_ref and has_reverse_ref:
-        spatial_contract_path, spatial_contract_prompt_insert = load_scene_spatial_contract(
-            master_path=master_path_for_overlap,
-            reverse_path=reverse_path_for_overlap,
-            spatial_contract_arg=getattr(args, "spatial_contract", "auto"),
+        spatial_contract_path, spatial_contract_prompt_insert = (
+            load_scene_spatial_contract(
+                master_path=master_path_for_overlap,
+                reverse_path=reverse_path_for_overlap,
+                spatial_contract_arg=getattr(args, "spatial_contract", "auto"),
+            )
         )
         if master_ref_path is not None and reverse_ref_path is not None:
             guide_ref = make_direction_alignment_guide(
@@ -872,7 +915,9 @@ async def run(args: argparse.Namespace) -> int:
                 reverse_ref_path,
                 output_dir,
             )
-            master_refs.append(("REF 3 direction-only guide (sent to model)", guide_ref))
+            master_refs.append(
+                ("REF 3 direction-only guide (sent to model)", guide_ref)
+            )
             reference_images.append(image_tuple(guide_ref))
             has_direction_guide_ref = True
             topology_ref = make_topology_strip_2to1(
@@ -880,7 +925,9 @@ async def run(args: argparse.Namespace) -> int:
                 reverse_ref_path,
                 output_dir,
             )
-            master_refs.append(("REF 4 topology-only strip (sent to model)", topology_ref))
+            master_refs.append(
+                ("REF 4 topology-only strip (sent to model)", topology_ref)
+            )
             reference_images.append(image_tuple(topology_ref))
             has_topology_strip_ref = True
         overlap_analysis_path, overlap_guide_path, overlap_prompt_insert = (
@@ -899,7 +946,8 @@ async def run(args: argparse.Namespace) -> int:
                 + int(has_topology_strip_ref)
             )
             overlap_copy = (
-                output_dir / f"reference_{overlap_ref_index}_overlap_continuation_guide.jpg"
+                output_dir
+                / f"reference_{overlap_ref_index}_overlap_continuation_guide.jpg"
             )
             overlap_copy.write_bytes(overlap_guide_path.read_bytes())
             master_refs.append(
@@ -972,7 +1020,9 @@ async def run(args: argparse.Namespace) -> int:
             api_key=api_key,
             model=model,
             prompt=prompt,
-            reference_images=[item[1] for item in reference_images] if reference_images else None,
+            reference_images=[item[1] for item in reference_images]
+            if reference_images
+            else None,
             image_config={
                 "aspect_ratio": "2:1",
                 "image_size": args.image_size,
@@ -981,11 +1031,26 @@ async def run(args: argparse.Namespace) -> int:
                 "output_format": "png",
             },
         )
-    elif provider == "openai":
-        api_key = os.environ.get("OPENAI_API_KEY")
+    elif provider in {"openai", "provider_hub"}:
+        from novelvideo.config import (
+            PROVIDER_HUB_API_KEY,
+            PROVIDER_HUB_BASE_URL,
+            PROVIDER_HUB_IMAGE_MODEL,
+        )
+
+        api_key = (
+            PROVIDER_HUB_API_KEY or "provider-hub-local"
+            if provider == "provider_hub"
+            else os.environ.get("OPENAI_API_KEY")
+        )
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing")
-        model = args.model or os.environ.get("OPENAI_IMAGE_MODEL") or OPENAI_IMAGE_MODEL
+        model = (
+            args.model
+            or (PROVIDER_HUB_IMAGE_MODEL if provider == "provider_hub" else None)
+            or os.environ.get("OPENAI_IMAGE_MODEL")
+            or OPENAI_IMAGE_MODEL
+        )
         image_bytes, _text, error = await _call_openai_image_api(
             api_key=api_key,
             model=model,
@@ -997,6 +1062,7 @@ async def run(args: argparse.Namespace) -> int:
                 "quality": args.quality,
                 "output_format": "png",
             },
+            base_url=PROVIDER_HUB_BASE_URL if provider == "provider_hub" else None,
         )
     elif provider == "newapi":
         from novelvideo.config import get_newapi_runtime_credentials
@@ -1039,7 +1105,9 @@ async def run(args: argparse.Namespace) -> int:
             api_key=api_key,
             model=model,
             prompt=prompt,
-            reference_images=[item[1] for item in reference_images] if reference_images else None,
+            reference_images=[item[1] for item in reference_images]
+            if reference_images
+            else None,
             image_config={
                 "aspect_ratio": "2:1",
                 "image_size": args.image_size,
@@ -1063,10 +1131,16 @@ async def run(args: argparse.Namespace) -> int:
                 "spatial_layout": (
                     str(repo_path(spatial_layout_arg)) if spatial_layout_arg else ""
                 ),
-                "overlap_analysis": str(overlap_analysis_path) if overlap_analysis_path else "",
-                "spatial_contract": str(spatial_contract_path) if spatial_contract_path else "",
+                "overlap_analysis": str(overlap_analysis_path)
+                if overlap_analysis_path
+                else "",
+                "spatial_contract": str(spatial_contract_path)
+                if spatial_contract_path
+                else "",
                 "topology_strip": (
-                    "reference_4_topology_strip_2to1.jpg" if has_topology_strip_ref else ""
+                    "reference_4_topology_strip_2to1.jpg"
+                    if has_topology_strip_ref
+                    else ""
                 ),
                 "provider": provider,
                 "model": model,
@@ -1077,7 +1151,9 @@ async def run(args: argparse.Namespace) -> int:
                 "request_id": provider_trace.get("request_id", ""),
                 "response_id": provider_trace.get("response_id", ""),
                 "result": str(result_path),
-                "size_note": ("scene 360 defaults to image-2 2K medium; aspect_ratio=2:1"),
+                "size_note": (
+                    "scene 360 defaults to image-2 2K medium; aspect_ratio=2:1"
+                ),
             },
             ensure_ascii=False,
             indent=2,

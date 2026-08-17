@@ -1,4 +1,4 @@
-"""Shared NewAPI transport for Freezone vision-understanding tasks."""
+"""Shared Provider Hub transport for Freezone vision-understanding tasks."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def image_media_type(path: str) -> str:
 
 
 def resolve_freezone_vision_model(model_override: str | None = None) -> str:
-    """Return the logical NewAPI model shared by Freezone vision tasks."""
+    """Return the logical model shared by Freezone vision tasks."""
     clean_override = str(model_override or "").strip()
     if clean_override:
         return clean_override
@@ -50,7 +50,7 @@ async def call_freezone_vision_model(
     timeout_seconds: float,
     model_override: str | None = None,
 ) -> tuple[str, str]:
-    """Run a PydanticAI vision Agent through the effective NewAPI gateway."""
+    """Run a PydanticAI vision Agent through the effective Provider Hub gateway."""
     if not images:
         raise ValueError("at least one image is required")
 

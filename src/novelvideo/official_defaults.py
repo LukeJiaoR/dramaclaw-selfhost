@@ -40,5 +40,10 @@ DEFAULT_TEXT_MODEL_BY_ENV = {
     "EPISODE_SCENE_RECONCILE_MODEL": "DC-episode-scene-reconciler-LLM",
     "NARRATED_SCENE_ASSET_MODEL": "DC-narrated-scene-asset-planner-LLM",
     "STAGING_PROP_MODEL": "DC-staging-prop-planner-LLM",
+    "BLOCK_WORLD_MODEL": "DC-block-world-builder-LLM",
+    "SCENE_OVERLAP_MODEL": "DC-scene-overlap-analyzer-LLM",
+    "SCENE_SPATIAL_CONTRACT_MODEL": "DC-scene-spatial-contract-LLM",
+    "SKETCH_GATE_MODEL": "DC-sketch-visual-gate-LLM",
+    "VIDEO_PROMPT_TRANSLATOR_MODEL": "DC-video-prompt-translator-LLM",
     "COGNEE_LLM_MODEL": DEFAULT_COGNEE_LLM_MODEL,
 }

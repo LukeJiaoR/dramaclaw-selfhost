@@ -29,7 +29,7 @@ from novelvideo.verification import failure_registry
 
 DEFAULT_GATE_MODEL_GOOGLE = "gemini-3.5-flash"
 DEFAULT_GATE_MODEL_OPENROUTER = "gemini-3.5-flash"
-DEFAULT_GATE_MODEL = DEFAULT_GATE_MODEL_GOOGLE  # legacy alias (google-direct)
+DEFAULT_GATE_MODEL = "DC-sketch-visual-gate-LLM"
 
 
 @dataclass
@@ -191,19 +191,13 @@ def _resolve_gate_backend() -> tuple[str, str, str]:
         )
         return explicit_provider, explicit_key, model
 
-    nb_provider = (os.environ.get("NANOBANANA_PROVIDER") or "").strip().lower()
-    openrouter_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
-    if nb_provider == "openrouter" and openrouter_key:
-        return "openrouter", openrouter_key, explicit_model or DEFAULT_GATE_MODEL_OPENROUTER
+    try:
+        from novelvideo.llm_gateway import get_llm_gateway_credentials
 
-    for var in ("GOOGLE_AI_API_KEY", "GOOGLE_API_KEY"):
-        value = (os.environ.get(var) or "").strip()
-        if value:
-            return "google", value, explicit_model or DEFAULT_GATE_MODEL_GOOGLE
-
-    if openrouter_key:
-        return "openrouter", openrouter_key, explicit_model or DEFAULT_GATE_MODEL_OPENROUTER
-    return "", "", ""
+        api_key, _base_url = get_llm_gateway_credentials()
+    except RuntimeError:
+        return "", "", ""
+    return "provider_hub", api_key, explicit_model or DEFAULT_GATE_MODEL
 
 
 async def _ask_vlm_google(
@@ -308,6 +302,19 @@ async def _ask_vlm_once(
     model: str,
     max_tokens: int = 512,
 ) -> str:
+    if provider == "provider_hub":
+        from novelvideo.llm_gateway import call_llm_gateway
+
+        return await call_llm_gateway(
+            prompt=prompt,
+            image_inputs=[(image_bytes, "image/png")],
+            model=model,
+            api_key_override=api_key,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            timeout_seconds=60.0,
+        )
     if provider == "openrouter":
         return await _ask_vlm_openrouter(
             image_bytes=image_bytes,
@@ -406,8 +413,8 @@ async def gate_candidate_cells(
     provider, api_key, default_model = _resolve_gate_backend()
     if not provider or not api_key:
         raise RuntimeError(
-            "Gate requires a VLM key. Set SKETCH_GATE_API_KEY, or "
-            "OPENROUTER_API_KEY, or GOOGLE_AI_API_KEY in the environment."
+            "Gate requires a configured Provider Hub vision binding or an explicit "
+            "SKETCH_GATE_API_KEY."
         )
     resolved_model = model or default_model
 

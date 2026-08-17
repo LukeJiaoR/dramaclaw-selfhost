@@ -4,6 +4,7 @@ import base64
 
 import httpx
 import respx
+from starlette.requests import Request
 
 from provider_hub.adapters.comfyui import ComfyUIAdapter, inject_workflow
 from provider_hub.adapters.mimo import MimoChatAudioAdapter
@@ -116,6 +117,48 @@ async def test_openai_adapter_replaces_internal_model_name():
     assert sent["model"] == "real-model"
 
 
+@respx.mock
+async def test_openai_adapter_converts_multipart_image_edit_to_data_urls():
+    route = respx.post("https://provider.test/v1/images/edits").mock(
+        return_value=httpx.Response(200, json={"data": [{"b64_json": "aW1hZ2U="}]})
+    )
+    source = httpx.Request(
+        "POST",
+        "http://hub.test/v1/images/edits",
+        data={"model": "DC-image", "prompt": "keep identity"},
+        files={"image": ("portrait.png", b"portrait-bytes", "image/png")},
+    )
+    body = source.read()
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/images/edits",
+            "headers": [(key.lower(), value) for key, value in source.headers.raw],
+        },
+        receive,
+    )
+    response = await OpenAIAdapter().invoke(
+        target=target("openai", "image"),
+        operation="images_edits",
+        payload={"model": "DC-image"},
+        request=request,
+    )
+
+    assert response.status_code == 200
+    sent = __import__("json").loads(route.calls[0].request.content)
+    assert sent["model"] == "real-model"
+    assert sent["prompt"] == "keep identity"
+    assert sent["response_format"] == "b64_json"
+    assert sent["image"] == [
+        "data:image/png;base64," + base64.b64encode(b"portrait-bytes").decode()
+    ]
+
+
 def comfy_target() -> ResolvedTarget:
     service = ServiceConfig(
         id="comfy-1",
@@ -133,10 +176,23 @@ def comfy_target() -> ResolvedTarget:
                     "id": "first-frame",
                     "modes": ["first_frame"],
                     "workflow": {
-                        "1": {"class_type": "LoadImage", "inputs": {"image": "old.png"}},
-                        "2": {"class_type": "CR Text", "inputs": {"text": "old prompt"}},
-                        "3": {"class_type": "FloatInput", "_meta": {"title": "Seconds"}, "inputs": {"value": 3}},
-                        "4": {"class_type": "VHS_VideoCombine", "inputs": {"filename_prefix": "old"}},
+                        "1": {
+                            "class_type": "LoadImage",
+                            "inputs": {"image": "old.png"},
+                        },
+                        "2": {
+                            "class_type": "CR Text",
+                            "inputs": {"text": "old prompt"},
+                        },
+                        "3": {
+                            "class_type": "FloatInput",
+                            "_meta": {"title": "Seconds"},
+                            "inputs": {"value": 3},
+                        },
+                        "4": {
+                            "class_type": "VHS_VideoCombine",
+                            "inputs": {"filename_prefix": "old"},
+                        },
                     },
                 }
             ]
@@ -162,7 +218,10 @@ def test_comfyui_workflow_semantic_injection():
 @respx.mock
 async def test_comfyui_adapter_uploads_reference_and_submits_prompt():
     upload = respx.post("https://comfy.test/upload/image").mock(
-        return_value=httpx.Response(200, json={"name": "0-first.png", "subfolder": "provider-hub", "type": "input"})
+        return_value=httpx.Response(
+            200,
+            json={"name": "0-first.png", "subfolder": "provider-hub", "type": "input"},
+        )
     )
     prompt = respx.post("https://comfy.test/prompt").mock(
         return_value=httpx.Response(200, json={"prompt_id": "prompt-123"})
@@ -194,7 +253,17 @@ async def test_comfyui_adapter_normalizes_completed_history():
             json={
                 "prompt-123": {
                     "status": {"messages": []},
-                    "outputs": {"9": {"gifs": [{"filename": "movie.mp4", "subfolder": "ProviderHub", "type": "output"}]}},
+                    "outputs": {
+                        "9": {
+                            "gifs": [
+                                {
+                                    "filename": "movie.mp4",
+                                    "subfolder": "ProviderHub",
+                                    "type": "output",
+                                }
+                            ]
+                        }
+                    },
                 }
             },
         )

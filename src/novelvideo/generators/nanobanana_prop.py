@@ -24,6 +24,7 @@ from novelvideo.config import (
     get_style_preset,
     IMAGE_DEFAULT_STYLE,
     NEWAPI_IMAGE_MODEL,
+    PROVIDER_HUB_IMAGE_MODEL,
     PROP_REF_IMAGE_MODEL,
     PROP_REF_IMAGE_PROVIDER,
     normalize_image_generation_selection,
@@ -47,12 +48,16 @@ def resolve_prop_reference_image_model() -> str:
     config = get_grid_generation_config()
     prop_provider = (PROP_REF_IMAGE_PROVIDER or "").strip().lower()
     provider = prop_provider or str(config.get("provider") or "google").strip().lower()
+    if provider == "provider_hub":
+        return (PROP_REF_IMAGE_MODEL or PROVIDER_HUB_IMAGE_MODEL).strip()
     if provider == "newapi":
         return (PROP_REF_IMAGE_MODEL or NEWAPI_IMAGE_MODEL).strip()
     return str(config.get("model") or "").strip()
 
 
-def _prop_reference_image_source(selection: str | None) -> tuple[str | None, str | None]:
+def _prop_reference_image_source(
+    selection: str | None,
+) -> tuple[str | None, str | None]:
     selection = str(selection or "").strip()
     if not selection:
         return None, None
@@ -156,7 +161,12 @@ async def generate_prop_reference(
         or prop_provider
         or str(config.get("provider") or "google").strip().lower()
     )
-    if provider == "newapi":
+    if provider == "provider_hub":
+        hub_config = get_grid_generation_config(selection_override="provider_hub_image")
+        api_key = hub_config.get("api_key")
+        model = selected_model or resolve_prop_reference_image_model()
+        base_url = hub_config.get("base_url", "")
+    elif provider == "newapi":
         from novelvideo.config import get_effective_newapi_gateway_config
 
         gateway = get_effective_newapi_gateway_config()
@@ -171,7 +181,7 @@ async def generate_prop_reference(
     if not api_key:
         if provider == "openrouter":
             key_name = "OPENROUTER_API_KEY"
-        elif provider == "openai":
+        elif provider in {"openai", "provider_hub"}:
             key_name = "OPENAI_API_KEY"
         elif provider == "newapi":
             key_name = "NEWAPI_API_KEY"
@@ -198,13 +208,14 @@ async def generate_prop_reference(
                 api_key=api_key,
                 model=model,
             )
-        elif provider == "openai":
+        elif provider in {"openai", "provider_hub"}:
             result_path = await _generate_via_openai(
                 prompt=prompt,
                 output_path=output_path,
                 api_key=api_key,
                 model=model,
                 quality=config.get("openai_image_quality", "medium"),
+                base_url=base_url,
             )
         elif provider == "newapi":
             result_path = await _generate_via_newapi(
@@ -326,6 +337,7 @@ async def _generate_via_openai(
     api_key: str,
     model: str,
     quality: str = "medium",
+    base_url: str = "",
 ) -> Optional[str]:
     """通过 OpenAI Image API 生成图像。"""
 
@@ -339,6 +351,7 @@ async def _generate_via_openai(
             "quality": normalize_openai_quality(quality, default="medium"),
             "output_format": "png",
         },
+        base_url=base_url or None,
     )
 
     if image_bytes:

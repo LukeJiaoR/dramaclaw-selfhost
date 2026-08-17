@@ -1254,7 +1254,7 @@ class GrokVideoGenerator(VideoGeneratorBase):
 async def translate_prompt_to_english(prompt: str) -> str:
     """将中文视频提示词翻译并优化为 WAN I2V 最佳格式。
 
-    使用 Gemini 进行翻译，按照 WAN 模型最佳实践结构化输出。
+    通过当前文本模型网关翻译，并按照 WAN 模型最佳实践结构化输出。
 
     Args:
         prompt: 中文提示词
@@ -1271,14 +1271,7 @@ async def translate_prompt_to_english(prompt: str) -> str:
         return prompt
 
     try:
-        import google.genai as genai
-
-        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            print("[VIDEO] 警告: 未配置 GOOGLE_API_KEY，跳过翻译")
-            return prompt
-
-        client = genai.Client(api_key=api_key)
+        from novelvideo.llm_gateway import call_llm_gateway
 
         translation_prompt = f"""You are an expert at writing prompts for WAN 2.1 Image-to-Video AI model.
 
@@ -1300,13 +1293,19 @@ Convert this Chinese video motion description into an optimized English prompt f
 
 ## English Output (ONLY the optimized prompt, nothing else):"""
 
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model="gemini-3.5-flash",
-            contents=translation_prompt,
-        )
+        from novelvideo.config import get_newapi_text_model_name
 
-        english_prompt = response.text.strip()
+        english_prompt = await call_llm_gateway(
+            prompt=translation_prompt,
+            model=get_newapi_text_model_name(
+                "VIDEO_PROMPT_TRANSLATOR_MODEL",
+                "DC-video-prompt-translator-LLM",
+            ),
+            temperature=0.0,
+            max_tokens=256,
+            timeout_seconds=120.0,
+        )
+        english_prompt = english_prompt.strip()
         # 移除可能的引号包裹
         if english_prompt.startswith('"') and english_prompt.endswith('"'):
             english_prompt = english_prompt[1:-1]

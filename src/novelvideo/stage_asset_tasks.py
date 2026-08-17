@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 SPATIAL_CONTRACT_SCHEMA_VERSION = "scene_spatial_contract_v8_topology_only_locks"
-SPATIAL_CONTRACT_DEFAULT_MODEL = "openai/gpt-5.5"
+SPATIAL_CONTRACT_DEFAULT_MODEL = "DC-scene-spatial-contract-LLM"
 SAFE_SEAM_SPHERE_YAW_DEG = -90.0
 
 
@@ -248,6 +248,8 @@ def resolve_scene_360_image_model(provider: str = "", model: str = "") -> str:
         )
     if resolved_provider == "openai":
         return os.environ.get("OPENAI_IMAGE_MODEL") or "gpt-image-2"
+    if resolved_provider == "provider_hub":
+        return os.environ.get("PROVIDER_HUB_IMAGE_MODEL") or "DC-image"
     if resolved_provider == "newapi":
         return (
             os.environ.get("SCENE_360_IMAGE_MODEL")
@@ -1284,7 +1286,7 @@ def run_scene_360(
                     not analysis_path.exists()
                     or analysis_path.stat().st_mtime < latest_input_mtime
                 )
-                if needs_analysis and os.environ.get("OPENROUTER_API_KEY"):
+                if needs_analysis:
                     report(0.12, "分析 master/reverse 侧边 overlap 和 continuation...")
                     analyzer_cmd = [
                         sys.executable,
@@ -1341,7 +1343,7 @@ def run_scene_360(
                         SPATIAL_CONTRACT_SCHEMA_VERSION,
                     )
                 )
-                if needs_contract and os.environ.get("OPENROUTER_API_KEY"):
+                if needs_contract:
                     report(
                         0.14,
                         f"分析 master/reverse 空间合同 ({spatial_contract_model})...",
@@ -1641,8 +1643,7 @@ def run_voxel_world_from_360(
         if archived is not None and archived.exists():
             archived.replace(scene_world_path)
         raise RuntimeError(
-            "DirectorWorld 生成器成功退出，但没有写出 world.json: "
-            f"{scene_world_path}"
+            f"DirectorWorld 生成器成功退出，但没有写出 world.json: {scene_world_path}"
         )
 
     report(0.90, "voxel world.json 已写出")

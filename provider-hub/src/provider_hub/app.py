@@ -57,35 +57,52 @@ class ModelRouteBody(BaseModel):
     upstream_model: str = ""
 
 
-def save_service_and_routes(data: dict[str, Any], service_id: str = "") -> ServiceConfig:
+def save_service_and_routes(
+    data: dict[str, Any], service_id: str = ""
+) -> ServiceConfig:
     protocol = str(data.get("protocol") or "").strip().lower()
     if protocol in {"comfyui", "comfyui_native"}:
         if str(data.get("service_type") or "").strip().lower() != "video":
             raise ValueError("native ComfyUI services must use the video service type")
         if not str(data.get("base_url") or "").strip():
             raise ValueError("ComfyUI Base URL is required")
-        settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
+        settings = (
+            data.get("settings") if isinstance(data.get("settings"), dict) else {}
+        )
         workflows = settings.get("workflows")
         if not isinstance(workflows, list) or not workflows:
             raise ValueError("at least one ComfyUI workflow is required")
         seen: set[str] = set()
         for route in workflows:
-            route_id = str(route.get("id") or "").strip() if isinstance(route, dict) else ""
+            route_id = (
+                str(route.get("id") or "").strip() if isinstance(route, dict) else ""
+            )
             workflow = route.get("workflow") if isinstance(route, dict) else None
             if not route_id or route_id in seen:
                 raise ValueError("ComfyUI workflow IDs must be present and unique")
             seen.add(route_id)
-            if not isinstance(workflow, dict) or not workflow or not any(
-                isinstance(node, dict) and ("class_type" in node or "inputs" in node)
-                for node in workflow.values()
+            if (
+                not isinstance(workflow, dict)
+                or not workflow
+                or not any(
+                    isinstance(node, dict)
+                    and ("class_type" in node or "inputs" in node)
+                    for node in workflow.values()
+                )
             ):
-                raise ValueError(f"ComfyUI workflow {route_id} must use API Format JSON")
+                raise ValueError(
+                    f"ComfyUI workflow {route_id} must use API Format JSON"
+                )
     service = store.save_service(data, service_id)
     if service.protocol not in {"comfyui", "comfyui_native"}:
         return service
     wanted = set(service.models)
     for route in store.list_model_routes():
-        if route["service_id"] == service.id and route["capability"] == "video" and route["incoming_model"] not in wanted:
+        if (
+            route["service_id"] == service.id
+            and route["capability"] == "video"
+            and route["incoming_model"] not in wanted
+        ):
             store.delete_model_route(route["incoming_model"])
     for model in wanted:
         store.save_model_route(model, "video", service.id, model)
@@ -163,9 +180,13 @@ async def dispatch(
 async def optional_api_key(request: Request, call_next):
     expected = os.environ.get("PROVIDER_HUB_API_KEY", "").strip()
     if expected and request.url.path.startswith("/v1/"):
-        supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        supplied = (
+            request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        )
         if supplied != expected:
-            return JSONResponse(status_code=401, content={"error": "invalid provider hub key"})
+            return JSONResponse(
+                status_code=401, content={"error": "invalid provider hub key"}
+            )
     return await call_next(request)
 
 
@@ -261,13 +282,18 @@ async def models() -> dict[str, Any]:
     ids = {route["incoming_model"] for route in store.list_model_routes()}
     for service in store.list_services():
         ids.update(service.models)
-    return {"object": "list", "data": [{"id": item, "object": "model"} for item in sorted(ids)]}
+    return {
+        "object": "list",
+        "data": [{"id": item, "object": "model"} for item in sorted(ids)],
+    }
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Response:
     payload = require_payload(await request.json())
-    return await dispatch(request, capability_for_chat(payload), "chat_completions", payload)
+    return await dispatch(
+        request, capability_for_chat(payload), "chat_completions", payload
+    )
 
 
 @app.post("/v1/embeddings")
@@ -285,12 +311,11 @@ async def images_generations(request: Request) -> Response:
 @app.post("/v1/images/edits")
 async def images_edits(request: Request) -> Response:
     content_type = request.headers.get("content-type", "")
-    if "application/json" not in content_type:
-        raise HTTPException(
-            status_code=501,
-            detail="multipart image edits require a dedicated adapter",
-        )
-    payload = require_payload(await request.json())
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        payload = {"model": str(form.get("model") or "")}
+    else:
+        payload = require_payload(await request.json())
     return await dispatch(request, "image", "images_edits", payload)
 
 
@@ -343,19 +368,28 @@ async def video_poll(task_id: str) -> Response:
         raise HTTPException(status_code=410, detail="video provider was removed")
     adapter = adapters.get(task["protocol"])
     if not hasattr(adapter, "query"):
-        raise HTTPException(status_code=501, detail="video adapter does not support polling")
+        raise HTTPException(
+            status_code=501, detail="video adapter does not support polling"
+        )
     response = await adapter.query(service, task["upstream_task_id"])
     if response.status_code < 200 or response.status_code >= 300:
         return response
     try:
         data = normalize_task(json.loads(response.body))
     except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=f"invalid video status response: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"invalid video status response: {exc}"
+        ) from exc
     data["id"] = task_id
     data["task_id"] = task_id
     data["provider_task_id"] = task["upstream_task_id"]
-    if data.get("status") == "completed" and task["protocol"] in {"comfyui", "comfyui_native"}:
-        data["video_url"] = f"http://localhost:18001/v1/video/generations/{task_id}/content"
+    if data.get("status") == "completed" and task["protocol"] in {
+        "comfyui",
+        "comfyui_native",
+    }:
+        data["video_url"] = (
+            f"http://localhost:18001/v1/video/generations/{task_id}/content"
+        )
     return JSONResponse(data)
 
 
@@ -369,7 +403,9 @@ async def video_content(task_id: str) -> Response:
         raise HTTPException(status_code=410, detail="video provider was removed")
     adapter = adapters.get(task["protocol"])
     if not hasattr(adapter, "download_output"):
-        raise HTTPException(status_code=501, detail="video adapter does not proxy output")
+        raise HTTPException(
+            status_code=501, detail="video adapter does not proxy output"
+        )
     return await adapter.download_output(service, task["upstream_task_id"])
 
 

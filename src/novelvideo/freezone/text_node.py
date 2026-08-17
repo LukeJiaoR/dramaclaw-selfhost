@@ -21,14 +21,14 @@ from novelvideo.official_defaults import (
     DEFAULT_FREEZONE_TRANSLATION_MODEL,
 )
 
-FREEZONE_TRANSLATION_PROVIDER = "newapi"
+FREEZONE_TRANSLATION_PROVIDER = "provider_hub"
 FREEZONE_TRANSLATION_MODEL = DEFAULT_FREEZONE_TRANSLATION_MODEL
 FREEZONE_TEXT_WRITER_MODEL = DEFAULT_FREEZONE_TEXT_WRITER_MODEL
 FREEZONE_STORY_SCRIPT_MODEL = {
     "id": DEFAULT_FREEZONE_STORY_SCRIPT_MODEL,
-    "provider": "newapi",
+    "provider": "provider_hub",
     "model": DEFAULT_FREEZONE_STORY_SCRIPT_MODEL,
-    "label": "DramaClawAPI Story Script",
+    "label": "Provider Hub Story Script",
 }
 LEGACY_FREEZONE_STORY_SCRIPT_MODEL_IDS = {
     "newapi_gemini_flash",

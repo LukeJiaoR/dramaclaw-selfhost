@@ -48,7 +48,7 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm"}
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg"}
 TEXT_EXTS = {".json", ".txt", ".md"}
-FREEZONE_PRESET_DEFAULT_IMAGE_MODEL = "newapi_gpt_image2"
+FREEZONE_PRESET_DEFAULT_IMAGE_MODEL = "provider_hub_image"
 FREEZONE_PRESET_IMAGE_ASPECT_RATIOS = (
     "1:1",
     "16:9",
@@ -444,13 +444,17 @@ def _as_list(value: Any) -> list[Any]:
 
 def _prop_id_from_item(item: Any) -> str:
     if isinstance(item, dict):
-        return str(item.get("prop_id") or item.get("base_id") or item.get("id") or "").strip()
+        return str(
+            item.get("prop_id") or item.get("base_id") or item.get("id") or ""
+        ).strip()
     return str(item or "").strip()
 
 
 def _identity_id_from_item(item: Any) -> str:
     if isinstance(item, dict):
-        return str(item.get("identity_id") or item.get("id") or item.get("name") or "").strip()
+        return str(
+            item.get("identity_id") or item.get("id") or item.get("name") or ""
+        ).strip()
     return str(item or "").strip()
 
 
@@ -577,7 +581,9 @@ def _add_mainline_identity_ref(
     )
     candidates: list[tuple[Path, str]] = [(canonical_path, "character_identity")]
     if include_portrait_fallback:
-        candidates.append((canonical_portrait_path(project_dir, character), "character_portrait"))
+        candidates.append(
+            (canonical_portrait_path(project_dir, character), "character_portrait")
+        )
     for path, source_role in candidates:
         if not path.exists():
             continue
@@ -671,17 +677,25 @@ def _add_scene_refs(
         return
     scene_info = scene_info or {}
     effective_environment_prompt = str(
-        scene_info.get("effective_environment_prompt") or scene_info.get("environment_prompt") or ""
+        scene_info.get("effective_environment_prompt")
+        or scene_info.get("environment_prompt")
+        or ""
     ).strip()
     scene_meta = {
         "scene": scene_name,
         "environment_prompt": effective_environment_prompt,
-        "raw_environment_prompt": str(scene_info.get("environment_prompt") or "").strip(),
+        "raw_environment_prompt": str(
+            scene_info.get("environment_prompt") or ""
+        ).strip(),
         "variant_prompt": str(scene_info.get("variant_prompt") or "").strip(),
         "base_scene_id": str(scene_info.get("base_scene_id") or "").strip(),
         "base_master_url": str(scene_info.get("base_master_url") or "").strip(),
-        "base_master_rel_path": str(scene_info.get("base_master_rel_path") or "").strip(),
-        "base_environment_prompt": str(scene_info.get("base_environment_prompt") or "").strip(),
+        "base_master_rel_path": str(
+            scene_info.get("base_master_rel_path") or ""
+        ).strip(),
+        "base_environment_prompt": str(
+            scene_info.get("base_environment_prompt") or ""
+        ).strip(),
         "base_description": str(scene_info.get("base_description") or "").strip(),
         "base_scene_type": str(scene_info.get("base_scene_type") or "").strip(),
         "variant_id": str(scene_info.get("variant_id") or "").strip(),
@@ -708,7 +722,9 @@ def _add_scene_refs(
                 ("reverse", "scene_3gs_reverse_ply", f"{scene_name} 3D 世界（背面）"),
                 ("pano", "scene_3gs_pano_ply", f"{scene_name} 3D 世界（360）"),
             ]:
-                path = stage_manifest.resolve_ply_path(project_dir, scene_name, ply_kind=ply_kind)
+                path = stage_manifest.resolve_ply_path(
+                    project_dir, scene_name, ply_kind=ply_kind
+                )
                 if path is None:
                     continue
                 rel = _rel(project_dir, path)
@@ -803,7 +819,9 @@ def _beat_scene_source_urls(context: dict[str, Any]) -> dict[str, Any]:
     beat = _maybe_int(context.get("beat"))
     project_dir_raw = context.get("project_dir")
     project_dir = (
-        Path(project_dir_raw) if isinstance(project_dir_raw, str) and project_dir_raw else None
+        Path(project_dir_raw)
+        if isinstance(project_dir_raw, str) and project_dir_raw
+        else None
     )
 
     def url_for(role: str) -> str | None:
@@ -816,19 +834,27 @@ def _beat_scene_source_urls(context: dict[str, Any]) -> dict[str, Any]:
             return None
         return _make_url(project_id, project_dir, _rel(project_dir, path))
 
-    direct_master_url = direct_reverse_url = direct_pano_url = direct_env_only_url = None
+    direct_master_url = direct_reverse_url = direct_pano_url = direct_env_only_url = (
+        None
+    )
     direct_has_3gs = False
     if project_dir and scene_id:
-        direct_master_url = url_for_path(canonical_scene_master_path(project_dir, scene_id))
+        direct_master_url = url_for_path(
+            canonical_scene_master_path(project_dir, scene_id)
+        )
         direct_reverse_url = url_for_path(
             canonical_scene_reverse_master_path(project_dir, scene_id)
         )
         try:
             from novelvideo.director_world import stage_manifest
 
-            direct_pano_url = url_for_path(stage_manifest.resolve_pano_path(project_dir, scene_id))
+            direct_pano_url = url_for_path(
+                stage_manifest.resolve_pano_path(project_dir, scene_id)
+            )
             direct_has_3gs = any(
-                stage_manifest.resolve_ply_path(project_dir, scene_id, ply_kind=ply_kind)
+                stage_manifest.resolve_ply_path(
+                    project_dir, scene_id, ply_kind=ply_kind
+                )
                 for ply_kind in ("master", "reverse", "pano")
             )
         except Exception:
@@ -889,17 +915,23 @@ async def build_beat_preset_context(
     primary_slot: str = "render",
 ) -> dict[str, Any]:
     beats = await store.get_beats_as_dicts(episode)
-    target = next((b for b in beats if int(b.get("beat_number") or -1) == int(beat)), None)
+    target = next(
+        (b for b in beats if int(b.get("beat_number") or -1) == int(beat)), None
+    )
     if not target:
         raise ValueError(f"beat not found: ep{episode} beat{beat}")
 
     episode_obj = await store.get_episode_from_graph(episode)
     prop_menu = [
         item.model_dump()
-        for item in build_prop_menu(prop_menu=getattr(episode_obj, "prop_menu", []) or [])
+        for item in build_prop_menu(
+            prop_menu=getattr(episode_obj, "prop_menu", []) or []
+        )
     ]
     try:
-        from novelvideo.services.prop_ref_service import runtime_prop_menu_with_cached_global_props
+        from novelvideo.services.prop_ref_service import (
+            runtime_prop_menu_with_cached_global_props,
+        )
 
         prop_menu = runtime_prop_menu_with_cached_global_props(
             prop_menu=prop_menu,
@@ -994,8 +1026,12 @@ async def build_beat_preset_context(
                 else None
             ),
             exists=preview_bg_exists,
-            media_type=_media_type_for_path(preview_bg_path) if preview_bg_path else "image",
-            aspect_ratio=_aspect_ratio_for_ref(preview_bg_path) if preview_bg_path else "16:9",
+            media_type=_media_type_for_path(preview_bg_path)
+            if preview_bg_path
+            else "image",
+            aspect_ratio=_aspect_ratio_for_ref(preview_bg_path)
+            if preview_bg_path
+            else "16:9",
             meta=selected_bg_meta,
         )
     )
@@ -1022,7 +1058,9 @@ async def build_beat_preset_context(
             identity_id=identity_id,
         )
 
-    detected_props = [_prop_id_from_item(x) for x in _as_list(target.get("detected_props"))]
+    detected_props = [
+        _prop_id_from_item(x) for x in _as_list(target.get("detected_props"))
+    ]
     prop_ids = _real_prop_ids([*marker_props, *detected_props])
     seen_props: set[str] = set()
     for prop_id in prop_ids:
@@ -1064,10 +1102,14 @@ async def build_beat_preset_context(
                                 if hasattr(identity, "model_dump")
                                 else _jsonable(identity)
                             )
-                            for identity in (getattr(character_obj, "identities", []) or [])
+                            for identity in (
+                                getattr(character_obj, "identities", []) or []
+                            )
                         ],
                     }
-                    for character_obj in getattr(store, "get_all_characters", lambda: [])()
+                    for character_obj in getattr(
+                        store, "get_all_characters", lambda: []
+                    )()
                 ],
                 episode_beats=beats,
             )
@@ -1107,7 +1149,9 @@ async def build_beat_preset_context(
                 getattr(character_obj, "appearance_details", "") or ""
             ).strip(),
             "identities": [
-                identity.model_dump() if hasattr(identity, "model_dump") else _jsonable(identity)
+                identity.model_dump()
+                if hasattr(identity, "model_dump")
+                else _jsonable(identity)
                 for identity in (getattr(character_obj, "identities", []) or [])
             ],
         }
@@ -1178,11 +1222,15 @@ async def build_episode_preset_context(
         detected_identities = [
             _identity_id_from_item(x) for x in _as_list(beat.get("detected_identities"))
         ]
-        detected_props = [_prop_id_from_item(x) for x in _as_list(beat.get("detected_props"))]
+        detected_props = [
+            _prop_id_from_item(x) for x in _as_list(beat.get("detected_props"))
+        ]
         scene_id = _normalize_scene_name(beat.get("scene_ref"))
         if scene_id:
             scene_ids.add(scene_id)
-        for identity_id in _real_identity_ids([*marker_identities, *detected_identities]):
+        for identity_id in _real_identity_ids(
+            [*marker_identities, *detected_identities]
+        ):
             identity_ids.add(identity_id)
         for prop_id in _real_prop_ids([*marker_props, *detected_props]):
             prop_ids.add(prop_id)
@@ -1478,7 +1526,9 @@ def _upload_node(node_id: str, x: int, y: int, ref: dict[str, Any]) -> dict[str,
     }
 
 
-def _pano_360_viewer_node(node_id: str, x: int, y: int, ref: dict[str, Any]) -> dict[str, Any]:
+def _pano_360_viewer_node(
+    node_id: str, x: int, y: int, ref: dict[str, Any]
+) -> dict[str, Any]:
     url = ref.get("url")
     node = {
         "id": node_id,
@@ -1501,7 +1551,9 @@ def _pano_360_viewer_node(node_id: str, x: int, y: int, ref: dict[str, Any]) -> 
     return node
 
 
-def _three_d_world_node(node_id: str, x: int, y: int, ref: dict[str, Any]) -> dict[str, Any]:
+def _three_d_world_node(
+    node_id: str, x: int, y: int, ref: dict[str, Any]
+) -> dict[str, Any]:
     url = ref.get("url")
     meta = ref.get("meta") if isinstance(ref.get("meta"), dict) else {}
     ply_kind = str(meta.get("ply_kind") or "").strip().lower()
@@ -1528,7 +1580,9 @@ def _three_d_world_node(node_id: str, x: int, y: int, ref: dict[str, Any]) -> di
     return node
 
 
-def _director_world_source_from_ref(ref: dict[str, Any], scene_id: str) -> dict[str, Any] | None:
+def _director_world_source_from_ref(
+    ref: dict[str, Any], scene_id: str
+) -> dict[str, Any] | None:
     url = ref.get("url")
     if not isinstance(url, str) or not url:
         return None
@@ -1583,7 +1637,9 @@ def _director_world_node(
         source = _director_world_source_from_ref(ref, scene_id)
         if not source:
             continue
-        source_url = str(source.get("pano_url") or source.get("ply_url") or source.get("url") or "")
+        source_url = str(
+            source.get("pano_url") or source.get("ply_url") or source.get("url") or ""
+        )
         if source_url and source_url in seen_urls:
             continue
         if source_url:
@@ -1592,7 +1648,9 @@ def _director_world_node(
 
     active_source = (
         next((source for source in sources if source.get("current")), None)
-        or next((source for source in sources if source.get("source_type") == "sog"), None)
+        or next(
+            (source for source in sources if source.get("source_type") == "sog"), None
+        )
         or (sources[0] if sources else None)
     )
     pano_source = next(
@@ -1696,7 +1754,9 @@ def _image_gen_node(
     }
 
 
-def _asset_image_node(node_id: str, x: int, y: int, ref: dict[str, Any]) -> dict[str, Any]:
+def _asset_image_node(
+    node_id: str, x: int, y: int, ref: dict[str, Any]
+) -> dict[str, Any]:
     node = _image_gen_node(
         node_id,
         x,
@@ -1715,12 +1775,15 @@ def _asset_image_node(node_id: str, x: int, y: int, ref: dict[str, Any]) -> dict
     return node
 
 
-def _ref_image_node(node_id: str, x: int, y: int, ref: dict[str, Any]) -> dict[str, Any]:
+def _ref_image_node(
+    node_id: str, x: int, y: int, ref: dict[str, Any]
+) -> dict[str, Any]:
     role = str(ref.get("role") or "")
     rel_path = str(ref.get("rel_path") or "")
     media_type = str(ref.get("media_type") or "")
     if role.startswith("scene_3gs_") or (
-        media_type == "file" and rel_path.lower().endswith((".ply", ".sog", ".splat", ".ksplat"))
+        media_type == "file"
+        and rel_path.lower().endswith((".ply", ".sog", ".splat", ".ksplat"))
     ):
         return _three_d_world_node(node_id, x, y, ref)
     if role in {"scene_director_pano_360", "scene_360"}:
@@ -1764,7 +1827,9 @@ def _edge(
     return edge
 
 
-def _candidate_binding_edge(edge_id: str, source: str, target: str, role: str) -> dict[str, Any]:
+def _candidate_binding_edge(
+    edge_id: str, source: str, target: str, role: str
+) -> dict[str, Any]:
     edge = _edge(edge_id, target, source)
     edge["data"] = {
         "edgeKind": "role_binding",
@@ -1919,7 +1984,9 @@ def _scene_prompt_content(scene_id: str, meta: dict[str, Any]) -> str:
     if description and description != env_prompt:
         lines.extend(["", "[Description]", description])
     if not env_prompt and not description:
-        lines.extend(["", "No scene prompt found; use the scene id as fallback intent."])
+        lines.extend(
+            ["", "No scene prompt found; use the scene id as fallback intent."]
+        )
     style_block = _scene_style_block_from_meta(meta)
     if style_block:
         lines.extend(["", style_block])
@@ -1945,18 +2012,24 @@ def _scene_style_block_from_meta(meta: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _project_style_meta(username: str, project: str, project_dir: Path) -> dict[str, str]:
+def _project_style_meta(
+    username: str, project: str, project_dir: Path
+) -> dict[str, str]:
     try:
         from novelvideo.config import IMAGE_DEFAULT_STYLE, get_style_preset
         from novelvideo.project_config import load_project_config
 
         project_config = load_project_config(username, project)
-        style_id = str(project_config.get("visual_style") or IMAGE_DEFAULT_STYLE).strip()
+        style_id = str(
+            project_config.get("visual_style") or IMAGE_DEFAULT_STYLE
+        ).strip()
         preset = get_style_preset(
             style_id, username=username, project=project, project_dir=str(project_dir)
         )
         label = str(preset.get("label") or style_id).strip()
-        style_name = f"{label} ({style_id})" if label and label != style_id else style_id
+        style_name = (
+            f"{label} ({style_id})" if label and label != style_id else style_id
+        )
         return {
             "style_name": style_name,
             "style_prompt": str(preset.get("style_instructions") or "").strip(),
@@ -2033,7 +2106,12 @@ def _scene_ply_input_roles(role: str, ref: dict[str, Any]) -> tuple[str, ...] | 
         return ("scene_director_pano_360", "scene_360")
     if "custom" in source_hint or ply_kind == "custom":
         return ("scene_master", "scene_director_pano_360", "scene_360")
-    return ("scene_master", "scene_reverse_master", "scene_director_pano_360", "scene_360")
+    return (
+        "scene_master",
+        "scene_reverse_master",
+        "scene_director_pano_360",
+        "scene_360",
+    )
 
 
 def _append_scene_asset_workflow(
@@ -2056,11 +2134,17 @@ def _append_scene_asset_workflow(
 
     for scene_index, (scene_id, items) in enumerate(sorted(scene_refs.items())):
         prompt_source_ref = next(
-            (ref for ref, _node_id in items if str(ref.get("role") or "") in SCENE_IMAGE_ROLES),
+            (
+                ref
+                for ref, _node_id in items
+                if str(ref.get("role") or "") in SCENE_IMAGE_ROLES
+            ),
             items[0][0],
         )
         prompt_meta = (
-            prompt_source_ref.get("meta") if isinstance(prompt_source_ref.get("meta"), dict) else {}
+            prompt_source_ref.get("meta")
+            if isinstance(prompt_source_ref.get("meta"), dict)
+            else {}
         )
         safe_scene = _safe_id(scene_id, fallback="scene")
         role_to_node: dict[str, str] = {}
@@ -2152,12 +2236,16 @@ def _append_scene_asset_workflow(
             _set_scene_node_position(reverse_node, 1460, -250 + scene_y)
 
             pano_roles = [
-                role for role in ("scene_director_pano_360", "scene_360") if role in role_to_node
+                role
+                for role in ("scene_director_pano_360", "scene_360")
+                if role in role_to_node
             ]
             for idx, role in enumerate(pano_roles):
                 # Pano viewer 从 x=620 右移到 x=1240,腾出左边空间给
                 # scene_director_pano_360 workflow trigger 表达数据流方向。
-                _set_scene_node_position(role_to_node.get(role), 1240, 500 + scene_y + idx * 320)
+                _set_scene_node_position(
+                    role_to_node.get(role), 1240, 500 + scene_y + idx * 320
+                )
 
             ply_roles = [
                 role
@@ -2171,7 +2259,9 @@ def _append_scene_asset_workflow(
                 if role in role_to_node
             ]
             for idx, role in enumerate(ply_roles):
-                _set_scene_node_position(role_to_node.get(role), 1460, 460 + scene_y + idx * 320)
+                _set_scene_node_position(
+                    role_to_node.get(role), 1460, 460 + scene_y + idx * 320
+                )
 
             for idx, role in enumerate(SCENE_PLY_WORKFLOW_ROLES):
                 _ensure_ply_workflow_node(role, x=1460, y=460 + scene_y + idx * 320)
@@ -2199,7 +2289,10 @@ def _append_scene_asset_workflow(
                             "kind": "scene_prompt",
                             "role": "scene_master_generation_prompt",
                             "label": f"{scene_id} master prompt",
-                            "meta": {"scene_id": scene_id, "scene_reference_kind": "master"},
+                            "meta": {
+                                "scene_id": scene_id,
+                                "scene_reference_kind": "master",
+                            },
                         },
                     )
                 )
@@ -2256,7 +2349,9 @@ def _append_scene_asset_workflow(
             if not any(node.get("id") == reverse_prompt_id for node in nodes):
                 reverse_meta = (
                     role_to_ref.get("scene_reverse_master", {}).get("meta")
-                    if isinstance(role_to_ref.get("scene_reverse_master", {}).get("meta"), dict)
+                    if isinstance(
+                        role_to_ref.get("scene_reverse_master", {}).get("meta"), dict
+                    )
                     else prompt_meta
                 )
                 nodes.append(
@@ -2333,7 +2428,10 @@ def _append_scene_asset_workflow(
                 # preset Phase 1d 阶段单独 emit。
                 # Beat 画布 (layout_style=="beat" / "sketch") 下,pano viewer 是
                 # 信息性参考节点 (没独立 trigger),prompt → pano viewer 仍有意义。
-                if layout_style == "default" and role in {"scene_director_pano_360", "scene_360"}:
+                if layout_style == "default" and role in {
+                    "scene_director_pano_360",
+                    "scene_360",
+                }:
                     continue
                 edges.append(
                     _edge(
@@ -2348,7 +2446,9 @@ def _append_scene_asset_workflow(
             source_ref = role_to_ref.get(pano_role)
             if not source_id or not source_ref:
                 continue
-            source_node = next((node for node in nodes if node.get("id") == source_id), None)
+            source_node = next(
+                (node for node in nodes if node.get("id") == source_id), None
+            )
             if source_node and source_node.get("type") == "pano360ViewerNode":
                 continue
             viewer_id = f"viewer_{_safe_id(source_id)}"
@@ -2417,7 +2517,9 @@ def _append_scene_asset_workflow(
                 "scene_3gs_custom_scene",
             }
             source_refs = [
-                ref for ref, _node_id in items if str(ref.get("role") or "") in source_roles
+                ref
+                for ref, _node_id in items
+                if str(ref.get("role") or "") in source_roles
             ]
 
             for pano_role in ("scene_director_pano_360", "scene_360"):
@@ -2446,7 +2548,10 @@ def _append_scene_asset_workflow(
                         "actualAspectRatio": "2:1",
                     }
                 )
-                nodes[:] = [pano_node if node.get("id") == pano_node_id else node for node in nodes]
+                nodes[:] = [
+                    pano_node if node.get("id") == pano_node_id else node
+                    for node in nodes
+                ]
 
             removed_world_node_ids = {
                 node_id
@@ -2454,7 +2559,11 @@ def _append_scene_asset_workflow(
                 if role.startswith("scene_3gs_") and node_id != director_world_id
             }
             if removed_world_node_ids:
-                nodes[:] = [node for node in nodes if node.get("id") not in removed_world_node_ids]
+                nodes[:] = [
+                    node
+                    for node in nodes
+                    if node.get("id") not in removed_world_node_ids
+                ]
                 edges[:] = [
                     edge
                     for edge in edges
@@ -2491,7 +2600,8 @@ def _append_scene_asset_workflow(
                 if not source_id:
                     continue
                 if any(
-                    edge.get("source") == source_id and edge.get("target") == director_world_id
+                    edge.get("source") == source_id
+                    and edge.get("target") == director_world_id
                     for edge in edges
                 ):
                     continue
@@ -2532,7 +2642,10 @@ def _append_director_capture_workflow(
         return
 
     def has_edge(source: str, target: str) -> bool:
-        return any(edge.get("source") == source and edge.get("target") == target for edge in edges)
+        return any(
+            edge.get("source") == source and edge.get("target") == target
+            for edge in edges
+        )
 
     for role in DIRECTOR_CAPTURE_IMAGE_ROLES:
         for target_id in role_to_nodes.get(role, []):
@@ -2595,7 +2708,9 @@ def _prop_profile_content(profile: dict[str, Any]) -> str:
     def _text(value: Any) -> str:
         return str(value or "").strip()
 
-    aliases = [str(item).strip() for item in profile.get("aliases") or [] if str(item).strip()]
+    aliases = [
+        str(item).strip() for item in profile.get("aliases") or [] if str(item).strip()
+    ]
     lines = [
         f"名称: {_text(profile.get('name'))}",
         f"类型: {_text(profile.get('prop_type')) or 'object'}",
@@ -2638,7 +2753,9 @@ def _identity_marker_context(
     identity_id: str,
     sketch_context: dict[str, Any],
 ) -> dict[str, str]:
-    character = _identity_character(identity_id, (sketch_context.get("characters") or {}).keys())
+    character = _identity_character(
+        identity_id, (sketch_context.get("characters") or {}).keys()
+    )
     profile = (sketch_context.get("characters") or {}).get(character) or {}
     suffix = _identity_name(identity_id, character)
     identity_data = next(
@@ -2649,11 +2766,17 @@ def _identity_marker_context(
         ),
         {},
     )
-    color = str((sketch_context.get("sketch_colors") or {}).get(identity_id) or "").strip()
+    color = str(
+        (sketch_context.get("sketch_colors") or {}).get(identity_id) or ""
+    ).strip()
     hex_code, color_name = _split_marker_color(color)
     gender = _gender_label(str(profile.get("gender") or ""))
-    body_type = str(identity_data.get("body_type") or profile.get("body_type") or "").strip()
-    body_desc = ", ".join(part for part in [gender, body_type] if part) or "character figure"
+    body_type = str(
+        identity_data.get("body_type") or profile.get("body_type") or ""
+    ).strip()
+    body_desc = (
+        ", ".join(part for part in [gender, body_type] if part) or "character figure"
+    )
     try:
         from novelvideo.generators.prompt_builder import PromptComponents
 
@@ -2670,7 +2793,9 @@ def _identity_marker_context(
         "color_name": color_name,
         "body_desc": body_desc,
         "appearance_details": str(
-            identity_data.get("appearance_details") or profile.get("appearance_details") or ""
+            identity_data.get("appearance_details")
+            or profile.get("appearance_details")
+            or ""
         ).strip(),
     }
 
@@ -2680,7 +2805,9 @@ def _prop_marker_context(
     prop_menu: list[dict[str, Any]],
     prop_marker_colors: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    prop_info = next((item for item in prop_menu if str(item.get("prop_id") or "") == prop_id), {})
+    prop_info = next(
+        (item for item in prop_menu if str(item.get("prop_id") or "") == prop_id), {}
+    )
     try:
         from novelvideo.generators.prompt_builder import PromptComponents
 
@@ -2708,7 +2835,9 @@ def _replace_beat_markers(
         if identity_id:
             marker = identity_markers.get(identity_id)
             if marker:
-                color_name = marker.get("color_name") or marker.get("color") or "assigned color"
+                color_name = (
+                    marker.get("color_name") or marker.get("color") or "assigned color"
+                )
                 return f"{marker.get('tag')} ({color_name})"
             return identity_id
         if prop_id:
@@ -2729,7 +2858,8 @@ def _beat_sketch_marker_context(context: dict[str, Any]) -> dict[str, Any]:
     visual_description = str(beat_data.get("visual_description") or "")
     marker_identities, marker_props = _visual_markers(visual_description)
     detected_identities = [
-        _identity_id_from_item(item) for item in _as_list(beat_data.get("detected_identities"))
+        _identity_id_from_item(item)
+        for item in _as_list(beat_data.get("detected_identities"))
     ]
     detected_props = [
         _prop_id_from_item(item) for item in _as_list(beat_data.get("detected_props"))
@@ -2760,7 +2890,9 @@ def _beat_sketch_marker_context(context: dict[str, Any]) -> dict[str, Any]:
     return {
         "identities": identities,
         "props": props,
-        "visual_with_tags": _replace_beat_markers(visual_description, identities, props),
+        "visual_with_tags": _replace_beat_markers(
+            visual_description, identities, props
+        ),
     }
 
 
@@ -2782,7 +2914,11 @@ def _beat_sketch_marker_content(marker_context: dict[str, Any]) -> str:
 
     prop_lines = []
     for marker in marker_context.get("props", {}).values():
-        description = marker.get("visual_prompt") or marker.get("description") or "core prop/object"
+        description = (
+            marker.get("visual_prompt")
+            or marker.get("description")
+            or "core prop/object"
+        )
         marker_color = str(marker.get("marker_color") or "").strip()
         if marker_color:
             prop_lines.append(
@@ -2790,7 +2926,9 @@ def _beat_sketch_marker_content(marker_context: dict[str, Any]) -> str:
                 f"marker color {marker_color}; {description}"
             )
         else:
-            prop_lines.append(f"- {marker.get('prop_id')} -> {marker.get('tag')} — {description}")
+            prop_lines.append(
+                f"- {marker.get('prop_id')} -> {marker.get('tag')} — {description}"
+            )
 
     lines = [
         "Sketch generation uses TEXT MARKERS, not image references.",
@@ -2849,13 +2987,19 @@ def _beat_sketch_prompt(context: dict[str, Any], marker_context: dict[str, Any])
                 "shape replacing the prop. ZERO internal detail; the color is only an "
                 "identity marker for the sketch stage."
             )
-            key_prop_color_lines.append(f"- {marker.get('tag')} — flat solid {marker_color} block.")
+            key_prop_color_lines.append(
+                f"- {marker.get('tag')} — flat solid {marker_color} block."
+            )
         else:
-            prop_lines.append(f"- {marker.get('prop_id')} {marker.get('tag')} — core prop/object.")
+            prop_lines.append(
+                f"- {marker.get('prop_id')} {marker.get('tag')} — core prop/object."
+            )
     color_law = ""
     if colored_targets:
         key_prop_colors = (
-            ["", "KEY PROP COLORS:", *key_prop_color_lines] if key_prop_color_lines else []
+            ["", "KEY PROP COLORS:", *key_prop_color_lines]
+            if key_prop_color_lines
+            else []
         )
         color_law = "\n".join(
             [
@@ -2924,8 +3068,12 @@ def _beat_render_prompt(context: dict[str, Any]) -> str:
         project_config,
         context.get("episode") or 1,
     )
-    sketch_colors = dict((context.get("sketch_context") or {}).get("sketch_colors") or {})
-    characters = list(((context.get("sketch_context") or {}).get("characters") or {}).values())
+    sketch_colors = dict(
+        (context.get("sketch_context") or {}).get("sketch_colors") or {}
+    )
+    characters = list(
+        ((context.get("sketch_context") or {}).get("characters") or {}).values()
+    )
     user_output_dir = project_dir.parent if project_dir else Path("output") / username
 
     character_map = build_character_map_for_grid(
@@ -2978,7 +3126,12 @@ def _beat_render_prompt(context: dict[str, Any]) -> str:
         for entry in PromptComponents.build_reference_image_plan(ctx, ordered_chars):
             kind = str(entry.get("kind") or "")
             path = ""
-            if kind in {"combined_composite", "composite", "portrait_only", "identity_portrait"}:
+            if kind in {
+                "combined_composite",
+                "composite",
+                "portrait_only",
+                "identity_portrait",
+            }:
                 path = str(entry.get("path") or "")
             elif kind in {"scene", "prop"}:
                 ref = entry.get("ref")
@@ -3135,11 +3288,15 @@ async def build_asset_preset_context(
         char_age_group = str(getattr(char, "age_group", "") or "youth")
         try:
             from novelvideo.config import IMAGE_DEFAULT_STYLE, get_style_preset
-            from novelvideo.generators.nanobanana_character import NanoBananaCharacterGenerator
+            from novelvideo.generators.nanobanana_character import (
+                NanoBananaCharacterGenerator,
+            )
             from novelvideo.project_config import load_project_config
 
             project_config = load_project_config(username, project)
-            project_style = str(project_config.get("visual_style") or IMAGE_DEFAULT_STYLE)
+            project_style = str(
+                project_config.get("visual_style") or IMAGE_DEFAULT_STYLE
+            )
             project_ethnicity = str(project_config.get("ethnicity") or "Chinese")
             style_preset = get_style_preset(
                 project_style,
@@ -3176,7 +3333,9 @@ async def build_asset_preset_context(
 
         generation_context["portrait"] = {
             "character": character,
-            "prompt": _novelvideo_portrait_full_prompt(portrait_prompt) if portrait_prompt else "",
+            "prompt": _novelvideo_portrait_full_prompt(portrait_prompt)
+            if portrait_prompt
+            else "",
             "display_name": f"{character} portrait prompt",
         }
 
@@ -3203,12 +3362,16 @@ async def build_asset_preset_context(
             )
 
         def _build_identity_generation_context(identity_obj: Any) -> dict[str, Any]:
-            current_identity_id = str(getattr(identity_obj, "identity_id", "") or "").strip()
+            current_identity_id = str(
+                getattr(identity_obj, "identity_id", "") or ""
+            ).strip()
             identity_name = str(
                 getattr(identity_obj, "identity_name", "")
                 or _identity_name(current_identity_id, character)
             ).strip()
-            appearance_details = str(getattr(identity_obj, "appearance_details", "") or "").strip()
+            appearance_details = str(
+                getattr(identity_obj, "appearance_details", "") or ""
+            ).strip()
             face_override = str(getattr(identity_obj, "face_prompt", "") or "").strip()
             identity_age = str(getattr(identity_obj, "age_group", "") or "").strip()
             is_age_variant = bool(identity_age and identity_age != char_age_group)
@@ -3226,13 +3389,17 @@ async def build_asset_preset_context(
             )
             if is_age_variant:
                 identity_portrait_path = identity_portrait or str(
-                    canonical_identity_portrait_path(project_dir, character, identity_name)
+                    canonical_identity_portrait_path(
+                        project_dir, character, identity_name
+                    )
                 )
             else:
                 identity_portrait_path = ""
             has_costume_image = bool(costume_image and Path(costume_image).exists())
             has_identity_portrait = bool(
-                is_age_variant and identity_portrait and Path(identity_portrait).exists()
+                is_age_variant
+                and identity_portrait
+                and Path(identity_portrait).exists()
             )
             if is_age_variant:
                 prompt = (
@@ -3260,7 +3427,9 @@ async def build_asset_preset_context(
                 identity_prompt=prompt,
                 has_costume_image=has_costume_image,
             )
-            identity_portrait_prompt = (face_override or appearance_details or prompt).strip()
+            identity_portrait_prompt = (
+                face_override or appearance_details or prompt
+            ).strip()
             full_identity_portrait_prompt = (
                 _novelvideo_portrait_full_prompt(identity_portrait_prompt)
                 if identity_portrait_prompt
@@ -3287,12 +3456,16 @@ async def build_asset_preset_context(
 
         identity_generation_contexts: list[dict[str, Any]] = []
         for identity_obj in getattr(char, "identities", None) or []:
-            current_identity_id = str(getattr(identity_obj, "identity_id", "") or "").strip()
+            current_identity_id = str(
+                getattr(identity_obj, "identity_id", "") or ""
+            ).strip()
             if not current_identity_id:
                 continue
             if asset_kind == "identity" and current_identity_id != identity_id:
                 continue
-            identity_generation_contexts.append(_build_identity_generation_context(identity_obj))
+            identity_generation_contexts.append(
+                _build_identity_generation_context(identity_obj)
+            )
         generation_context["identities"] = identity_generation_contexts
         if asset_kind == "character":
             _add_file_ref(
@@ -3304,7 +3477,9 @@ async def build_asset_preset_context(
                 kind="identity",
                 role="character_portrait",
                 label=f"{character} portrait",
-                rel_path=_rel(project_dir, canonical_portrait_path(project_dir, character)),
+                rel_path=_rel(
+                    project_dir, canonical_portrait_path(project_dir, character)
+                ),
                 meta={"character": character},
             )
             for existing_identity_id in char_identity_ids:
@@ -3319,7 +3494,9 @@ async def build_asset_preset_context(
                 )
             for identity_ctx in identity_generation_contexts:
                 identity_name = str(identity_ctx.get("identity_name") or "").strip()
-                portrait_path = str(identity_ctx.get("identity_portrait_path") or "").strip()
+                portrait_path = str(
+                    identity_ctx.get("identity_portrait_path") or ""
+                ).strip()
                 if portrait_path:
                     _add_file_ref(
                         refs,
@@ -3338,7 +3515,9 @@ async def build_asset_preset_context(
                             "identity_name": identity_name,
                         },
                     )
-                costume_path = str(identity_ctx.get("identity_costume_path") or "").strip()
+                costume_path = str(
+                    identity_ctx.get("identity_costume_path") or ""
+                ).strip()
                 if costume_path:
                     _add_file_ref(
                         refs,
@@ -3371,13 +3550,18 @@ async def build_asset_preset_context(
                 (
                     item
                     for item in identity_generation_contexts
-                    if str(item.get("identity_id") or "").strip() == (identity_id or "").strip()
+                    if str(item.get("identity_id") or "").strip()
+                    == (identity_id or "").strip()
                 ),
                 None,
             )
             if target_identity_ctx:
-                identity_name = str(target_identity_ctx.get("identity_name") or "").strip()
-                portrait_path = str(target_identity_ctx.get("identity_portrait_path") or "").strip()
+                identity_name = str(
+                    target_identity_ctx.get("identity_name") or ""
+                ).strip()
+                portrait_path = str(
+                    target_identity_ctx.get("identity_portrait_path") or ""
+                ).strip()
                 if portrait_path:
                     _add_file_ref(
                         refs,
@@ -3397,8 +3581,12 @@ async def build_asset_preset_context(
                         },
                     )
             if target_identity_ctx:
-                identity_name = str(target_identity_ctx.get("identity_name") or "").strip()
-                costume_path = str(target_identity_ctx.get("identity_costume_path") or "").strip()
+                identity_name = str(
+                    target_identity_ctx.get("identity_name") or ""
+                ).strip()
+                costume_path = str(
+                    target_identity_ctx.get("identity_costume_path") or ""
+                ).strip()
                 if costume_path:
                     _add_file_ref(
                         refs,
@@ -3434,18 +3622,22 @@ async def build_asset_preset_context(
             for beat in visual_beats:
                 visual = str(getattr(beat, "visual_description", "") or "")
                 try:
-                    detected = json.loads(getattr(beat, "detected_identities_json", "[]") or "[]")
+                    detected = json.loads(
+                        getattr(beat, "detected_identities_json", "[]") or "[]"
+                    )
                 except Exception:
                     detected = []
                 detected_ids = [_identity_id_from_item(x) for x in _as_list(detected)]
                 mentions_character = character in visual
                 mentions_identity = bool(
-                    identity_id and (identity_id in visual or identity_id in detected_ids)
+                    identity_id
+                    and (identity_id in visual or identity_id in detected_ids)
                 )
                 mentions_any_known_identity = bool(
                     asset_kind == "character"
                     and any(
-                        existing_id and (existing_id in visual or existing_id in detected_ids)
+                        existing_id
+                        and (existing_id in visual or existing_id in detected_ids)
                         for existing_id in char_identity_ids
                     )
                 )
@@ -3510,7 +3702,9 @@ async def build_asset_preset_context(
         scene_info = (
             scene_obj.model_dump()
             if scene_obj is not None and hasattr(scene_obj, "model_dump")
-            else _jsonable(scene_obj) if scene_obj is not None else {}
+            else _jsonable(scene_obj)
+            if scene_obj is not None
+            else {}
         )
         base_scene_id = str(scene_info.get("base_scene_id") or "").strip()
         base_scene_info: dict[str, Any] = {}
@@ -3519,19 +3713,27 @@ async def build_asset_preset_context(
                 base_scene_obj = await store.get_scene(base_scene_id)
                 base_scene_info = (
                     base_scene_obj.model_dump()
-                    if base_scene_obj is not None and hasattr(base_scene_obj, "model_dump")
-                    else _jsonable(base_scene_obj) if base_scene_obj is not None else {}
+                    if base_scene_obj is not None
+                    and hasattr(base_scene_obj, "model_dump")
+                    else _jsonable(base_scene_obj)
+                    if base_scene_obj is not None
+                    else {}
                 )
             except Exception:
                 base_scene_info = {}
         if scene_info:
             scene_model = NovelScene(
-                name=str(scene_info.get("name") or scene_info.get("scene_id") or scene_name),
-                scene_type=str(scene_info.get("scene_type") or "interior") or "interior",
+                name=str(
+                    scene_info.get("name") or scene_info.get("scene_id") or scene_name
+                ),
+                scene_type=str(scene_info.get("scene_type") or "interior")
+                or "interior",
                 base_scene_id=base_scene_id,
                 variant_id=str(scene_info.get("variant_id") or "").strip(),
                 time_of_day=str(scene_info.get("time_of_day") or "").strip(),
-                environment_prompt=str(scene_info.get("environment_prompt") or "").strip(),
+                environment_prompt=str(
+                    scene_info.get("environment_prompt") or ""
+                ).strip(),
                 variant_prompt=str(scene_info.get("variant_prompt") or "").strip(),
                 description=str(scene_info.get("description") or "").strip(),
             )
@@ -3543,8 +3745,11 @@ async def build_asset_preset_context(
                         or base_scene_info.get("scene_id")
                         or base_scene_id
                     ),
-                    scene_type=str(base_scene_info.get("scene_type") or "interior") or "interior",
-                    environment_prompt=str(base_scene_info.get("environment_prompt") or "").strip(),
+                    scene_type=str(base_scene_info.get("scene_type") or "interior")
+                    or "interior",
+                    environment_prompt=str(
+                        base_scene_info.get("environment_prompt") or ""
+                    ).strip(),
                     description=str(base_scene_info.get("description") or "").strip(),
                 )
             scene_info["effective_environment_prompt"] = build_scene_effective_prompt(
@@ -3561,7 +3766,9 @@ async def build_asset_preset_context(
                 base_scene_info.get("scene_type") or ""
             ).strip()
             if base_scene_id:
-                base_master_path = canonical_scene_master_path(project_dir, base_scene_id)
+                base_master_path = canonical_scene_master_path(
+                    project_dir, base_scene_id
+                )
                 if base_master_path.exists():
                     base_master_rel_path = _rel(project_dir, base_master_path)
                     scene_info["base_master_rel_path"] = base_master_rel_path
@@ -3570,7 +3777,10 @@ async def build_asset_preset_context(
                         project_dir,
                         base_master_rel_path,
                     )
-        scene_info = {**scene_info, **_project_style_meta(username, project, project_dir)}
+        scene_info = {
+            **scene_info,
+            **_project_style_meta(username, project, project_dir),
+        }
         _add_scene_refs(
             refs,
             project_id=project_id,
@@ -3612,7 +3822,8 @@ async def build_asset_preset_context(
             else {
                 "prop_id": prop_id,
                 "prop_type": prop_profile["prop_type"] or "object",
-                "visual_prompt": prop_profile["visual_prompt"] or prop_profile["description"],
+                "visual_prompt": prop_profile["visual_prompt"]
+                or prop_profile["description"],
                 "description": prop_profile["description"],
             }
         )
@@ -3630,7 +3841,9 @@ async def build_asset_preset_context(
         try:
             from novelvideo.project_config import load_project_config_file
 
-            project_config = load_project_config_file(username, project) if project else {}
+            project_config = (
+                load_project_config_file(username, project) if project else {}
+            )
         except Exception:
             project_config = {}
         project_style = str(
@@ -3706,7 +3919,10 @@ def build_canvas_payload_from_context(
         r
         for r in context.get("refs", [])
         if str(r.get("role") or "") not in _hidden_roles
-        and ((r.get("exists") and r.get("url")) or str(r.get("role") or "") in _always_keep_roles)
+        and (
+            (r.get("exists") and r.get("url"))
+            or str(r.get("role") or "") in _always_keep_roles
+        )
     ]
     image_refs = [
         r
@@ -3718,10 +3934,13 @@ def build_canvas_payload_from_context(
         image_refs = [
             r
             for r in image_refs
-            if str(r.get("role") or "") not in {"related_sketch", "related_director_combined"}
+            if str(r.get("role") or "")
+            not in {"related_sketch", "related_director_combined"}
         ]
     is_beat_scope = context.get("scope") == "beat"
-    is_sketch_primary = is_beat_scope and str(context.get("primary_slot") or "").strip() == "sketch"
+    is_sketch_primary = (
+        is_beat_scope and str(context.get("primary_slot") or "").strip() == "sketch"
+    )
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     if context.get("scope") == "beat":
@@ -3796,7 +4015,9 @@ def build_canvas_payload_from_context(
                     return ref
             return None
 
-        def _episode_identity_ref(identity_id: str, character: str) -> dict[str, Any] | None:
+        def _episode_identity_ref(
+            identity_id: str, character: str
+        ) -> dict[str, Any] | None:
             return _episode_ref_for(
                 role="character_identity",
                 meta_key="identity_id",
@@ -3867,7 +4088,9 @@ def build_canvas_payload_from_context(
                 str(identity.get("character") or ""),
             )
             if identity_ref:
-                nodes.append(_ref_image_node(node_id, -1120, 160 + idx * 260, identity_ref))
+                nodes.append(
+                    _ref_image_node(node_id, -1120, 160 + idx * 260, identity_ref)
+                )
             else:
                 nodes.append(
                     _text_node(
@@ -3917,7 +4140,11 @@ def build_canvas_payload_from_context(
                         f"Prop: {prop_id}",
                         {
                             "mainline_context": [
-                                {"kind": "prop", "propId": prop_id, "role": "prop_context"}
+                                {
+                                    "kind": "prop",
+                                    "propId": prop_id,
+                                    "role": "prop_context",
+                                }
                             ],
                             "mainline_role": "context",
                         },
@@ -3978,7 +4205,10 @@ def build_canvas_payload_from_context(
             linked_identity_ids: set[str] = set()
             for identity_id in beat.get("detected_identities") or []:
                 identity_id = str(identity_id or "").strip()
-                if identity_id in identity_node_ids and identity_id not in linked_identity_ids:
+                if (
+                    identity_id in identity_node_ids
+                    and identity_id not in linked_identity_ids
+                ):
                     linked_identity_ids.add(identity_id)
                     edges.append(
                         _edge(
@@ -4043,7 +4273,10 @@ def build_canvas_payload_from_context(
                     "kind": "beat_prompt",
                     "role": "beat_visual_prompt",
                     "label": f"EP{context.get('episode')} Beat {context.get('beat')} visual prompt",
-                    "meta": {"episode": context.get("episode"), "beat": context.get("beat")},
+                    "meta": {
+                        "episode": context.get("episode"),
+                        "beat": context.get("beat"),
+                    },
                 },
             )
         )
@@ -4177,7 +4410,15 @@ def build_canvas_payload_from_context(
             base_x, base_y = base_positions.get(kind, (80, 1120))
             return base_x + (index % 2) * 360, base_y + (index // 2) * 360
 
-        beat_bucket_order = ["identity", "prop", "scene", "director", "sketch", "frame", "render"]
+        beat_bucket_order = [
+            "identity",
+            "prop",
+            "scene",
+            "director",
+            "sketch",
+            "frame",
+            "render",
+        ]
         role_counts: dict[str, int] = {
             str(ref.get("role") or ""): 1 for ref, _node_id in ref_node_ids
         }
@@ -4219,36 +4460,66 @@ def build_canvas_payload_from_context(
                 idx_for_kind += 1
 
         current_sketch_id = next(
-            (node_id for ref, node_id in ref_node_ids if ref.get("role") == "current_sketch"),
+            (
+                node_id
+                for ref, node_id in ref_node_ids
+                if ref.get("role") == "current_sketch"
+            ),
             None,
         )
         current_frame_id = next(
-            (node_id for ref, node_id in ref_node_ids if ref.get("role") == "current_frame"),
+            (
+                node_id
+                for ref, node_id in ref_node_ids
+                if ref.get("role") == "current_frame"
+            ),
             None,
         )
         selected_background_id = next(
-            (node_id for ref, node_id in ref_node_ids if ref.get("role") == "selected_background"),
+            (
+                node_id
+                for ref, node_id in ref_node_ids
+                if ref.get("role") == "selected_background"
+            ),
             None,
         )
         director_combined_id = next(
-            (node_id for ref, node_id in ref_node_ids if ref.get("role") == "director_combined"),
+            (
+                node_id
+                for ref, node_id in ref_node_ids
+                if ref.get("role") == "director_combined"
+            ),
             None,
         )
         scene_master_id = next(
-            (node_id for ref, node_id in ref_node_ids if ref.get("role") == "scene_master"),
+            (
+                node_id
+                for ref, node_id in ref_node_ids
+                if ref.get("role") == "scene_master"
+            ),
             None,
         )
         scene_reverse_master_id = next(
-            (node_id for ref, node_id in ref_node_ids if ref.get("role") == "scene_reverse_master"),
+            (
+                node_id
+                for ref, node_id in ref_node_ids
+                if ref.get("role") == "scene_reverse_master"
+            ),
             None,
         )
-        beat_data = context.get("beat_data") if isinstance(context.get("beat_data"), dict) else {}
+        beat_data = (
+            context.get("beat_data")
+            if isinstance(context.get("beat_data"), dict)
+            else {}
+        )
         detected_identity_id_list = _real_identity_ids(
-            _identity_id_from_item(item) for item in _as_list(beat_data.get("detected_identities"))
+            _identity_id_from_item(item)
+            for item in _as_list(beat_data.get("detected_identities"))
         )
         detected_identity_ids = set(detected_identity_id_list)
         detected_prop_id_list = _real_prop_ids(
-            _prop_id_from_item(item) for item in _as_list(beat_data.get("detected_props"))
+            _prop_id_from_item(item)
+            for item in _as_list(beat_data.get("detected_props"))
         )
         detected_prop_ids = set(detected_prop_id_list)
 
@@ -4266,7 +4537,9 @@ def build_canvas_payload_from_context(
                     return candidate
             if character:
                 character_identity_ids = [
-                    item for item in detected_identity_id_list if item.startswith(f"{character}_")
+                    item
+                    for item in detected_identity_id_list
+                    if item.startswith(f"{character}_")
                 ]
                 if len(character_identity_ids) == 1:
                     return character_identity_ids[0]
@@ -4469,7 +4742,9 @@ def build_canvas_payload_from_context(
                 role="sketch",
                 label="Sketch",
             )
-            for index, (identity_node_id, identity_id) in enumerate(identity_node_refs, start=1):
+            for index, (identity_node_id, identity_id) in enumerate(
+                identity_node_refs, start=1
+            ):
                 _append_skill_input_edge(
                     f"edge_{_safe_id(identity_node_id)}_to_skill_frame_identity_{index}",
                     identity_node_id,
@@ -4501,7 +4776,10 @@ def build_canvas_payload_from_context(
                 )
 
         if current_sketch_id:
-            for sketch_skill_id in (skill_background_sketch_id, skill_director_sketch_id):
+            for sketch_skill_id in (
+                skill_background_sketch_id,
+                skill_director_sketch_id,
+            ):
                 edges.append(
                     _edge(
                         f"edge_{sketch_skill_id}_to_{_safe_id(current_sketch_id)}",
@@ -4623,7 +4901,10 @@ def build_canvas_payload_from_context(
             if kind and str(ref.get("kind") or "") != kind:
                 continue
             meta = ref.get("meta") or {}
-            if identity_id is not None and str(meta.get("identity_id") or "") != identity_id:
+            if (
+                identity_id is not None
+                and str(meta.get("identity_id") or "") != identity_id
+            ):
                 continue
             return node_id
         return None
@@ -4641,7 +4922,10 @@ def build_canvas_payload_from_context(
             if kind and str(ref.get("kind") or "") != kind:
                 continue
             meta = ref.get("meta") or {}
-            if identity_id is not None and str(meta.get("identity_id") or "") != identity_id:
+            if (
+                identity_id is not None
+                and str(meta.get("identity_id") or "") != identity_id
+            ):
                 continue
             node_ids.append(node_id)
         return node_ids
@@ -4673,7 +4957,9 @@ def build_canvas_payload_from_context(
                 node.setdefault("data", {}).update(data)
                 return
 
-    def _append_edge_if_missing(edge_id: str, source: str | None, target: str | None) -> None:
+    def _append_edge_if_missing(
+        edge_id: str, source: str | None, target: str | None
+    ) -> None:
         if not source or not target:
             return
         for edge in edges:
@@ -4798,7 +5084,9 @@ def build_canvas_payload_from_context(
             if not current_identity_id:
                 continue
             safe_identity_id = _safe_id(current_identity_id, fallback="identity")
-            identity_name = str(identity_ctx.get("identity_name") or current_identity_id).strip()
+            identity_name = str(
+                identity_ctx.get("identity_name") or current_identity_id
+            ).strip()
             prompt = str(identity_ctx.get("prompt") or "").strip()
             prompt_node_id = f"prompt_identity_{safe_identity_id}"
             flow_node_id = f"flow_identity_{safe_identity_id}"
@@ -4873,7 +5161,9 @@ def build_canvas_payload_from_context(
             existing_identity_committed_url: Any = None
             for node in nodes:
                 if node.get("id") == identity_target_id:
-                    existing_identity_committed_url = (node.get("data") or {}).get("imageUrl")
+                    existing_identity_committed_url = (node.get("data") or {}).get(
+                        "imageUrl"
+                    )
                     break
             _update_node_data(
                 identity_target_id,
@@ -4903,7 +5193,9 @@ def build_canvas_payload_from_context(
                 existing_portrait_committed_url: Any = None
                 for node in nodes:
                     if node.get("id") == identity_portrait_ref_id:
-                        existing_portrait_committed_url = (node.get("data") or {}).get("imageUrl")
+                        existing_portrait_committed_url = (node.get("data") or {}).get(
+                            "imageUrl"
+                        )
                         break
                 portrait_prompt = str(
                     identity_ctx.get("identity_portrait_prompt")
@@ -4936,7 +5228,9 @@ def build_canvas_payload_from_context(
                 existing_costume_committed_url: Any = None
                 for node in nodes:
                     if node.get("id") == identity_costume_ref_id:
-                        existing_costume_committed_url = (node.get("data") or {}).get("imageUrl")
+                        existing_costume_committed_url = (node.get("data") or {}).get(
+                            "imageUrl"
+                        )
                         break
                 costume_prompt = prompt
                 _update_node_data(
@@ -4971,10 +5265,14 @@ def build_canvas_payload_from_context(
                 )
             reference_url = _node_image_url(portrait_source_id)
             if reference_url:
-                _update_node_data(identity_target_id, {"referenceImageUrl": reference_url})
+                _update_node_data(
+                    identity_target_id, {"referenceImageUrl": reference_url}
+                )
             workflow_asset_ids.append(identity_target_id)
 
-        usage_source_ids = workflow_asset_ids or ([portrait_ref_id] if portrait_ref_id else [])
+        usage_source_ids = workflow_asset_ids or (
+            [portrait_ref_id] if portrait_ref_id else []
+        )
         for idx, node_id in enumerate(usage_context_ids[:8]):
             paired_y = 260 + idx * 260
             _set_node_position(node_id, 1080, paired_y)
@@ -4987,7 +5285,9 @@ def build_canvas_payload_from_context(
 
         prop_context = generation_context.get("prop") or {}
         if asset_kind in {"prop", "prop_ref"} and prop_context:
-            prop_id = str(prop_context.get("prop_id") or context.get("asset_id") or "").strip()
+            prop_id = str(
+                prop_context.get("prop_id") or context.get("asset_id") or ""
+            ).strip()
             prop_ref_id = _find_ref_node_id(role="prop_reference", kind="prop")
             if prop_ref_id:
                 _set_node_position(prop_ref_id, -120, -120)
@@ -5047,7 +5347,9 @@ def build_canvas_payload_from_context(
         # 注:旧 \"scene_360\" role 已 deprecate (presets.py:703-710 注释),asset
         # preset 实际只 emit scene_director_pano_360。所以这里只查后者。
         scene_master_node_id = _find_ref_node_id(role="scene_master", kind="scene")
-        scene_reverse_node_id = _find_ref_node_id(role="scene_reverse_master", kind="scene")
+        scene_reverse_node_id = _find_ref_node_id(
+            role="scene_reverse_master", kind="scene"
+        )
         scene_pano_viewer_node_id = _find_ref_node_id(
             role="scene_director_pano_360",
             kind="scene",
@@ -5055,7 +5357,10 @@ def build_canvas_payload_from_context(
         # scene_id 来源: asset_id (scene preset_key 把它放 asset_id);兼容老路径
         # 也接 identity_id / character (有些 fixture 没分清)。
         scene_name_for_target = str(
-            context.get("asset_id") or context.get("identity_id") or context.get("character") or ""
+            context.get("asset_id")
+            or context.get("identity_id")
+            or context.get("character")
+            or ""
         ).strip()
         if scene_master_node_id and scene_name_for_target:
             existing_master_url: Any = None
