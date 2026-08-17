@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import UploadFile
 
-from novelvideo.api.schemas import CharacterUpdate
+from novelvideo.api.schemas import CharacterUpdate, VoiceDesignRequest
 from novelvideo.models import CharacterIdentity, NovelCharacter
 
 
@@ -87,6 +87,7 @@ async def test_list_characters_returns_indextts2_voice_fields(tmp_path, monkeypa
     voice_path.write_bytes(b"default voice")
     character = NovelCharacter(
         name="秦",
+        voice_prompt="沉稳清晰的青年男性声线",
         fish_voice_id="legacy-fish-id",
         reference_audio_path="assets/characters/秦/voices/voice_default.wav",
         reference_audio_sha256="default-sha",
@@ -111,6 +112,7 @@ async def test_list_characters_returns_indextts2_voice_fields(tmp_path, monkeypa
     asset = response["data"][0]
     assert "fish_voice_id" not in asset
     assert asset["reference_audio_path"] == "assets/characters/秦/voices/voice_default.wav"
+    assert asset["voice_prompt"] == "沉稳清晰的青年男性声线"
     assert asset["reference_audio_url"] == (
         "/static/projects/proj_demo/assets/characters/秦/voices/voice_default.wav"
     )
@@ -383,3 +385,38 @@ async def test_delete_character_voice_sample_clears_age_slot(tmp_path, monkeypat
     assert response["data"]["slot"] == "child"
     assert response["data"]["path"] == ""
     assert "child" not in store.updates[-1][1]["voice_samples_by_age_group"]
+
+
+@pytest.mark.asyncio
+async def test_generated_voice_saves_the_adopted_prompt(tmp_path, monkeypatch):
+    from novelvideo.api.routes import characters
+
+    character = NovelCharacter(name="秦", voice_prompt="提取阶段的声线提示词")
+    store = _CharacterStore([character])
+    _patch_project(monkeypatch, characters, tmp_path, store)
+
+    async def fake_generate_voice_design_audio(*, description: str, preview_text: str):
+        assert description == "用户最终采用的声线提示词"
+        assert preview_text == "试听台词"
+        return b"generated mp3"
+
+    monkeypatch.setattr(
+        characters,
+        "generate_voice_design_audio",
+        fake_generate_voice_design_audio,
+    )
+
+    response = await characters.generate_character_voice_sample(
+        project="demo",
+        name="秦",
+        slot="default",
+        body=VoiceDesignRequest(
+            description="用户最终采用的声线提示词",
+            preview_text="试听台词",
+        ),
+        user={"username": "admin"},
+    )
+
+    assert response["ok"] is True
+    assert character.voice_prompt == "用户最终采用的声线提示词"
+    assert store.updates[-1][1]["voice_prompt"] == "用户最终采用的声线提示词"

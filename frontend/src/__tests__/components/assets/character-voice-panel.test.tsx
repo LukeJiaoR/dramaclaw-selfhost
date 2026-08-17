@@ -206,6 +206,41 @@ describe("CharacterVoicePanel", () => {
     );
   });
 
+  it("uses the voice prompt produced during character extraction", async () => {
+    server.use(
+      http.get(
+        "http://localhost:3000/api/v1/projects/demo/characters/%E7%A7%A6/voice-samples",
+        () =>
+          HttpResponse.json({
+            ok: true,
+            data: {
+              character: "秦",
+              slots: [{ slot: "default", label: "默认（兜底）", path: "", url: "", sha256: "", updated_at: "", inherited_from_default: false, required: true }],
+            },
+          }),
+      ),
+    );
+
+    renderPanel({
+      name: "秦",
+      age_group: "youth",
+      gender: "男",
+      description: "角色简介不应覆盖声线提示词",
+      voice_prompt: "青年男性声线，音色清亮，语速从容，表演自然。",
+    });
+
+    await waitFor(() =>
+      expect(screen.getByText("未配置 → 角色将无法出声")).toBeInTheDocument(),
+    );
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "characters.voiceSamples.aiGenerate" })[0],
+    );
+
+    expect(
+      await screen.findByDisplayValue("青年男性声线，音色清亮，语速从容，表演自然。"),
+    ).toBeInTheDocument();
+  });
+
   it("shows an error instead of crashing when the voice API returns ok false", async () => {
     server.use(
       http.get(

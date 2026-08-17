@@ -87,7 +87,13 @@ async def test_character_extraction_keeps_single_narrator_main(monkeypatch):
 
     class _Result:
         characters = [
-            pipeline.CharacterEnrichment(name="桑落", role="主角", is_main=True, gender="女"),
+            pipeline.CharacterEnrichment(
+                name="桑落",
+                role="主角",
+                is_main=True,
+                gender="女",
+                voice_prompt="清冷克制的青年女性声线",
+            ),
             pipeline.CharacterEnrichment(name="楚寒", role="师尊", is_main=True, gender="男"),
             pipeline.CharacterEnrichment(name="林清清", role="师妹", is_main=False, gender="女"),
         ]
@@ -105,6 +111,7 @@ async def test_character_extraction_keeps_single_narrator_main(monkeypatch):
 
     assert [c.name for c in characters if c.is_main] == ["桑落"]
     assert all(isinstance(c, NovelCharacter) for c in characters)
+    assert characters[0].voice_prompt == "清冷克制的青年女性声线"
 
 
 @pytest.mark.asyncio

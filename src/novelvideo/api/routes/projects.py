@@ -23,6 +23,8 @@ from novelvideo.api.schemas import (
     CharacterVoiceRecordRequest,
     NarratorVoiceCopyRequest,
     NarratorVoiceTrimRequest,
+    VoiceDesignRequest,
+    VoicePromptOptimizeRequest,
     ProjectCreate,
     ProjectStatusFilter,
     ProjectSummary,
@@ -65,6 +67,7 @@ from novelvideo.seedance2_i2v.voice_clone import (
     NARRATION_STYLES,
     resolve_narrator_source,
 )
+from novelvideo.voice_design import generate_voice_design_audio, optimize_voice_description
 
 logger = logging.getLogger("novelvideo.api.projects")
 
@@ -660,6 +663,55 @@ async def record_narrator_voice(
         "ok": True,
         "data": _narrator_voice_payload(ctx, store),
     }
+
+
+@router.post("/projects/{project}/narrator-voice/generate")
+async def generate_narrator_voice(
+    project: str,
+    body: VoiceDesignRequest,
+    user: dict = Depends(get_api_user),
+):
+    """Generate and save the third-person narrator reference voice."""
+    ctx = await resolve_project_context(user=user, project_id=project, required_role="editor")
+    store = await make_sqlite_store_for_context(ctx)
+    try:
+        _ensure_third_person_narrator(ctx.owner_username, ctx.project_name)
+        content = await generate_voice_design_audio(
+            description=body.description,
+            preview_text=body.preview_text,
+        )
+        _persist_narrator_voice_content(
+            username=ctx.owner_username,
+            project=ctx.project_name,
+            project_dir=ctx.output_dir,
+            filename="ai-voice.mp3",
+            content=content,
+        )
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "data": _narrator_voice_payload(ctx, store)}
+
+
+@router.post("/projects/{project}/narrator-voice/optimize-prompt")
+async def optimize_narrator_voice_prompt(
+    project: str,
+    body: VoicePromptOptimizeRequest,
+    user: dict = Depends(get_api_user),
+):
+    """Optimize a narrator voice prompt through the configured text provider."""
+    ctx = await resolve_project_context(user=user, project_id=project, required_role="editor")
+    try:
+        description = await optimize_voice_description(
+            description=body.description,
+            preview_text=body.preview_text,
+            subject_context=(
+                f"项目：{ctx.project_name}\n"
+                "声线用途：第三人称有声剧旁白，负责叙事、转场和氛围铺陈"
+            ),
+        )
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "data": {"description": description}}
 
 
 @router.post("/projects/{project}/narrator-voice/copy")

@@ -58,6 +58,14 @@ We'll keep tearing down walls.
 
 <br/>
 
+> **Selfhost edition:** this repository adds a pluggable, visual Provider Hub,
+> OpenAI-compatible model routing, native local/remote ComfyUI workflows, and
+> AI voice design. See [SELFHOST.md](./SELFHOST.md) for the credential-free
+> deployment path using host ports above 10000. The original NewAPI deployment
+> remains available for upstream compatibility.
+
+<br/>
+
 <p align="center">
   <img src="./assets/hero.png" alt="DramaClaw — storytellers, back in front of the camera" width="820"/>
 </p>

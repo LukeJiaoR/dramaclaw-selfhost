@@ -72,6 +72,7 @@ async def test_build_characters_from_graph_only_adds_missing_characters(tmp_proj
         role="主角",
         description="用户修过的角色描述",
         face_prompt="用户修过的面部提示词",
+        voice_prompt="用户修过的声线提示词",
         reference_audio_path="voices/linwan.wav",
     )
     existing.identities = [
@@ -84,6 +85,7 @@ async def test_build_characters_from_graph_only_adds_missing_characters(tmp_proj
     ]
     await tmp_project.add_character(existing)
     await tmp_project.add_character(NovelCharacter(name="手动角色", description="手工补充"))
+    await tmp_project.add_character(NovelCharacter(name="待补全角色", description="已有角色"))
 
     async def fake_extract_characters_from_graph(**_kwargs):
         return [
@@ -91,8 +93,18 @@ async def test_build_characters_from_graph_only_adds_missing_characters(tmp_proj
                 name="林晚",
                 description="图谱新描述不应覆盖",
                 face_prompt="图谱新面部不应覆盖",
+                voice_prompt="图谱新声线不应覆盖",
             ),
-            NovelCharacter(name="新角色", description="图谱新增角色"),
+            NovelCharacter(
+                name="新角色",
+                description="图谱新增角色",
+                voice_prompt="清亮自然的青年声线",
+            ),
+            NovelCharacter(
+                name="待补全角色",
+                description="图谱描述不应覆盖",
+                voice_prompt="低沉克制的中年声线",
+            ),
         ]
 
     monkeypatch.setattr(
@@ -109,10 +121,15 @@ async def test_build_characters_from_graph_only_adds_missing_characters(tmp_proj
     assert preserved is not None
     assert preserved.description == "用户修过的角色描述"
     assert preserved.face_prompt == "用户修过的面部提示词"
+    assert preserved.voice_prompt == "用户修过的声线提示词"
     assert preserved.reference_audio_path == "voices/linwan.wav"
     assert [identity.identity_id for identity in preserved.identities] == ["林晚_校服"]
     assert tmp_project.get_character("手动角色") is not None
     assert tmp_project.get_character("新角色") is not None
+    assert tmp_project.get_character("新角色").voice_prompt == "清亮自然的青年声线"
+    backfilled = tmp_project.get_character("待补全角色")
+    assert backfilled.description == "已有角色"
+    assert backfilled.voice_prompt == "低沉克制的中年声线"
 
 
 @pytest.mark.asyncio

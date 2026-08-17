@@ -56,7 +56,7 @@ export function useBuildCharacters(project: string) {
 export function useCreateCharacter(project: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: { name: string; role?: string; gender?: string; is_main?: boolean; description?: string; face_prompt?: string }) =>
+    mutationFn: (data: { name: string; role?: string; gender?: string; is_main?: boolean; description?: string; face_prompt?: string; voice_prompt?: string }) =>
       api.post(p`api/v1/projects/${project}/characters`, { json: data }).json<OkResponse<Character>>(),
     onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.characters(project) }),
   });
@@ -321,6 +321,49 @@ export function useRecordCharacterVoiceSample(project: string, name: string) {
         .json<OkResponse<CharacterVoiceSlot> | ErrorResponse>(),
     onSuccess: (response) =>
       handleCharacterVoiceMutationSuccess(qc, project, name, response),
+  });
+}
+
+export function useGenerateCharacterVoiceSample(project: string, name: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      slot,
+      description,
+      previewText,
+    }: {
+      slot: string;
+      description: string;
+      previewText: string;
+    }) =>
+      api
+        .post(
+          p`api/v1/projects/${project}/characters/${name}/voice-samples/${slot}/generate`,
+          { json: { description, preview_text: previewText } },
+        )
+        .json<OkResponse<CharacterVoiceSlot> | ErrorResponse>(),
+    onSuccess: (response) =>
+      handleCharacterVoiceMutationSuccess(qc, project, name, response),
+  });
+}
+
+export function useOptimizeCharacterVoicePrompt(project: string, name: string) {
+  return useMutation({
+    mutationFn: ({
+      slot,
+      description,
+      previewText,
+    }: {
+      slot: string;
+      description: string;
+      previewText: string;
+    }) =>
+      api
+        .post(
+          p`api/v1/projects/${project}/characters/${name}/voice-samples/${slot}/optimize-prompt`,
+          { json: { description, preview_text: previewText } },
+        )
+        .json<OkResponse<{ description: string }> | ErrorResponse>(),
   });
 }
 

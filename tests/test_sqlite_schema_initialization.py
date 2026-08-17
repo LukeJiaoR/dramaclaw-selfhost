@@ -309,7 +309,7 @@ def test_task_and_project_schema_initialize_safely_across_processes(tmp_path):
             ).fetchall()
         )
         assert components["task_state"] == 1
-        assert components["project_store"] == 1
+        assert components["project_store"] == 2
         tables = {
             row[0]
             for row in conn.execute(

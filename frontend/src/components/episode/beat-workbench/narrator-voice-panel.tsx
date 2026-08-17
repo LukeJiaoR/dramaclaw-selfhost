@@ -2,10 +2,11 @@
 // Copyright (c) 2026 ClaymoreLab
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { FolderOpen, Loader2, Mic, Scissors, Square, Trash2, Upload } from "lucide-react";
+import { FolderOpen, Loader2, Mic, Scissors, Square, Trash2, Upload, WandSparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { VoiceDesignDialog, type VoiceDesignInput } from "@/components/assets/voice-design-dialog";
 import {
   Dialog,
   DialogContent,
@@ -26,6 +27,8 @@ import { resolveMediaUrl } from "@/lib/media-url";
 import {
   useCopyProjectNarratorVoice,
   useDeleteNarratorVoice,
+  useGenerateNarratorVoice,
+  useOptimizeNarratorVoicePrompt,
   useNarratorVoiceSources,
   useNarratorVoiceStatus,
   useRecordNarratorVoice,
@@ -70,6 +73,8 @@ export function NarratorVoicePanel({
   const copyProjectVoice = useCopyProjectNarratorVoice(project);
   const trimVoice = useTrimNarratorVoice(project);
   const deleteVoice = useDeleteNarratorVoice(project);
+  const generateVoice = useGenerateNarratorVoice(project);
+  const optimizeVoicePrompt = useOptimizeNarratorVoicePrompt(project);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -100,6 +105,7 @@ export function NarratorVoicePanel({
   const [trimOpen, setTrimOpen] = useState(false);
   const [trimStart, setTrimStart] = useState("0");
   const [trimDuration, setTrimDuration] = useState("4");
+  const [designOpen, setDesignOpen] = useState(false);
 
   const status = statusQuery.data?.data;
   const canEdit = Boolean(status && (allowFirstPersonProjectVoice || !status.is_first_person));
@@ -107,6 +113,7 @@ export function NarratorVoicePanel({
   const audioSrc = resolveMediaUrl(status?.reference_url);
   const pending =
     uploadVoice.isPending ||
+    generateVoice.isPending ||
     recordVoice.isPending ||
     copyProjectVoice.isPending ||
     trimVoice.isPending ||
@@ -130,6 +137,39 @@ export function NarratorVoicePanel({
     }
     toast.error(t("common.error"));
     return false;
+  };
+
+  const generateDesignedVoice = async (input: VoiceDesignInput): Promise<boolean> => {
+    try {
+      const res = await generateVoice.mutateAsync({
+        description: input.description,
+        previewText: input.previewText,
+      });
+      return finishMutation(
+        res,
+        t("episode.workbench.video.narratorVoiceGenerated"),
+      );
+    } catch {
+      toast.error(t("common.error"));
+      return false;
+    }
+  };
+
+  const optimizeDesignedVoicePrompt = async (input: VoiceDesignInput): Promise<string | null> => {
+    try {
+      const res = await optimizeVoicePrompt.mutateAsync({
+        description: input.description,
+        previewText: input.previewText,
+      });
+      if (isErrorResponse(res)) {
+        toast.error(res.error || t("common.error"));
+        return null;
+      }
+      if (isOkResponse<{ description: string }>(res)) return res.data.description;
+    } catch {
+      toast.error(t("common.error"));
+    }
+    return null;
   };
 
   const handleUploadFile = async (file: File) => {
@@ -316,6 +356,17 @@ export function NarratorVoicePanel({
       {/* Action buttons */}
       {canEdit && (
         <div className="mt-10 flex flex-wrap items-center justify-center gap-x-4 gap-y-3">
+          <Button
+            type="button"
+            size="xs"
+            variant="outline"
+            disabled={pending}
+            onClick={() => setDesignOpen(true)}
+            className={SECONDARY_ACTION_CLASS}
+          >
+            <WandSparkles className="size-3" />
+            {t("episode.workbench.video.narratorVoiceAiGenerate")}
+          </Button>
           <Button
             type="button"
             size="xs"
@@ -534,6 +585,18 @@ export function NarratorVoicePanel({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <VoiceDesignDialog
+        open={designOpen}
+        onOpenChange={setDesignOpen}
+        title={t("episode.workbench.video.narratorVoiceAiGenerateTitle")}
+        initialDescription={t("voiceDesign.narratorDescription")}
+        initialPreviewText={t("voiceDesign.narratorPreview")}
+        pending={generateVoice.isPending}
+        optimizing={optimizeVoicePrompt.isPending}
+        onOptimize={optimizeDesignedVoicePrompt}
+        onGenerate={generateDesignedVoice}
+      />
     </section>
   );
 }

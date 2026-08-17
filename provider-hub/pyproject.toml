@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dramaclaw-provider-hub"
+version = "0.2.0"
+description = "Pluggable provider gateway for DramaClaw"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.128.0",
+  "httpx>=0.28.0",
+  "pydantic>=2.0.0",
+  "python-multipart>=0.0.20",
+  "uvicorn[standard]>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "respx>=0.22.0"]
+
+[project.scripts]
+provider-hub = "provider_hub.app:main"
+provider-hub-import = "provider_hub.importer:main"
+
+[project.entry-points."dramaclaw_provider_hub.adapters"]
+openai = "provider_hub.adapters.openai:register"
+mimo = "provider_hub.adapters.mimo:register"
+video = "provider_hub.adapters.video:register"
+comfyui = "provider_hub.adapters.comfyui:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/provider_hub"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -67,6 +67,7 @@ export interface Character {
   age_group?: string;
   is_main?: boolean;
   face_prompt?: string;
+  voice_prompt?: string;
   body_type?: string;
   reference_audio_path?: string;
   reference_audio_url?: string;

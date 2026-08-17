@@ -1,0 +1,22 @@
+services:
+  provider-hub:
+    build: .
+    restart: unless-stopped
+    environment:
+      PROVIDER_HUB_DATA_DIR: /data
+      PROVIDER_HUB_API_KEY: ""
+      PROVIDER_HUB_LOG_LEVEL: INFO
+      PROVIDER_HUB_DOCKER: "1"
+    ports:
+      - "127.0.0.1:${PROVIDER_HUB_PORT:-18001}:18001"
+    volumes:
+      - provider-hub-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18001/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  provider-hub-data:

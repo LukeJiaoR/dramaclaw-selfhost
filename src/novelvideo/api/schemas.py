@@ -402,6 +402,7 @@ class CharacterCreate(BaseModel):
     age_group: str = "youth"
     description: str = ""
     face_prompt: str = ""
+    voice_prompt: str = ""
 
 
 # ── Freezone ─────────────────────────────────────────────────────────────────
@@ -1937,6 +1938,7 @@ class CreateIdentityAssetRequest(BaseModel):
 class CharacterUpdate(BaseModel):
     name: Optional[str] = None
     face_prompt: Optional[str] = None
+    voice_prompt: Optional[str] = None
     description: Optional[str] = None
     gender: Optional[str] = None
     age_group: Optional[str] = None
@@ -2053,6 +2055,16 @@ class AssetImageSourceSelectionRequest(BaseModel):
 
 class CharacterVoiceRecordRequest(BaseModel):
     data_url: str
+
+
+class VoiceDesignRequest(BaseModel):
+    description: str
+    preview_text: str
+
+
+class VoicePromptOptimizeRequest(BaseModel):
+    description: str
+    preview_text: str = ""
 
 
 class NarratorVoiceCopyRequest(BaseModel):

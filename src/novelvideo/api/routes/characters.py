@@ -37,6 +37,8 @@ from novelvideo.api.schemas import (
     IdentityImageGenRequest,
     CharacterVoiceRecordRequest,
     CharacterVoiceTrimRequest,
+    VoiceDesignRequest,
+    VoicePromptOptimizeRequest,
 )
 from novelvideo.config import (
     image_generation_selection_options,
@@ -71,6 +73,7 @@ from novelvideo.seedance2_i2v.character_voice_storage import (
     trim_existing_character_voice_file,
 )
 from novelvideo.sqlite_store import SQLiteStore
+from novelvideo.voice_design import generate_voice_design_audio, optimize_voice_description
 
 router = APIRouter()
 
@@ -505,6 +508,7 @@ async def _apply_character_voice_update(
     path: str,
     sha256: str,
     updated_at: str,
+    voice_prompt: str | None = None,
 ) -> dict:
     fields = _voice_slot_update_fields(
         character,
@@ -513,6 +517,8 @@ async def _apply_character_voice_update(
         sha256=sha256,
         updated_at=updated_at,
     )
+    if voice_prompt is not None:
+        fields["voice_prompt"] = voice_prompt
     await store.update_character(character.name, **fields)
     for key, value in fields.items():
         setattr(character, key, value)
@@ -578,6 +584,7 @@ async def list_characters(
             "age_group": getattr(c, "age_group", ""),
             "body_type": getattr(c, "body_type", ""),
             "face_prompt": getattr(c, "face_prompt", ""),
+            "voice_prompt": getattr(c, "voice_prompt", ""),
             "is_main": c.is_main if hasattr(c, "is_main") else False,
             "portrait_path": abs_portrait,
             "portrait_url": (
@@ -631,6 +638,7 @@ async def add_character(
         age_group=body.age_group,
         description=body.description,
         face_prompt=body.face_prompt,
+        voice_prompt=body.voice_prompt,
     )
     await store.add_character(char)
 
@@ -645,6 +653,7 @@ async def add_character(
                 "age_group",
                 "description",
                 "face_prompt",
+                "voice_prompt",
             }
         ),
     }
@@ -1186,6 +1195,93 @@ async def record_character_voice_sample(
             updated_at=updated_at,
         ),
     }
+
+
+@router.post("/projects/{project}/characters/{name}/voice-samples/{slot}/generate")
+async def generate_character_voice_sample(
+    project: str,
+    name: str,
+    slot: str,
+    body: VoiceDesignRequest,
+    user: dict = Depends(get_api_user),
+):
+    """Generate an AI voice and save it into an existing character voice slot."""
+    ctx, _username, _project_name, project_dir, _output_dir, store = (
+        await _resolve_character_project(project, user)
+    )
+    character = store.get_character(name)
+    if character is None:
+        return {"ok": False, "error": f"Character '{name}' not found"}
+    if slot not in VOICE_SAMPLE_SLOTS:
+        return {"ok": False, "error": f"Unsupported voice slot: {slot}"}
+    try:
+        content = await generate_voice_design_audio(
+            description=body.description,
+            preview_text=body.preview_text,
+        )
+        rel_path, sha256, updated_at = persist_character_voice_file(
+            project_dir=project_dir,
+            character_name=name,
+            slot=slot,
+            filename="ai-voice.mp3",
+            content=content,
+        )
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "data": await _apply_character_voice_update(
+            ctx=ctx,
+            project_dir=project_dir,
+            character=character,
+            store=store,
+            slot=slot,
+            path=rel_path,
+            sha256=sha256,
+            updated_at=updated_at,
+            voice_prompt=body.description.strip(),
+        ),
+    }
+
+
+@router.post("/projects/{project}/characters/{name}/voice-samples/{slot}/optimize-prompt")
+async def optimize_character_voice_prompt(
+    project: str,
+    name: str,
+    slot: str,
+    body: VoicePromptOptimizeRequest,
+    user: dict = Depends(get_api_user),
+):
+    """Optimize a character voice prompt using project character metadata."""
+    _ctx, _username, _project_name, _project_dir, _output_dir, store = (
+        await _resolve_character_project(project, user)
+    )
+    character = store.get_character(name)
+    if character is None:
+        return {"ok": False, "error": f"Character '{name}' not found"}
+    if slot not in VOICE_SAMPLE_SLOTS:
+        return {"ok": False, "error": f"Unsupported voice slot: {slot}"}
+    slot_label = VOICE_SLOT_LABELS.get(slot, slot)
+    context = "\n".join(
+        line
+        for line in (
+            f"角色：{character.name}",
+            f"声线用途：{slot_label}声线",
+            f"年龄段：{getattr(character, 'age_group', '') or '未指定'}",
+            f"性别：{getattr(character, 'gender', '') or '未指定'}",
+            f"角色设定：{getattr(character, 'description', '') or '未提供'}",
+        )
+        if line
+    )
+    try:
+        description = await optimize_voice_description(
+            description=body.description,
+            preview_text=body.preview_text,
+            subject_context=context,
+        )
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "data": {"description": description}}
 
 
 @router.post("/projects/{project}/characters/{name}/voice-samples/{slot}/trim")

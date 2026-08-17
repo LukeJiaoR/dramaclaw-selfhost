@@ -319,6 +319,10 @@ class CharacterEnrichment(BaseModel):
         default="",
         description="纯面部特征描述（发型、眼睛、肤色），不含服装",
     )
+    voice_prompt: str = Field(
+        default="",
+        description="可直接用于有声剧语音设计模型的中文声线描述",
+    )
 
 
 class CharacterEnrichmentList(BaseModel):
@@ -442,6 +446,11 @@ async def extract_characters_from_graph(
    示例："女性，二十多岁，黑色长发马尾，黑色杏眼，小麦肤色，瓜子脸"
    ⚠️ 不要在 face_prompt 中描述服装！
 
+10. **voice_prompt**: 可直接交给语音设计模型的中文声线提示词
+   - 只描述可听见的特征：年龄感、性别感、音高、音色、语速、咬字、情绪底色、表演方式和录音质感
+   - 结合角色性格，但不要写外貌、服装、剧情、动作、模型参数或具体台词
+   - 使用自然、明确、无歧义的中文单段描述，约 80-180 个汉字
+
 规则：
 - face_prompt 必须是纯面部特征，绝对不能包含服装描述
 - 图谱中同一人物的不同称呼要合并（利用 is_alias_of、same_as 等关系）
@@ -473,6 +482,7 @@ async def extract_characters_from_graph(
                 fish_voice_id=fish_voice_id,
                 description=enriched.description,
                 face_prompt=enriched.face_prompt,
+                voice_prompt=enriched.voice_prompt,
             )
             char.ensure_tag()
             characters.append(char)

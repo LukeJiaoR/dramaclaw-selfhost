@@ -131,6 +131,42 @@ export function useRecordNarratorVoice(project: string) {
   });
 }
 
+export function useGenerateNarratorVoice(project: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      description,
+      previewText,
+    }: {
+      description: string;
+      previewText: string;
+    }) =>
+      api
+        .post(p`api/v1/projects/${project}/narrator-voice/generate`, {
+          json: { description, preview_text: previewText },
+        })
+        .json<OkResponse<NarratorVoiceStatusData> | ErrorResponse>(),
+    onSuccess: () => invalidateNarratorVoiceQueries(qc, project),
+  });
+}
+
+export function useOptimizeNarratorVoicePrompt(project: string) {
+  return useMutation({
+    mutationFn: ({
+      description,
+      previewText,
+    }: {
+      description: string;
+      previewText: string;
+    }) =>
+      api
+        .post(p`api/v1/projects/${project}/narrator-voice/optimize-prompt`, {
+          json: { description, preview_text: previewText },
+        })
+        .json<OkResponse<{ description: string }> | ErrorResponse>(),
+  });
+}
+
 export function useCopyProjectNarratorVoice(project: string) {
   const qc = useQueryClient();
   return useMutation({

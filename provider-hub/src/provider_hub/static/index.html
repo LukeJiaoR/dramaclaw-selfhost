@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Provider Hub</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Provider Hub</h1>
+        <span id="health" class="status">连接中</span>
+      </div>
+      <div class="actions">
+        <input id="import-file" type="file" accept=".db,.sqlite,.sqlite3" hidden />
+        <button id="import-button" class="button secondary" type="button">导入 LocalMiniDrama</button>
+        <button id="add-service" class="button primary" type="button">新增服务</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="band defaults-section">
+        <div class="section-title">
+          <h2>默认能力</h2>
+          <span id="binding-save-state"></span>
+        </div>
+        <div id="bindings" class="binding-grid"></div>
+      </section>
+
+      <section class="band services-section">
+        <div class="section-title">
+          <h2>AI 服务</h2>
+          <div id="type-filter" class="segments"></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>类型</th>
+                <th>协议</th>
+                <th>默认模型</th>
+                <th>地址</th>
+                <th>状态</th>
+                <th class="right">操作</th>
+              </tr>
+            </thead>
+            <tbody id="services"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="band routes-section">
+        <div class="section-title">
+          <h2>链路覆盖</h2>
+          <button id="add-route" class="button secondary" type="button">新增覆盖</button>
+        </div>
+        <div id="routes" class="route-list"></div>
+      </section>
+    </main>
+
+    <dialog id="service-dialog">
+      <form id="service-form" method="dialog" autocomplete="off">
+        <div class="dialog-header">
+          <h2 id="service-dialog-title">新增服务</h2>
+          <button class="icon-button" value="cancel" aria-label="关闭" title="关闭" type="submit">×</button>
+        </div>
+        <input id="service-id" type="hidden" />
+        <div class="form-grid">
+          <label>名称<input id="service-name" required /></label>
+          <label>服务类型<select id="service-type"></select></label>
+          <label>Provider<input id="service-provider" required placeholder="openai" /></label>
+          <label>协议<select id="service-protocol"></select></label>
+          <label class="span-2">Base URL<input id="service-base-url" placeholder="https://api.example.com/v1" /></label>
+          <label class="span-2">API Key<input id="service-api-key" type="password" autocomplete="new-password" placeholder="留空保留现有密钥" /></label>
+          <label class="span-2">模型列表<input id="service-models" placeholder="model-a, model-b" /></label>
+          <label>默认模型<input id="service-default-model" /></label>
+          <label>优先级<input id="service-priority" type="number" value="0" /></label>
+          <label>提交端点<input id="service-endpoint" placeholder="/chat/completions" /></label>
+          <label>查询端点<input id="service-query-endpoint" placeholder="/tasks/{taskId}" /></label>
+          <label class="span-2">附加设置<textarea id="service-settings" rows="4" placeholder='{"voice_id":"mimo_default"}'></textarea></label>
+          <div id="comfy-workflows-section" class="span-2 workflow-editor" hidden>
+            <div class="workflow-editor-head">
+              <div><strong>ComfyUI Workflows</strong><span>使用 API Format JSON</span></div>
+              <button id="add-workflow" class="button small secondary" type="button">新增 Workflow</button>
+            </div>
+            <div id="comfy-workflows"></div>
+          </div>
+        </div>
+        <div class="checks">
+          <label><input id="service-active" type="checkbox" checked /> 启用</label>
+          <label><input id="service-default" type="checkbox" /> 设为该类型默认</label>
+        </div>
+        <div class="dialog-footer">
+          <button class="button secondary" value="cancel" type="submit">取消</button>
+          <button id="service-save" class="button primary" value="default" type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="route-dialog">
+      <form id="route-form" method="dialog">
+        <div class="dialog-header">
+          <h2>新增链路覆盖</h2>
+          <button class="icon-button" value="cancel" aria-label="关闭" title="关闭" type="submit">×</button>
+        </div>
+        <div class="form-grid single">
+          <label>DramaClaw 模型名<input id="route-incoming" required /></label>
+          <label>能力<select id="route-capability"></select></label>
+          <label>服务<select id="route-service"></select></label>
+          <label>上游模型<input id="route-upstream" /></label>
+        </div>
+        <div class="dialog-footer">
+          <button class="button secondary" value="cancel" type="submit">取消</button>
+          <button class="button primary" value="default" type="submit">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

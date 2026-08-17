@@ -950,13 +950,26 @@ class CogneeStore:
         log("保存新增角色到数据库...")
         added: list[NovelCharacter] = []
         skipped = 0
+        voice_prompts_backfilled = 0
         for char in characters:
-            if self.get_character(char.name):
+            existing = self.get_character(char.name)
+            if existing:
+                if not str(getattr(existing, "voice_prompt", "") or "").strip() and str(
+                    getattr(char, "voice_prompt", "") or ""
+                ).strip():
+                    await self.update_character(
+                        existing.name,
+                        voice_prompt=str(char.voice_prompt).strip(),
+                    )
+                    voice_prompts_backfilled += 1
                 skipped += 1
                 continue
             await self.add_character(char)
             added.append(char)
-        log(f"已新增 {len(added)} 个角色，跳过已有 {skipped} 个")
+        log(
+            f"已新增 {len(added)} 个角色，跳过已有 {skipped} 个，"
+            f"补全声线提示词 {voice_prompts_backfilled} 个"
+        )
 
         report(1.0, "角色提取完成")
         log(f"角色提取完成: 新增 {len(added)} 个，已有 {skipped} 个")

@@ -12,15 +12,19 @@ import {
   Trash2,
   Upload,
   Volume2,
+  WandSparkles,
 } from "lucide-react";
 
 import {
   useCharacterVoiceSamples,
   useDeleteCharacterVoiceSample,
+  useGenerateCharacterVoiceSample,
+  useOptimizeCharacterVoicePrompt,
   useRecordCharacterVoiceSample,
   useTrimCharacterVoiceSample,
   useUploadCharacterVoiceSample,
 } from "@/lib/queries/characters";
+import { VoiceDesignDialog, type VoiceDesignInput } from "@/components/assets/voice-design-dialog";
 import { resolveMediaUrl } from "@/lib/media-url";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -136,6 +140,8 @@ export function CharacterVoicePanel({
   const recordVoice = useRecordCharacterVoiceSample(project, character.name);
   const trimVoice = useTrimCharacterVoiceSample(project, character.name);
   const deleteVoice = useDeleteCharacterVoiceSample(project, character.name);
+  const generateVoice = useGenerateCharacterVoiceSample(project, character.name);
+  const optimizeVoicePrompt = useOptimizeCharacterVoicePrompt(project, character.name);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadSlotRef = useRef<string>("default");
@@ -166,6 +172,7 @@ export function CharacterVoicePanel({
   const [trimSlot, setTrimSlot] = useState<CharacterVoiceSlot | null>(null);
   const [trimStart, setTrimStart] = useState("0");
   const [trimDuration, setTrimDuration] = useState("4");
+  const [designSlot, setDesignSlot] = useState<CharacterVoiceSlot | null>(null);
   const [slotDurations, setSlotDurations] = useState<Record<string, number>>({});
   const voiceSamples = isOkResponse(samples.data) ? samples.data.data : undefined;
   const sampleSlots = voiceSamples?.slots ?? EMPTY_VOICE_SLOTS;
@@ -222,8 +229,57 @@ export function CharacterVoicePanel({
   const pending =
     uploadVoice.isPending ||
     recordVoice.isPending ||
+    generateVoice.isPending ||
     trimVoice.isPending ||
     deleteVoice.isPending;
+
+  const initialVoiceDescription = useMemo(() => {
+    if (character.voice_prompt?.trim()) return character.voice_prompt.trim();
+    const parts = [
+      character.age_group ? `${character.age_group}年龄段` : "",
+      character.gender || "",
+      "标准普通话，声音清晰自然，适合有声剧角色配音",
+      character.description || "",
+    ];
+    return parts.filter(Boolean).join("，");
+  }, [character.age_group, character.description, character.gender, character.voice_prompt]);
+
+  const generateDesignedVoice = async (input: VoiceDesignInput): Promise<boolean> => {
+    if (!designSlot) return false;
+    try {
+      const res = await generateVoice.mutateAsync({
+        slot: String(designSlot.slot),
+        description: input.description,
+        previewText: input.previewText,
+      });
+      return finishMutation<CharacterVoiceSlot>(
+        res,
+        t("characters.voiceSamples.generated"),
+      );
+    } catch {
+      toast.error(t("common.error"));
+      return false;
+    }
+  };
+
+  const optimizeDesignedVoicePrompt = async (input: VoiceDesignInput): Promise<string | null> => {
+    if (!designSlot) return null;
+    try {
+      const res = await optimizeVoicePrompt.mutateAsync({
+        slot: String(designSlot.slot),
+        description: input.description,
+        previewText: input.previewText,
+      });
+      if (isErrorResponse(res)) {
+        toast.error(res.error || t("common.error"));
+        return null;
+      }
+      if (isOkResponse<{ description: string }>(res)) return res.data.description;
+    } catch {
+      toast.error(t("common.error"));
+    }
+    return null;
+  };
 
   const finishMutation = <T,>(res: unknown, successMessage: string): boolean => {
     if (isErrorResponse(res)) {
@@ -492,6 +548,12 @@ export function CharacterVoicePanel({
 
                 <div className="flex items-center gap-1 shrink-0">
                   <VoiceActionButton
+                    label={t("characters.voiceSamples.aiGenerate")}
+                    icon={<WandSparkles className="size-3.5" />}
+                    disabled={pending}
+                    onClick={() => setDesignSlot(actionSlot)}
+                  />
+                  <VoiceActionButton
                     label={t("characters.voiceSamples.upload")}
                     icon={<Upload className="size-3.5" />}
                     disabled={pending}
@@ -678,6 +740,20 @@ export function CharacterVoicePanel({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <VoiceDesignDialog
+        open={Boolean(designSlot)}
+        onOpenChange={(open) => !open && setDesignSlot(null)}
+        title={t("characters.voiceSamples.aiGenerateTitle", {
+          slot: designSlot?.label ?? "",
+        })}
+        initialDescription={initialVoiceDescription}
+        initialPreviewText={t("voiceDesign.characterPreview", { name: character.name })}
+        pending={generateVoice.isPending}
+        optimizing={optimizeVoicePrompt.isPending}
+        onOptimize={optimizeDesignedVoicePrompt}
+        onGenerate={generateDesignedVoice}
+      />
     </section>
   );
 }

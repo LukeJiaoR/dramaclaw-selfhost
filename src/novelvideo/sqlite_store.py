@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS characters (
     fish_voice_id     TEXT DEFAULT '',
     description       TEXT DEFAULT '',
     face_prompt       TEXT DEFAULT '',
+    voice_prompt      TEXT DEFAULT '',
     appearance_details TEXT DEFAULT '',
     identities_json   TEXT DEFAULT '[]',
     created_at        TEXT DEFAULT (datetime('now')),
@@ -251,7 +252,7 @@ _PROJECT_STORE_SCHEMA_COMPONENT = "project_store"
 # MIGRATION CONTRACT: increment this whenever SQLITE_SCHEMA_SQL or any
 # _ensure_*_columns migration above changes. Existing databases skip the
 # initializer after this version has been recorded.
-_PROJECT_STORE_SCHEMA_VERSION = 1
+_PROJECT_STORE_SCHEMA_VERSION = 2
 
 
 def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
@@ -389,6 +390,7 @@ class SQLiteStore:
             self._ensure_beat_current_columns(db)
             self._ensure_scene_columns(db)
             self._ensure_indextts2_columns(db)
+            self._ensure_character_prompt_columns(db)
 
         ensure_sqlite_schema(
             path,
@@ -428,6 +430,10 @@ class SQLiteStore:
         }
         for name, definition in char_columns.items():
             _add_column_if_missing(db, "characters", name, definition)
+
+    def _ensure_character_prompt_columns(self, db: sqlite3.Connection) -> None:
+        """Add independently editable character-generation prompt fields."""
+        _add_column_if_missing(db, "characters", "voice_prompt", "TEXT DEFAULT ''")
 
     def _ensure_episode_planning_columns(self, db: sqlite3.Connection) -> None:
         """Add episode columns introduced after early project databases were created."""
@@ -647,16 +653,17 @@ class SQLiteStore:
         db = await self._ensure_db()
         await db.execute(
             """INSERT INTO characters (name, aliases_json, role, is_main, gender, age_group,
-               body_type, fish_voice_id, description, face_prompt, appearance_details, identities_json,
+               body_type, fish_voice_id, description, face_prompt, voice_prompt, appearance_details, identities_json,
                reference_audio_path, reference_audio_sha256, reference_audio_updated_at,
                voice_samples_by_age_group_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET
                aliases_json=excluded.aliases_json, role=excluded.role,
                is_main=excluded.is_main, gender=excluded.gender,
                age_group=excluded.age_group, body_type=excluded.body_type,
                fish_voice_id=excluded.fish_voice_id, description=excluded.description,
-               face_prompt=excluded.face_prompt, appearance_details=excluded.appearance_details,
+               face_prompt=excluded.face_prompt, voice_prompt=excluded.voice_prompt,
+               appearance_details=excluded.appearance_details,
                identities_json=excluded.identities_json,
                reference_audio_path=excluded.reference_audio_path,
                reference_audio_sha256=excluded.reference_audio_sha256,
@@ -674,6 +681,7 @@ class SQLiteStore:
                 character.fish_voice_id,
                 character.description,
                 character.face_prompt,
+                character.voice_prompt,
                 character.appearance_details,
                 character.identities_json,
                 character.reference_audio_path,
@@ -1353,6 +1361,10 @@ class SQLiteStore:
                 fish_voice_id=row["fish_voice_id"] if "fish_voice_id" in row.keys() else "",
                 description=row["description"] or "",
                 face_prompt=row["face_prompt"] or "",
+                voice_prompt=(
+                    row["voice_prompt"] if "voice_prompt" in row.keys() else ""
+                )
+                or "",
                 appearance_details=row["appearance_details"] or "",
                 identities_json=row["identities_json"] or "[]",
                 reference_audio_path=(
