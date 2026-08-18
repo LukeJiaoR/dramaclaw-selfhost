@@ -9,7 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from novelvideo.api.auth import get_api_user, require_project_scope
 from novelvideo.api.deps import get_sqlite_store, resolve_project_scope
-from novelvideo.api.schemas import ContentUpdateRequest, RewriteGenerateRequest
+from novelvideo.api.schemas import (
+    ContentUpdateRequest,
+    RewriteGenerateRequest,
+    RewriteSettingsSuggestionRequest,
+)
 from novelvideo.ports import get_usage_meter
 from novelvideo.sqlite_store import SQLiteStore
 
@@ -234,6 +238,110 @@ async def generate_rewrite(
             "used_fallback": not bool(normalized),
         },
     }
+
+
+@router.post("/projects/{project}/episodes/{episode_num}/rewrite/suggest-settings")
+async def suggest_rewrite_settings(
+    project: str,
+    episode_num: int,
+    body: RewriteSettingsSuggestionRequest,
+    user: dict = Depends(require_project_scope("projects:write")),
+    store: SQLiteStore = Depends(get_sqlite_store),
+):
+    """Recommend rewrite limits from effective story density."""
+    raw_content = (await store.load_episode_content(episode_num) or "").strip()
+    if not raw_content:
+        return {
+            "ok": False,
+            "error": f"第 {episode_num} 集尚未有原文，请先填写 raw-content",
+        }
+
+    resolved = await resolve_project_scope(project, user, required_role="editor")
+    ctx = getattr(resolved, "ctx", None)
+    project_id = str(getattr(ctx, "project_id", "") or "")
+    billing_user_id = _requester_user_id_for_billing(resolved, user)
+    usage_meter = get_usage_meter()
+    billing_context = {
+        "source": "sync_api",
+        "endpoint": "suggest_content_rewrite_settings",
+        "episode": episode_num,
+        "narration_style": body.narration_style or "first_person",
+    }
+    reservation = await usage_meter.reserve_feature_start_credits(
+        user_id=billing_user_id,
+        feature_key=CONTENT_REWRITE_FEATURE_KEY,
+        product_surface="mainline",
+        project_id=project_id,
+        resource_kind="script",
+        task_type=CONTENT_REWRITE_TASK_TYPE,
+        metadata=billing_context,
+        require_price_rule=True,
+        require_positive_cost=True,
+    )
+    reservation_id = str(reservation.get("id") or "")
+    model_billing_metadata: dict[str, Any] = {
+        "model_call_credit_policy": MODEL_CALL_CREDIT_POLICY_FEATURE_INCLUDED,
+        "feature_key": CONTENT_REWRITE_FEATURE_KEY,
+        "source": "sync_api",
+    }
+    if reservation_id:
+        model_billing_metadata.update(
+            {
+                "feature_credit_reservation_id": reservation_id,
+                "feature_credit_charge_id": reservation_id,
+                "feature_credit_cost": str(reservation.get("cost") or 0),
+            }
+        )
+
+    try:
+        usage_meter.set_llm_usage_context(
+            billing_user_id,
+            project_id=project_id,
+            resource_kind="script",
+            billing_metadata=model_billing_metadata,
+        )
+        await store.load_graph_state()
+        episode = store.get_episode(episode_num)
+        episode_title = getattr(episode, "title", "") if episode else ""
+
+        from novelvideo.agents.content_rewriter import (
+            suggest_rewrite_settings as suggest_settings,
+        )
+
+        suggestion = await suggest_settings(
+            raw_content,
+            episode_title=episode_title,
+        )
+    except Exception as exc:
+        if reservation_id:
+            try:
+                await usage_meter.settle_cancelled_feature_credit_reservation(
+                    reservation_id,
+                    metadata={**billing_context, "error": str(exc)},
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to settle interrupted rewrite suggestion reservation"
+                )
+        if isinstance(exc, ValueError):
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise
+    finally:
+        usage_meter.clear_llm_usage_context()
+
+    if reservation_id:
+        try:
+            await usage_meter.settle_feature_credit_reservation(
+                reservation_id,
+                action="confirm",
+                metadata=billing_context,
+            )
+        except Exception:
+            logger.exception(
+                "Rewrite settings suggestion succeeded but credit confirmation remains pending"
+            )
+
+    return {"ok": True, "data": suggestion.model_dump()}
 
 
 def _resolve_narrator_main_name(store: SQLiteStore) -> str:

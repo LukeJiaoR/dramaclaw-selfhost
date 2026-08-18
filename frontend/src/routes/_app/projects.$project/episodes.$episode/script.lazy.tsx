@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Loader2, Play, Sparkles, Square } from "lucide-react";
+import { Lightbulb, Loader2, Play, Sparkles, Square } from "lucide-react";
 
 import {
   isPlanEpisodeAssetsResult,
@@ -18,7 +18,11 @@ import {
 } from "@/lib/queries/episodes";
 import { useCharacters } from "@/lib/queries/characters";
 import { useProject } from "@/lib/queries/projects";
-import { useGenerateRewrite, useGenerateScript } from "@/lib/queries/scripts";
+import {
+  useGenerateRewrite,
+  useGenerateScript,
+  useSuggestRewriteSettings,
+} from "@/lib/queries/scripts";
 import { useTaskController } from "@/hooks/use-task-controller";
 import { queryKeys } from "@/lib/query-keys";
 import {
@@ -51,13 +55,18 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { saveScopes, trackSave } from "@/stores/save-status-store";
 import type { Character } from "@/types/character";
-
-const REWRITE_TARGET_BEATS_MIN = 5;
-const REWRITE_TARGET_BEATS_MAX = 80;
-const REWRITE_BEAT_CHARS_MIN_MIN = 4;
-const REWRITE_BEAT_CHARS_MIN_MAX = 50;
-const REWRITE_BEAT_CHARS_MAX_MIN = 4;
-const REWRITE_BEAT_CHARS_MAX_MAX = 80;
+import {
+  loadRewriteSettings,
+  REWRITE_BEAT_CHARS_MAX_MAX,
+  REWRITE_BEAT_CHARS_MAX_MIN,
+  REWRITE_BEAT_CHARS_MIN_MAX,
+  REWRITE_BEAT_CHARS_MIN_MIN,
+  REWRITE_TARGET_BEATS_MAX,
+  REWRITE_TARGET_BEATS_MIN,
+  rewriteSettingsStorageKey,
+  saveRewriteSettings,
+  type RewriteSettings,
+} from "@/lib/rewrite-settings";
 
 // While typing, parse the raw value WITHOUT clamping to the min — clamping a
 // half-typed value (e.g. "1" → min 4) would snap it back and make the next
@@ -121,6 +130,7 @@ function ScriptTabContent() {
       ? t("common.billingRuleNotConfiguredShort")
       : null);
   const generateRewrite = useGenerateRewrite(project, epNum);
+  const suggestRewriteSettings = useSuggestRewriteSettings(project, epNum);
   const generateRewriteCost = useGenerationCreditCost("feature", "mainline.content_rewrite");
   const generateRewriteCostDisplay =
     generateRewriteCost.data?.data.display ??
@@ -155,13 +165,31 @@ function ScriptTabContent() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [assetCategory, setAssetCategory] =
     useState<AssetPlanningCategory>("identities");
-  const [rewriteTargetBeats, setRewriteTargetBeats] = useState(18);
-  const [rewriteBeatCharsMin, setRewriteBeatCharsMin] = useState(14);
-  const [rewriteBeatCharsMax, setRewriteBeatCharsMax] = useState(20);
+  const rewriteStorageKey = rewriteSettingsStorageKey(project, epNum);
+  const [rewriteSettings, setRewriteSettings] = useState<RewriteSettings>(() =>
+    loadRewriteSettings(project, epNum),
+  );
+  const {
+    targetBeats: rewriteTargetBeats,
+    beatCharsMin: rewriteBeatCharsMin,
+    beatCharsMax: rewriteBeatCharsMax,
+  } = rewriteSettings;
   const initializedSourceRef = useRef("");
 
   const sourceScope = saveScopes.episodeSource(project, epNum);
   const identitiesScope = saveScopes.episodeIdentities(project, epNum);
+
+  useEffect(() => {
+    setRewriteSettings(loadRewriteSettings(project, epNum));
+  }, [epNum, project, rewriteStorageKey]);
+
+  const updateRewriteSettings = (update: Partial<RewriteSettings>) => {
+    setRewriteSettings((current) => {
+      const next = { ...current, ...update };
+      saveRewriteSettings(project, epNum, next);
+      return next;
+    });
+  };
 
   useEffect(() => {
     const initKey = `${project}:${epNum}`;
@@ -370,6 +398,29 @@ function ScriptTabContent() {
     }
   };
 
+  const handleSuggestRewriteSettings = async () => {
+    try {
+      const suggestionRes = await suggestRewriteSettings.mutateAsync();
+      if (suggestionRes.ok === false) {
+        toast.error(suggestionRes.error || t("common.error"));
+        return;
+      }
+      const suggestion = suggestionRes.data;
+      updateRewriteSettings({
+        targetBeats: suggestion.target_beats,
+        beatCharsMin: suggestion.beat_chars_min,
+        beatCharsMax: suggestion.beat_chars_max,
+      });
+      toast.success(
+        t("episode.script.aiSuggestionApplied", {
+          reason: suggestion.rationale,
+        }),
+      );
+    } catch (error) {
+      toast.error(backendErrorToastMessage(error, t));
+    }
+  };
+
   const handleGenerateScript = async () => {
     try {
       const readySource = await ensureBeatSourceText();
@@ -455,7 +506,10 @@ function ScriptTabContent() {
   );
   const scriptProgressLabel =
     scriptTask.stream.currentTask || t("common.preparing");
-  const generateButtonBusy = generateScript.isPending || generateRewrite.isPending;
+  const generateButtonBusy =
+    generateScript.isPending ||
+    generateRewrite.isPending ||
+    suggestRewriteSettings.isPending;
   const handleGenerateButtonClick = () => {
     if (scriptTask.started) {
       void scriptTask.stop();
@@ -493,20 +547,27 @@ function ScriptTabContent() {
                     max={REWRITE_TARGET_BEATS_MAX}
                     step={1}
                     value={rewriteTargetBeats}
-                    disabled={generating || generateRewrite.isPending}
+                    disabled={
+                      generating ||
+                      generateRewrite.isPending ||
+                      suggestRewriteSettings.isPending
+                    }
                     onChange={(event) =>
-                      setRewriteTargetBeats(
-                        parseRewriteNumber(event.target.value, rewriteTargetBeats),
-                      )
+                      updateRewriteSettings({
+                        targetBeats: parseRewriteNumber(
+                          event.target.value,
+                          rewriteTargetBeats,
+                        ),
+                      })
                     }
                     onBlur={() =>
-                      setRewriteTargetBeats((value) =>
-                        clampRewriteNumber(
-                          value,
+                      updateRewriteSettings({
+                        targetBeats: clampRewriteNumber(
+                          rewriteTargetBeats,
                           REWRITE_TARGET_BEATS_MIN,
                           REWRITE_TARGET_BEATS_MAX,
                         ),
-                      )
+                      })
                     }
                     className="h-7 w-14 rounded-[7px] px-2 text-xs tabular-nums"
                   />
@@ -521,20 +582,27 @@ function ScriptTabContent() {
                     max={REWRITE_BEAT_CHARS_MIN_MAX}
                     step={1}
                     value={rewriteBeatCharsMin}
-                    disabled={generating || generateRewrite.isPending}
+                    disabled={
+                      generating ||
+                      generateRewrite.isPending ||
+                      suggestRewriteSettings.isPending
+                    }
                     onChange={(event) =>
-                      setRewriteBeatCharsMin(
-                        parseRewriteNumber(event.target.value, rewriteBeatCharsMin),
-                      )
+                      updateRewriteSettings({
+                        beatCharsMin: parseRewriteNumber(
+                          event.target.value,
+                          rewriteBeatCharsMin,
+                        ),
+                      })
                     }
                     onBlur={() =>
-                      setRewriteBeatCharsMin((value) =>
-                        clampRewriteNumber(
-                          value,
+                      updateRewriteSettings({
+                        beatCharsMin: clampRewriteNumber(
+                          rewriteBeatCharsMin,
                           REWRITE_BEAT_CHARS_MIN_MIN,
                           REWRITE_BEAT_CHARS_MIN_MAX,
                         ),
-                      )
+                      })
                     }
                     className="h-7 w-14 rounded-[7px] px-2 text-xs tabular-nums"
                   />
@@ -549,20 +617,27 @@ function ScriptTabContent() {
                     max={REWRITE_BEAT_CHARS_MAX_MAX}
                     step={1}
                     value={rewriteBeatCharsMax}
-                    disabled={generating || generateRewrite.isPending}
+                    disabled={
+                      generating ||
+                      generateRewrite.isPending ||
+                      suggestRewriteSettings.isPending
+                    }
                     onChange={(event) =>
-                      setRewriteBeatCharsMax(
-                        parseRewriteNumber(event.target.value, rewriteBeatCharsMax),
-                      )
+                      updateRewriteSettings({
+                        beatCharsMax: parseRewriteNumber(
+                          event.target.value,
+                          rewriteBeatCharsMax,
+                        ),
+                      })
                     }
                     onBlur={() =>
-                      setRewriteBeatCharsMax((value) =>
-                        clampRewriteNumber(
-                          value,
+                      updateRewriteSettings({
+                        beatCharsMax: clampRewriteNumber(
+                          rewriteBeatCharsMax,
                           REWRITE_BEAT_CHARS_MAX_MIN,
                           REWRITE_BEAT_CHARS_MAX_MAX,
                         ),
-                      )
+                      })
                     }
                     className="h-7 w-14 rounded-[7px] px-2 text-xs tabular-nums"
                   />
@@ -571,8 +646,31 @@ function ScriptTabContent() {
               <Button
                 variant="outline"
                 size="sm"
+                onClick={handleSuggestRewriteSettings}
+                disabled={
+                  generating ||
+                  generateRewrite.isPending ||
+                  suggestRewriteSettings.isPending
+                }
+                className="h-7 gap-1.5 rounded-[7px] px-2.5 text-xs font-normal shadow-none"
+              >
+                {suggestRewriteSettings.isPending ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Lightbulb className="size-3.5" />
+                )}
+                {t("episode.script.aiSuggestSettings")}
+                <CreditCostInline display={generateRewriteCostDisplay} />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
                 onClick={handleGenerateRewrite}
-                disabled={generating || generateRewrite.isPending}
+                disabled={
+                  generating ||
+                  generateRewrite.isPending ||
+                  suggestRewriteSettings.isPending
+                }
                 className="h-7 gap-1.5 rounded-[7px] border-primary/35 bg-primary/[0.08] px-2.5 text-xs font-normal text-primary shadow-none hover:border-primary/55 hover:bg-primary/[0.14] hover:text-primary [&_svg]:size-3.5"
               >
                 {generateRewrite.isPending ? (

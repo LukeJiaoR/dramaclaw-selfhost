@@ -2036,6 +2036,8 @@
       "rewriteTargetBeats": "目标行数",
       "rewriteBeatCharsMin": "每行最少字",
       "rewriteBeatCharsMax": "每行最多字",
+      "aiSuggestSettings": "AI 建议",
+      "aiSuggestionApplied": "已应用 AI 建议：{{reason}}",
       "generateScript": "生成脚本",
       "generateLineByLine": "逐行生成",
       "rewriteComplete": "AI改写已完成",

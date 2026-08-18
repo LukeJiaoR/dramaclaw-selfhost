@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, model_validator
+from typing import Annotated
+
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 from pydantic_ai import Agent
 
 from novelvideo.config import (
@@ -32,6 +34,62 @@ class AdaptedContentOutput(BaseModel):
         return self
 
 
+class RewriteSettingsSuggestion(BaseModel):
+    """AI recommendation for converting one episode into narration beats."""
+
+    target_beats: int = Field(ge=5, le=80, description="建议的有效剧情 Beat 数")
+    beat_chars_min: int = Field(ge=4, le=50, description="建议的单行最少字符数")
+    beat_chars_max: int = Field(ge=4, le=80, description="建议的单行最多字符数")
+    rationale: str = Field(
+        min_length=1,
+        max_length=160,
+        description="一句话说明剧情密度判断和建议依据",
+    )
+
+    @model_validator(mode="after")
+    def validate_char_range(self) -> "RewriteSettingsSuggestion":
+        if self.beat_chars_min > self.beat_chars_max:
+            raise ValueError("beat_chars_min 不能大于 beat_chars_max")
+        return self
+
+
+def _constrained_output_type(
+    target_beats: int,
+    min_chars: int,
+    max_chars: int,
+) -> type[AdaptedContentOutput]:
+    """Build an output schema that makes the requested rewrite limits enforceable."""
+    constrained_line = Annotated[
+        str,
+        StringConstraints(min_length=min_chars, max_length=max_chars),
+    ]
+
+    class ConstrainedAdaptedContentOutput(AdaptedContentOutput):
+        lines: list[constrained_line] = Field(  # type: ignore[valid-type]
+            min_length=target_beats,
+            max_length=target_beats,
+            description=(
+                f"恰好 {target_beats} 行；每行 {min_chars}-{max_chars} 个字符"
+            ),
+        )
+
+        @model_validator(mode="after")
+        def enforce_requested_limits(self) -> "ConstrainedAdaptedContentOutput":
+            # The parent validator strips surrounding whitespace, so validate
+            # again to prevent padding from satisfying the schema constraints.
+            if len(self.lines) != target_beats:
+                raise ValueError(f"必须恰好输出 {target_beats} 行")
+            for index, line in enumerate(self.lines, start=1):
+                if not min_chars <= len(line) <= max_chars:
+                    raise ValueError(
+                        f"第 {index} 行必须为 {min_chars}-{max_chars} 个字符，"
+                        f"当前为 {len(line)} 个字符"
+                    )
+            return self
+
+    return ConstrainedAdaptedContentOutput
+
+
 REWRITE_PROMPT = """你是网文小说的短视频解说改写师。
 
 你的任务是把原文改写成逐行解说文本，每一行都会被下游工作流当作一个视频 beat。
@@ -42,11 +100,11 @@ REWRITE_PROMPT = """你是网文小说的短视频解说改写师。
 - 同时保留网文解说应有的节奏、情绪和钩子
 - 不是逐段摘要，也不是只摘高能片段，要在“剧情完整”和“听感抓人”之间平衡
 
-## 行长纪律（优先目标，不是死规矩）
-- 每行**优先**落在指定字数范围内（通常 14-20 字），这样 TTS 节奏最稳
-- 但字数只是推荐目标，不是机械硬切；**完整表达、关键信息、核心对白优先**
+## 行长纪律（硬约束）
+- 每行**必须**落在本次任务指定的字数范围内；输出结构会逐行校验，不合格会被退回重写
+- 通过调整句式、合并信息或拆分动作满足字数要求，同时保留完整表达、关键信息和核心对白
 - ⚠️ 不要出现 2-4 字的碎行（如"不。""我重生了。""而是。"）—— 这类单独成行会让 TTS 节奏崩掉
-- 一般情况下，行太长就拆；但如果拆开会损伤一句核心对白或一句完整攻防，就允许该行适度超出上限
+- 行太长时在自然气口拆分，或压缩同一行的叙述部分；任何行都不能超出上限
 - 如果一个信息点太短不够一行，和前后内容合并
 - 行长稳定很重要，但不要为了卡字数把句意切碎、把核心台词截断
 
@@ -86,7 +144,7 @@ REWRITE_PROMPT = """你是网文小说的短视频解说改写师。
 - ⚠️ 例如 `“劳妹妹费心，这汤药，你自己喝吧。”` 这种句子，不能只剩 `“劳妹妹费心。”`；`“万一汤药里有不妥，误了我可不好。”` 也不能只剩前半句
 - ⚠️ 禁止写成只有 `“你的一切，都是我的。”` 这种无 speaker 的句子；必须写成 `苏清柔冷笑着说：“你的一切，都是我的。”`
 - 引号内的对白文字内容**必须逐字保留原句**，不要加字、不要改措辞、不要改语气词；如果原文使用的是英文引号 `""`，输出时统一改用中文引号 `“”` 包裹即可
-- 如果对白略微超出推荐字数，但这是更自然的完整表达，优先保留整句
+- 对白接近或超出上限时，优先压缩说话方式和前后叙述；仍然过长则按自然气口拆分，但不得改写引号内原句
 - 只有在对白明显过长、严重拖慢节奏时，才截取最有冲击力的部分；且优先保留真正决定攻防关系的那半句
 - 说话方式从原文语境推断（冷笑、怒喝、低声、柔声、咬牙切齿、嘶哑着说 等）
 - 如果原文没有明确语气描写，根据剧情推断一个合理的说话方式
@@ -126,13 +184,13 @@ REWRITE_PROMPT = """你是网文小说的短视频解说改写师。
 - 补写的目标是让每一行成为一个可画的画面，不是让读者更了解角色的内心世界
 
 ## 结构规则
-- 总行数尽量接近目标行数
+- 总行数必须等于目标行数
 - 可以把长段落拆成多行，也可以把过短内容合并
 - 尽量覆盖整集主线剧情，不要漏掉关键因果和关键转折
 - 必须保留：主冲突、关键转折、人物关系变化、高潮点、结尾钩子
 - 可以压缩：重复解释、重复心理描写、冗长环境铺陈、次要支线细节
 - 如果删掉一句会让后文听不懂，就不要删
-- 如果为了卡目标行数或卡字数，会导致某句关键对白、关键因果或关键反击变弱，那就宁可稍长一点、稍多一点
+- 在目标行数和字数范围内优先保住关键对白、关键因果和关键反击，压缩次要铺垫为它们留出空间
 - 第一人称/第三人称保持一致
 - 开头几行先把人、事、冲突立起来，不要连续多行只铺气氛
 - 结尾 2-3 行要收在**反制成立 / 局势变化 / 新钩子**上，不要收在空泛狠话
@@ -158,6 +216,50 @@ REWRITE_PROMPT = """你是网文小说的短视频解说改写师。
 """
 
 
+REWRITE_SETTINGS_SUGGESTION_PROMPT = """你是短视频网文解说的剧情密度分析师。
+
+请为输入的一集原文建议逐行改写参数。不要按原文总字数机械换算；网文可能包含大量重复心理、环境铺陈、同义复述和水分。
+
+判断原则：
+- 先识别不可重复的有效事件节点：新动作、新信息、对抗变化、关键对白、转折、高潮和结尾钩子
+- target_beats 应接近有效事件节点数量；不要为了覆盖水文而增加 Beat
+- 每个 Beat 对应一个可画、可朗读的瞬间，通常约 3-5 秒
+- 对白密集、因果复杂时可适当增加行数；重复情绪和冗长铺垫应压缩
+- beat_chars_min / beat_chars_max 是口播行长范围，不是原文句长；范围不宜过窄，需兼顾冲击短句和完整因果
+- 输出建议必须满足：目标行数 5-80、最少字 4-50、最多字 4-80，且最少字不能大于最多字
+- rationale 用一句简洁中文说明有效剧情密度，而不是复述原文
+"""
+
+
+async def suggest_rewrite_settings(
+    raw_content: str,
+    *,
+    episode_title: str = "",
+) -> RewriteSettingsSuggestion:
+    """Recommend rewrite limits from story density rather than source length."""
+    source_text = (raw_content or "").strip()
+    if not source_text:
+        raise ValueError("原文不能为空")
+
+    task = f"""## 剧集信息
+- 标题: {episode_title or "未命名"}
+
+## 原文
+{source_text}
+
+请分析有效剧情密度并给出逐行改写参数建议。"""
+    agent = Agent(
+        get_newapi_text_pydantic_model("CONTENT_REWRITER_MODEL", "gpt-5.4-mini"),
+        system_prompt=REWRITE_SETTINGS_SUGGESTION_PROMPT,
+        output_type=RewriteSettingsSuggestion,
+        output_retries=3,
+        model_settings=get_newapi_structured_output_model_settings(),
+        name="短视频解说参数建议师",
+    )
+    result = await agent.run(task)
+    return result.output
+
+
 async def rewrite_episode_content(
     raw_content: str,
     *,
@@ -173,12 +275,17 @@ async def rewrite_episode_content(
         return ""
 
     min_chars, max_chars = beat_chars_range
+    if target_beats < 1:
+        raise ValueError("target_beats 必须大于 0")
+    if min_chars < 1 or max_chars < min_chars:
+        raise ValueError("每行字数范围无效")
     task = f"""## 剧集信息
 - 标题: {episode_title or "未命名"}
 - 解说主角（第一人称里的“我”）: {protagonist_name or "未绑定"}
 - 解说风格: {narration_style}
 - 目标行数: {target_beats}
 - 每行字数: {min_chars}-{max_chars} 字
+- 硬性要求: 必须恰好输出 {target_beats} 行，且每行（含标点）必须为 {min_chars}-{max_chars} 个字符
 - 改写目标: 生成适合短视频口播的网文主线解说，不是逐段摘要，也不是只摘爆点
 
 ## 原文
@@ -189,7 +296,7 @@ async def rewrite_episode_content(
     agent = Agent(
         get_newapi_text_pydantic_model("CONTENT_REWRITER_MODEL", "gpt-5.4-mini"),
         system_prompt=REWRITE_PROMPT,
-        output_type=AdaptedContentOutput,
+        output_type=_constrained_output_type(target_beats, min_chars, max_chars),
         output_retries=3,
         model_settings=get_newapi_structured_output_model_settings(),
         name="短视频解说改写师",

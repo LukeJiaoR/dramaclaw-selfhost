@@ -2036,6 +2036,8 @@
       "rewriteTargetBeats": "Target lines",
       "rewriteBeatCharsMin": "Min chars/line",
       "rewriteBeatCharsMax": "Max chars/line",
+      "aiSuggestSettings": "AI suggest",
+      "aiSuggestionApplied": "AI suggestion applied: {{reason}}",
       "generateScript": "Generate script",
       "generateLineByLine": "Generate line-by-line",
       "rewriteComplete": "AI rewrite completed",

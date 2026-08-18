@@ -299,12 +299,13 @@ async def test_content_rewriter_uses_newapi_text_model(monkeypatch) -> None:
 
         async def run(self, task: str):
             calls["task"] = task
+            output_type = calls["kwargs"]["output_type"]
             return type(
                 "FakeResult",
                 (),
                 {
-                    "output": content_rewriter.AdaptedContentOutput(
-                        lines=["改写第一行", "改写第二行"]
+                    "output": output_type(
+                        lines=["第一行改写内容足够十四个字符。", "第二行改写内容同样十四个字符。"]
                     )
                 },
             )()
@@ -341,8 +342,134 @@ async def test_content_rewriter_uses_newapi_text_model(monkeypatch) -> None:
         target_beats=2,
     )
 
-    assert rewritten == "改写第一行\n改写第二行"
+    assert rewritten == "第一行改写内容足够十四个字符。\n第二行改写内容同样十四个字符。"
     assert calls["model"] == "newapi-model"
     assert calls["model_env"] == "CONTENT_REWRITER_MODEL"
     assert calls["default_model"] == "gpt-5.4-mini"
     assert calls["structured_settings_called"] is True
+
+
+def test_content_rewriter_output_type_enforces_requested_limits() -> None:
+    from novelvideo.agents.content_rewriter import _constrained_output_type
+
+    from pydantic import ValidationError
+
+    output_type = _constrained_output_type(6, 40, 70)
+    valid_line = "这是一条满足四十字下限的改写文本，用于确认用户配置会成为真正的输出硬约束（含标点符号）。"
+    assert 40 <= len(valid_line) <= 70
+
+    output = output_type(lines=[valid_line] * 6)
+    assert len(output.lines) == 6
+
+    with pytest.raises(ValidationError):
+        output_type(lines=[valid_line] * 5)
+
+    with pytest.raises(ValidationError):
+        output_type(lines=["字数不足"] * 6)
+
+
+def test_rewrite_generate_request_validates_limits() -> None:
+    from novelvideo.api.schemas import RewriteGenerateRequest
+
+    from pydantic import ValidationError
+
+    request = RewriteGenerateRequest(
+        target_beats=6,
+        beat_chars_min=40,
+        beat_chars_max=70,
+    )
+    assert request.target_beats == 6
+
+    with pytest.raises(ValidationError):
+        RewriteGenerateRequest(beat_chars_min=40, beat_chars_max=20)
+
+
+@pytest.mark.asyncio
+async def test_content_rewriter_suggests_settings_from_story_density(monkeypatch) -> None:
+    from novelvideo.agents import content_rewriter
+
+    calls: dict[str, object] = {}
+
+    class FakeAgent:
+        def __init__(self, model, **kwargs):
+            calls["kwargs"] = kwargs
+
+        async def run(self, task: str):
+            calls["task"] = task
+            output_type = calls["kwargs"]["output_type"]
+            return type(
+                "FakeResult",
+                (),
+                {
+                    "output": output_type(
+                        target_beats=9,
+                        beat_chars_min=18,
+                        beat_chars_max=32,
+                        rationale="原文虽长，但有效冲突集中在九个事件节点。",
+                    )
+                },
+            )()
+
+    monkeypatch.setattr(content_rewriter, "Agent", FakeAgent)
+    monkeypatch.setattr(
+        content_rewriter,
+        "get_newapi_text_pydantic_model",
+        lambda *args: "newapi-model",
+    )
+    monkeypatch.setattr(
+        content_rewriter,
+        "get_newapi_structured_output_model_settings",
+        lambda: {},
+    )
+
+    suggestion = await content_rewriter.suggest_rewrite_settings(
+        "大量重复铺垫之后，主角终于完成一次关键反击。",
+        episode_title="第一集",
+    )
+
+    assert suggestion.target_beats == 9
+    assert suggestion.beat_chars_min == 18
+    assert suggestion.beat_chars_max == 32
+    assert "不要按原文总字数机械换算" in calls["kwargs"]["system_prompt"]
+    assert "有效剧情密度" in calls["task"]
+
+
+@pytest.mark.asyncio
+async def test_suggest_rewrite_settings_route_returns_ai_recommendation(monkeypatch) -> None:
+    from novelvideo.agents import content_rewriter
+    from novelvideo.api.routes import content
+    from novelvideo.api.schemas import RewriteSettingsSuggestionRequest
+
+    async def fake_suggest(*args, **kwargs):
+        return content_rewriter.RewriteSettingsSuggestion(
+            target_beats=8,
+            beat_chars_min=16,
+            beat_chars_max=28,
+            rationale="去除重复心理后有八个有效事件节点。",
+        )
+
+    monkeypatch.setattr(content_rewriter, "suggest_rewrite_settings", fake_suggest)
+    meter = _UsageMeter()
+    monkeypatch.setattr(content, "get_usage_meter", lambda: meter)
+
+    async def fake_resolve_project_scope(*args, **kwargs):
+        return SimpleNamespace(
+            ctx=SimpleNamespace(project_id="project-1", requester_user_id="user-1")
+        )
+
+    monkeypatch.setattr(content, "resolve_project_scope", fake_resolve_project_scope)
+
+    response = await content.suggest_rewrite_settings(
+        project="demo",
+        episode_num=1,
+        body=RewriteSettingsSuggestionRequest(),
+        user={"username": "admin"},
+        store=_RewriteRouteStore(),
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["target_beats"] == 8
+    assert response["data"]["beat_chars_min"] == 16
+    assert response["data"]["beat_chars_max"] == 28
+    assert meter.reserved[0]["feature_key"] == "mainline.content_rewrite"
+    assert meter.confirmed[0][0] == "reservation-1"

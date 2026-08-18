@@ -59,6 +59,26 @@ export function useGenerateRewrite(project: string, episode: number) {
   });
 }
 
+export function useSuggestRewriteSettings(project: string, episode: number) {
+  return useMutation({
+    mutationFn: () =>
+      jsonWithBackendError<OkResponse<{
+        target_beats: number;
+        beat_chars_min: number;
+        beat_chars_max: number;
+        rationale: string;
+      }> | ErrorResponse>(
+        api.post(
+          p`api/v1/projects/${project}/episodes/${episode}/rewrite/suggest-settings`,
+          {
+            json: {},
+            throwHttpErrors: false,
+          },
+        ),
+      ),
+  });
+}
+
 export function useUpdateBeat(project: string, episode: number) {
   const qc = useQueryClient();
   return useMutation({

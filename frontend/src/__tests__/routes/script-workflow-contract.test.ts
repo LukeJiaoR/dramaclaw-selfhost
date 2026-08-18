@@ -140,6 +140,13 @@ describe("script workflow canonical contract", () => {
     expect(route).toContain("target_beats: rewriteTargetBeats");
     expect(route).toContain("beat_chars_min: rewriteBeatCharsMin");
     expect(route).toContain("beat_chars_max: rewriteBeatCharsMax");
+    expect(route).toContain("loadRewriteSettings(project, epNum)");
+    expect(route).toContain("saveRewriteSettings(project, epNum, next)");
+    expect(route).toContain("useSuggestRewriteSettings");
+    expect(route).toContain("handleSuggestRewriteSettings");
+    expect(route).toContain("suggestion.target_beats");
+    expect(route).toContain("suggestion.beat_chars_min");
+    expect(route).toContain("suggestion.beat_chars_max");
     expect(route).not.toContain("generateRewrite.mutateAsync({})");
     expect(zh).toContain('"rewriteTargetBeats"');
     expect(zh).toContain('"rewriteBeatCharsMin"');

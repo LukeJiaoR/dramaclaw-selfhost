@@ -149,9 +149,19 @@ class ContentUpdateRequest(BaseModel):
 
 
 class RewriteGenerateRequest(BaseModel):
-    target_beats: int = 18
-    beat_chars_min: int = 14
-    beat_chars_max: int = 20
+    target_beats: int = Field(default=18, ge=5, le=80)
+    beat_chars_min: int = Field(default=14, ge=4, le=50)
+    beat_chars_max: int = Field(default=20, ge=4, le=80)
+    narration_style: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_beat_char_range(self) -> "RewriteGenerateRequest":
+        if self.beat_chars_min > self.beat_chars_max:
+            raise ValueError("beat_chars_min cannot exceed beat_chars_max")
+        return self
+
+
+class RewriteSettingsSuggestionRequest(BaseModel):
     narration_style: Optional[str] = None
 
 
