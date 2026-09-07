@@ -9,12 +9,18 @@ from typing import Any
 
 class PortNotRegistered(RuntimeError):
     def __init__(self, name: str) -> None:
-        super().__init__(f"port {name!r} is not registered; call ensure_bootstrap() first")
+        super().__init__(
+            f"port {name!r} is not registered; call ensure_bootstrap() first"
+        )
         self.name = name
 
 
 _PORTS: dict[str, Any] = {}
 _BOOTSTRAPPED = False
+# Every port this package fetches without a PortNotRegistered fallback. Ports
+# with a fallback (release_feed, media_model_catalog) are deliberately absent —
+# listing them would make EE refuse to start over something CE can supply
+# itself. tests/ports/test_registry.py derives both directions from the source.
 _EE_REQUIRED_PORTS = (
     "auth",
     "auth_session",
@@ -25,9 +31,14 @@ _EE_REQUIRED_PORTS = (
     "usage_meter",
     "provider_instrumentation",
     "task_backend",
+    "task_envelope_consumer",
     "cancellation_store",
     "lifecycle",
     "product_surface_access",
+    "model_credentials",
+    "authz",
+    "egress",
+    "egress_operations",
 )
 
 

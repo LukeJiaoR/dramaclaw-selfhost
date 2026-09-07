@@ -102,9 +102,10 @@ export function resolveVideoKeyframeUrls(
     }
 
     const displayName = String(candidate.legacyDisplayName ?? "").trim();
-    if (displayName.includes("首帧") && !firstFrameUrl) {
+    // 老数据里的 displayName 是写死的中文槽位名，属于**存量数据格式**不是界面文案。
+    if (displayName.includes("首帧") && !firstFrameUrl) { // i18n-exempt
       firstFrameUrl = candidate.url;
-    } else if (displayName.includes("尾帧") && !lastFrameUrl) {
+    } else if (displayName.includes("尾帧") && !lastFrameUrl) { // i18n-exempt
       lastFrameUrl = candidate.url;
     } else {
       unassigned.push(candidate.url);
@@ -251,6 +252,43 @@ export function videoUpstreamImageDefaultMode(
  */
 export function videoModeRequiresPrompt(mode: VideoGenMode): boolean {
   return mode === "textToVideo" || mode === "allReference";
+}
+
+/**
+ * 该 genMode 是否**必须有上游素材**才能提交：只有文生视频不需要，其余模式的提交
+ * 分支都会在素材为空时直接 return（见 VideoNode 的 handleSubmit）。
+ *
+ * 和 `videoModeRequiresPrompt` 是**并列**关系，不是二选一 —— 全能参考两条都要：
+ * 后端 omni 端点强校验 prompt，而 references 为空又根本没得可发。曾经写成「要提示词
+ * 的模式就只看提示词」，于是「接过图 → 又把图撤走 → 只打字」这条路上按钮看着可点、
+ * 点下去却被 handleSubmit 的 `references.length === 0` 静默拦掉，表现为「点了没反应」。
+ * 正常情况下 `videoNoUpstreamResetMode` 会先把模式退回文生视频，这条是兜底：上游节点
+ * 还连着、里面的图却被清空时（typeCounts>0 而 counts==0）退回不触发，仍要拦住提交。
+ */
+export function videoModeRequiresMedia(mode: VideoGenMode): boolean {
+  return mode !== "textToVideo";
+}
+
+/**
+ * 上游素材被全部撤走后该退回哪个模式：`"textToVideo"` = 退回文生视频，null = 不动。
+ *
+ * 视频节点的模式推导原本是**单向**的：接入图片/视频/音频时有一堆 effect 把模式推进
+ * 到能消费该素材的模式，却没有任何一条在素材撤空后把它推回来。于是「连一张图 → 又把
+ * 图删掉」之后节点卡在全能参考上，界面上看不出异常，提交却必然被静默拦下。
+ * HappyHorse 那条统一状态机早就有「无上游 → 文生视频」这一档，这里把同一条规则补给
+ * 其余模型。
+ *
+ * 素材计数要传**按节点类型**的口径（`upstreamTypeCounts`，空的图片节点也算），不能用
+ * 「已解析 URL」的口径：空态 CTA（全能参考 / 图片参考 / 首尾帧）正是先铺一个还没出图
+ * 的图片/上传节点、再把模式切过去，按 URL 口径这一瞬间素材数是 0，会被这条规则当场
+ * 顶回文生视频，等于把三个 CTA 全废掉。
+ */
+export function videoNoUpstreamResetMode(
+  mode: VideoGenMode,
+  counts: { images: number; videos: number; audios: number },
+): VideoGenMode | null {
+  if (counts.images > 0 || counts.videos > 0 || counts.audios > 0) return null;
+  return mode === "textToVideo" ? null : "textToVideo";
 }
 
 /**
@@ -528,13 +566,14 @@ export function formatAudioDurationClips(
  * 不受支持），因此这三条只会在真正会丢素材 / 400 的场景触发；2.0 / HappyHorse 的自动
  * 推导 effect 会先把模式导到能消费素材的模式，不会误伤。
  */
+/** 返回 i18n key（非 null 时由调用方 `t()` 出文案），不是可直接展示的句子。 */
 export function videoSubmitMediaRejectionReason(
   mode: VideoGenMode,
   model: VideoModelRef,
   counts: { images: number; videos: number; audios: number },
 ): string | null {
   if (counts.videos > 0 && mode !== "allReference" && mode !== "videoEdit") {
-    return "该模型不支持视频素材";
+    return "node.videoModel.reason.videoUnsupported";
   }
   const videoEditAcceptsAudio =
     mode === "videoEdit" &&
@@ -544,10 +583,10 @@ export function videoSubmitMediaRejectionReason(
     typeof model.referenceAudioMax === "number" &&
     model.referenceAudioMax > 0;
   if (counts.audios > 0 && mode !== "allReference" && !videoEditAcceptsAudio) {
-    return "该模型不支持音频素材";
+    return "node.videoModel.reason.audioUnsupported";
   }
   if (counts.images > 1 && !videoModelAcceptsMultipleImages(model)) {
-    return "该模型单次仅支持 1 张图片";
+    return "node.videoModel.reason.singleImageOnly";
   }
   return null;
 }
@@ -574,6 +613,7 @@ export function videoSubmitMediaRejectionReason(
  * - Grok Video Channel 只支持图片。注：它当前在后端是关掉的
  *   （`FREEZONE_DISABLED_VIDEO_BACKENDS`），不会出现在选择器里，这条分支是休眠的。
  */
+/** 同上：返回的是 i18n key，调用方负责 `t()`。 */
 export function videoModelReferenceDisabledReason(
   model: VideoModelRef,
   counts: { images: number; videos: number; audios: number },
@@ -582,42 +622,42 @@ export function videoModelReferenceDisabledReason(
     const supportsAllReference = isVideoModeSupportedByModel("allReference", model);
     const supportsVideoEdit = isVideoModeSupportedByModel("videoEdit", model);
     if (counts.videos > 0 && !supportsAllReference && !supportsVideoEdit) {
-      return "该模型不支持视频素材";
+      return "node.videoModel.reason.videoUnsupported";
     }
     const supportsVideoEditAudio =
       supportsVideoEdit &&
       typeof model.referenceAudioMax === "number" &&
       model.referenceAudioMax > 0;
     if (counts.audios > 0 && !supportsAllReference && !supportsVideoEditAudio) {
-      return "该模型不支持音频素材";
+      return "node.videoModel.reason.audioUnsupported";
     }
     if (counts.images > 1 && !videoModelAcceptsMultipleImages(model)) {
-      return "该模型单次仅支持 1 张图片";
+      return "node.videoModel.reason.singleImageOnly";
     }
     return null;
   }
   const modelId = videoModelIdOf(model);
   if (isGrokVideoChannelModel(modelId)) {
     if (counts.videos > 0 || counts.audios > 0) {
-      return "Grok Video Channel 仅支持图片素材";
+      return "node.videoModel.reason.grokImagesOnly";
     }
     if (counts.images > 8) {
-      return "Grok Video Channel 最多支持 1 张首帧和 7 张参考图";
+      return "node.videoModel.reason.grokImageLimit";
     }
     return null;
   }
   if (isHappyHorseVideoModel(modelId)) {
     if (counts.audios > 0) {
-      return "该模型不支持音频素材";
+      return "node.videoModel.reason.audioUnsupported";
     }
     return null;
   }
   if (isSeedance1xVideoModel(modelId)) {
     if (counts.videos > 0 || counts.audios > 0) {
-      return "该模型仅支持图片素材";
+      return "node.videoModel.reason.imagesOnly";
     }
     if (counts.images > 1) {
-      return "该模型单次仅支持 1 张图片";
+      return "node.videoModel.reason.singleImageOnly";
     }
   }
   return null;

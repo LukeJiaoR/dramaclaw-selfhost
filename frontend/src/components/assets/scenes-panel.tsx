@@ -9,6 +9,7 @@ import { toast } from "sonner";
 import { AssetHeaderActions } from "@/components/assets/asset-header-actions-slot";
 import { CharacterImageSourceSelect } from "@/components/assets/character-image-source-select";
 import { SceneAssetCard } from "@/components/assets/scene-asset-card";
+import { ViewportLazyImage } from "@/components/viewport-lazy-image";
 import { AssetBeatReferences } from "@/components/assets/asset-beat-references";
 import {
   SceneEnvironmentPromptFields,
@@ -22,13 +23,10 @@ import { ThreeDDirectorDialog } from "@/features/viewer-kit/three-d/ThreeDDirect
 import type { ThreeDSceneSnapshot } from "@/features/viewer-kit/three-d/engine/viewerApp";
 import {
   AssetSearchBox,
-  AssetSortSelect,
   filterBySearch,
-  sortAssets,
-  type AssetSortKey,
 } from "@/components/assets/asset-search-box";
 import {
-  useAssetReferenceIndex,
+  useAssetReferences,
   type BeatReference,
   type SceneCoOccurrence,
 } from "@/lib/queries/asset-references";
@@ -39,9 +37,11 @@ import { useNavigateToAsset } from "@/hooks/use-assets-deep-link";
 import {
   backendErrorResponseToastMessage,
   backendErrorToastMessage,
+  taskResponseToastMessage,
   BillingRuleNotConfiguredError,
   humanizeTaskError,
 } from "@/lib/api-errors";
+import { confirmDialog } from "@/components/confirm-dialog-host";
 import { CreditCostInline } from "@/components/credit-cost-inline";
 import { Button } from "@/components/ui/button";
 import { SUBTLE_HEADER_ACTION_BUTTON_CLASS } from "@/components/ui/header-action-styles";
@@ -95,6 +95,7 @@ import {
   useClearSceneDirectorWorld,
   useSaveSceneDirectorWorld,
   useSceneDirectorStageManifest,
+  useSceneDetails,
   useScenePanoManifest,
   useScenes,
   useUpdateScene,
@@ -103,6 +104,7 @@ import {
   useUploadScenePano,
   type ScenePayload,
 } from "@/lib/queries/scenes";
+import { useProject } from "@/lib/queries/projects";
 import { queryKeys } from "@/lib/query-keys";
 import type { ErrorResponse } from "@/types/api";
 import type {
@@ -286,10 +288,10 @@ function SceneDialog({
           aria-label={t("assets.scenes.fields.type")}
           className={SCENE_DIALOG_SELECT_TRIGGER_CLASS}
         >
-          <SelectValue>{sceneTypeLabel(draft.scene_type)}</SelectValue>
+          <SelectValue>{sceneTypeLabel(draft.scene_type, t)}</SelectValue>
         </SelectTrigger>
         <SelectContent align="start" alignItemWithTrigger={false}>
-          {sceneTypeOptions(draft.scene_type).map((option) => (
+          {sceneTypeOptions(draft.scene_type, t).map((option) => (
             <SelectItem key={option.value} value={option.value}>
               {option.label}
             </SelectItem>
@@ -392,15 +394,15 @@ function SceneDialog({
                       })}
                       className={SCENE_DIALOG_SELECT_TRIGGER_CLASS}
                     >
-                      <SelectValue>{timeOfDayLabel(draft.time_of_day)}</SelectValue>
+                      <SelectValue>{timeOfDayLabel(draft.time_of_day, t)}</SelectValue>
                     </SelectTrigger>
                     <SelectContent align="start" alignItemWithTrigger={false}>
                       <SelectItem value="__NO_SCENE_TIME__">
-                        {timeOfDayLabel("")}
+                        {timeOfDayLabel("", t)}
                       </SelectItem>
                       {sceneTimeChoices.map((option) => (
                         <SelectItem key={option} value={option}>
-                          {timeOfDayLabel(option)}
+                          {timeOfDayLabel(option, t)}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -421,10 +423,7 @@ function SceneDialog({
                 className={SCENE_DIALOG_INPUT_CLASS}
               />
               <p className="text-xs leading-5 text-muted-foreground">
-                {t("assets.scenes.fields.nameRule", {
-                  defaultValue:
-                    "普通独立场景只填名称；不要在这里填写变体或时间。需要状态/时间版时，在场景详情里添加变体。",
-                })}
+                {t("assets.scenes.fields.nameRule")}
               </p>
             </div>
           )}
@@ -448,10 +447,7 @@ function SceneDialog({
                     variant_prompt: event.target.value,
                   }))
                 }
-                placeholder={t("assets.scenes.fields.variantPromptPlaceholder", {
-                  defaultValue:
-                    "只写和基础场景不同的部分，例如积水反光、焦黑墙面、节日装饰。",
-                })}
+                placeholder={t("assets.scenes.fields.variantPromptPlaceholder")}
                 className={SCENE_DIALOG_TEXTAREA_CLASS}
               />
             </div>
@@ -574,14 +570,12 @@ function SceneAssetCardController({
   project,
   scene,
   imageSourceSelection,
-  referenceCount,
   onEdit,
   onDelete,
 }: {
   project: string;
   scene: SceneAsset;
   imageSourceSelection: string;
-  referenceCount: number;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -633,6 +627,16 @@ function SceneAssetCardController({
     "mainline.scene_pano_generation",
     { surface: "supertale" },
   );
+  const singleFaceStageCost = useGenerationCreditCost(
+    "feature",
+    "mainline.scene_single_face_to_sog",
+    { surface: "supertale" },
+  );
+  const panoStageCost = useGenerationCreditCost(
+    "feature",
+    "mainline.scene_pano_to_sog",
+    { surface: "supertale" },
+  );
   const sceneReferenceCostDisplay =
     sceneReferenceCost.data?.data.display ??
     (sceneReferenceCost.error instanceof BillingRuleNotConfiguredError
@@ -643,6 +647,34 @@ function SceneAssetCardController({
     (panoCost.error instanceof BillingRuleNotConfiguredError
       ? t("common.billingRuleNotConfiguredShort")
       : undefined);
+  const singleFaceStageRuleMissing =
+    singleFaceStageCost.error instanceof BillingRuleNotConfiguredError;
+  const panoStageRuleMissing =
+    panoStageCost.error instanceof BillingRuleNotConfiguredError;
+  const singleFaceStageCostDisplay =
+    singleFaceStageCost.data?.data.display ??
+    (singleFaceStageRuleMissing
+      ? t("common.billingRuleNotConfiguredShort")
+      : undefined);
+  const panoStageCostDisplay =
+    panoStageCost.data?.data.display ??
+    (panoStageRuleMissing
+      ? t("common.billingRuleNotConfiguredShort")
+      : undefined);
+  const singleFaceStageDisabledReason = singleFaceStageCost.data?.data.display
+    ? undefined
+    : singleFaceStageRuleMissing
+      ? t("common.billingRuleNotConfigured")
+      : singleFaceStageCost.isPending
+        ? t("assets.scenes.stage.costLoading")
+        : t("assets.scenes.stage.costUnavailable");
+  const panoStageDisabledReason = panoStageCost.data?.data.display
+    ? undefined
+    : panoStageRuleMissing
+      ? t("common.billingRuleNotConfigured")
+      : panoStageCost.isPending
+        ? t("assets.scenes.stage.costLoading")
+        : t("assets.scenes.stage.costUnavailable");
   const generateStagePly = useGenerateScene3gsPlyAsync(project, scene.name);
   const saveDirectorWorld = useSaveSceneDirectorWorld(project, scene.name);
   const clearDirectorWorld = useClearSceneDirectorWorld(project, scene.name);
@@ -935,7 +967,6 @@ function SceneAssetCardController({
     <>
       <SceneAssetCard
         scene={scene}
-        referenceCount={referenceCount}
         masterRunning={generateMaster.isPending || masterTask.started}
         reverseRunning={generateReverse.isPending || reverseTask.started}
         panoRunning={generatePano.isPending || panoTask.started}
@@ -965,6 +996,12 @@ function SceneAssetCardController({
         reversePromotion={sceneReferenceCost.data?.data.promotion}
         panoCost={panoCostDisplay}
         panoPromotion={panoCost.data?.data.promotion}
+        singleFaceStageCost={singleFaceStageCostDisplay}
+        singleFaceStagePromotion={singleFaceStageCost.data?.data.promotion}
+        singleFaceStageDisabledReason={singleFaceStageDisabledReason}
+        panoStageCost={panoStageCostDisplay}
+        panoStagePromotion={panoStageCost.data?.data.promotion}
+        panoStageDisabledReason={panoStageDisabledReason}
         onEdit={onEdit}
         onDelete={onDelete}
         onUploadMaster={() => masterInputRef.current?.click()}
@@ -1043,6 +1080,15 @@ interface SceneGroup {
   scenes: SceneAsset[];
 }
 
+export function selectAuthoritativeSceneDetails(
+  summaryScenes: SceneAsset[],
+  details: SceneAsset[] | undefined,
+  detailSucceeded: boolean,
+): SceneAsset[] | null {
+  if (!detailSucceeded) return summaryScenes;
+  return details?.length ? details : null;
+}
+
 const SCENE_GROUP_SELECTION_STORAGE_KEY_PREFIX = "supertale-scene-group:";
 
 function sceneGroupSelectionStorageKey(project: string): string {
@@ -1072,16 +1118,20 @@ function sceneGroupPreviewUrl(group: SceneGroup): string {
 function SceneGroupListItem({
   group,
   selected,
-  referenceCount,
   onSelect,
 }: {
   group: SceneGroup;
   selected: boolean;
-  referenceCount: number;
   onSelect: () => void;
 }) {
   const { t } = useTranslation();
   const previewUrl = sceneGroupPreviewUrl(group);
+  const [failedPreviewUrl, setFailedPreviewUrl] = useState("");
+  useEffect(() => {
+    setFailedPreviewUrl("");
+  }, [previewUrl]);
+  const visiblePreviewUrl =
+    previewUrl && failedPreviewUrl !== previewUrl ? previewUrl : "";
   return (
     <button
       type="button"
@@ -1099,11 +1149,12 @@ function SceneGroupListItem({
       ].join(" ")}
     >
       <div className="relative flex size-12 shrink-0 items-center justify-center overflow-hidden rounded-[8px] border border-white/[0.08] bg-black/20">
-        {previewUrl ? (
-          <img
-            src={previewUrl}
+        {visiblePreviewUrl ? (
+          <ViewportLazyImage
+            src={visiblePreviewUrl}
             alt=""
             aria-hidden="true"
+            onError={() => setFailedPreviewUrl(previewUrl)}
             className="h-full w-full object-cover"
           />
         ) : (
@@ -1121,14 +1172,6 @@ function SceneGroupListItem({
               })}
             </span>
           ) : null}
-          {referenceCount > 0 ? (
-            <span>
-              {t("assets.scenes.referenceCount", {
-                count: referenceCount,
-                defaultValue: "{{count}} 次使用",
-              })}
-            </span>
-          ) : null}
         </div>
       </div>
     </button>
@@ -1143,6 +1186,12 @@ export function ScenesPanel({
   focusId?: string | null;
 }) {
   const { t } = useTranslation();
+  // Narrated projects have no scene headings to build a catalogue from; their
+  // scenes are created per episode during planning. The page stays — those
+  // scenes are still global assets — only the project-level build is hidden.
+  const projectConfigRes = useProject(project);
+  const sceneBuildSupported =
+    projectConfigRes.data?.data?.scene_build_supported !== false;
   const scenes = useScenes(project);
   const createScene = useCreateScene(project);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -1169,11 +1218,18 @@ export function ScenesPanel({
     (buildScenesCost.error instanceof BillingRuleNotConfiguredError
       ? t("common.billingRuleNotConfiguredShort")
       : null);
-  const refIndex = useAssetReferenceIndex(project);
+  // Beat references are edit-only: opening the asset page must not scan every
+  // beat merely to decorate cards with a usage count.
+  const refDetail = useAssetReferences(
+    project,
+    useMemo(
+      () => (editing ? [{ type: "scene" as const, id: editing.name }] : []),
+      [editing],
+    ),
+  );
 
   const allItems = scenes.data?.data ?? [];
   const [searchQuery, setSearchQuery] = useState("");
-  const [sortKey, setSortKey] = useState<AssetSortKey>("name");
   const allSceneGroups = useMemo<SceneGroup[]>(() => {
     const groups = new globalThis.Map<string, SceneAsset[]>();
     for (const scene of allItems) {
@@ -1211,17 +1267,8 @@ export function ScenesPanel({
         ...(scene.aliases ?? []),
       ]),
     ]);
-    return sortAssets(
-      filtered,
-      sortKey,
-      (group) => group.baseName,
-      (group) =>
-        group.scenes.reduce(
-          (sum, scene) => sum + refIndex.countFor("scene", scene.name),
-          0,
-        ),
-    );
-  }, [allSceneGroups, searchQuery, sortKey, refIndex]);
+    return filtered.sort((a, b) => a.baseName.localeCompare(b.baseName));
+  }, [allSceneGroups, searchQuery]);
   useEffect(() => {
     if (scenes.isLoading) {
       return;
@@ -1250,8 +1297,27 @@ export function ScenesPanel({
     sceneGroups,
     selectedBaseName,
   ]);
-  const selectedGroup =
+  const selectedSummaryGroup =
     sceneGroups.find((group) => group.baseName === selectedBaseName) ?? null;
+  const selectedSceneNames = useMemo(
+    () => selectedSummaryGroup?.scenes.map((scene) => scene.name) ?? [],
+    [selectedSummaryGroup],
+  );
+  const selectedSceneDetails = useSceneDetails(project, selectedSceneNames);
+  const selectedSceneAssets = selectedSummaryGroup
+    ? selectAuthoritativeSceneDetails(
+        selectedSummaryGroup.scenes,
+        selectedSceneDetails.data?.data,
+        selectedSceneDetails.isSuccess,
+      )
+    : null;
+  const selectedGroup =
+    selectedSummaryGroup && selectedSceneAssets
+      ? {
+          baseName: selectedSummaryGroup.baseName,
+          scenes: selectedSceneAssets,
+        }
+      : null;
   const selectedBaseScene =
     selectedGroup?.scenes.find((scene) => scene.name === selectedGroup.baseName) ??
     selectedGroup?.scenes[0] ??
@@ -1289,13 +1355,25 @@ export function ScenesPanel({
       return;
     }
     buildActivity.markStarted({ taskId: res.task_id });
-    toast.success(res.message);
+    toast.success(taskResponseToastMessage(res, t));
   }
 
   async function handleDelete(scene: SceneAsset) {
-    if (!window.confirm(t("assets.scenes.confirmDelete", { name: scene.name })))
+    const confirmed = await confirmDialog({
+      title: t("assets.scenes.deleteTitle"),
+      description: t("assets.scenes.confirmDelete", { name: scene.name }),
+      confirmText: t("common.delete"),
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+    // ky 对 4xx/5xx 直接 reject，不接住的话删除失败就是「点了没反应」——用户会以为删掉了。
+    let res;
+    try {
+      res = await deleteScene.mutateAsync(scene.name);
+    } catch (error) {
+      toast.error(backendErrorToastMessage(error, t));
       return;
-    const res = await deleteScene.mutateAsync(scene.name);
+    }
     if (isErrorResponse(res)) {
       toast.error(res.error);
       return;
@@ -1325,8 +1403,13 @@ export function ScenesPanel({
         <HeaderRefreshButton
           label={t("common.refresh")}
           onRefresh={async () => {
-            const result = await scenes.refetch();
-            if (result.isError) {
+            const [listResult, detailResult] = await Promise.all([
+              scenes.refetch(),
+              selectedSceneNames.length
+                ? selectedSceneDetails.refetch()
+                : Promise.resolve(null),
+            ]);
+            if (listResult.isError || detailResult?.isError) {
               toast.error(t("common.error"));
               return false;
             }
@@ -1348,25 +1431,27 @@ export function ScenesPanel({
           <Plus className="size-3.5" />
           {t("assets.scenes.newScene")}
         </Button>
-        <Button
-          size="sm"
-          onClick={handleBuildScenes}
-          disabled={buildDisabled}
-          className="h-8 gap-1.5 rounded-[8px] bg-primary px-3 text-xs font-normal text-primary-foreground shadow-none hover:bg-primary/85 active:bg-primary/75"
-        >
-          {isBuildingScenes ? (
-            <Loader2 className="size-3.5 animate-spin" />
-          ) : (
-            <Sparkles className="size-3.5" />
-          )}
-          {t("assets.scenes.build")}
-          <CreditCostInline
-            display={buildScenesCostDisplay}
-            promotion={buildScenesCost.data?.data.promotion}
-            className="text-black"
-            iconClassName="text-black drop-shadow-none [&_path]:fill-current"
-          />
-        </Button>
+        {sceneBuildSupported ? (
+          <Button
+            size="sm"
+            onClick={handleBuildScenes}
+            disabled={buildDisabled}
+            className="h-8 gap-1.5 rounded-[8px] bg-primary px-3 text-xs font-normal text-primary-foreground shadow-none hover:bg-primary/85 active:bg-primary/75"
+          >
+            {isBuildingScenes ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Sparkles className="size-3.5" />
+            )}
+            {t("assets.scenes.build")}
+            <CreditCostInline
+              display={buildScenesCostDisplay}
+              promotion={buildScenesCost.data?.data.promotion}
+              className="text-black"
+              iconClassName="text-black drop-shadow-none [&_path]:fill-current"
+            />
+          </Button>
+        ) : null}
       </AssetHeaderActions>
       {scenes.isLoading ? (
         <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">
@@ -1398,7 +1483,9 @@ export function ScenesPanel({
               {t("assets.scenes.emptyTitle")}
             </h3>
             <p className="max-w-[15rem] text-xs leading-5 text-muted-foreground">
-              {t("assets.scenes.emptyDescription")}
+              {sceneBuildSupported
+                ? t("assets.scenes.emptyDescription")
+                : t("assets.scenes.emptyDescriptionPerEpisode")}
             </p>
           </div>
           <Button
@@ -1427,9 +1514,6 @@ export function ScenesPanel({
                   ariaLabel={t("assets.common.searchScenes")}
                   className="min-w-0 flex-1"
                 />
-                <div className="shrink-0">
-                  <AssetSortSelect value={sortKey} onValueChange={setSortKey} />
-                </div>
               </div>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3 pt-2">
@@ -1447,10 +1531,6 @@ export function ScenesPanel({
                       key={group.baseName}
                       group={group}
                       selected={selectedBaseName === group.baseName}
-                      referenceCount={group.scenes.reduce(
-                        (sum, scene) => sum + refIndex.countFor("scene", scene.name),
-                        0,
-                      )}
                       onSelect={() => rememberSelectedBaseName(group.baseName)}
                     />
                   ))}
@@ -1462,6 +1542,23 @@ export function ScenesPanel({
             {!selectedGroup ? (
               <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
                 {t("assets.common.noMatch")}
+              </div>
+            ) : selectedSceneDetails.isLoading ? (
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                <Loader2 className="mr-2 size-4 animate-spin" />
+                {t("common.loading")}
+              </div>
+            ) : selectedSceneDetails.isError ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+                <span>{t("common.error")}</span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void selectedSceneDetails.refetch()}
+                >
+                  {t("common.refresh")}
+                </Button>
               </div>
             ) : (
               <div className="@container h-full overflow-y-auto px-4 py-3">
@@ -1498,10 +1595,7 @@ export function ScenesPanel({
                               });
                               setDialogOpen(true);
                             }}
-                            title={t("assets.scenes.newPlateHint", {
-                              defaultValue:
-                                "场景变体即「同一个地点的不同状态」",
-                            })}
+                            title={t("assets.scenes.newPlateHint")}
                             className="h-8 gap-1 rounded-[8px] border-white/10 bg-transparent px-3 text-xs font-normal shadow-none hover:bg-white/[0.04] dark:bg-transparent"
                           />
                         }
@@ -1529,7 +1623,6 @@ export function ScenesPanel({
                         project={project}
                         scene={scene}
                         imageSourceSelection={imageSourceSelection}
-                        referenceCount={refIndex.countFor("scene", scene.name)}
                         onEdit={() => {
                           setEditing(scene);
                           setDraftSeed(null);
@@ -1551,11 +1644,11 @@ export function ScenesPanel({
         draftSeed={draftSeed}
         project={project}
         references={
-          editing ? refIndex.referencesFor("scene", editing.name) : []
+          editing ? refDetail.referencesFor("scene", editing.name) : []
         }
         coOccurrence={
           editing
-            ? refIndex.coOccurrenceForScene(editing.name)
+            ? refDetail.coOccurrenceForScene(editing.name)
             : { identities: [], props: [] }
         }
         onOpenChange={(open) => {

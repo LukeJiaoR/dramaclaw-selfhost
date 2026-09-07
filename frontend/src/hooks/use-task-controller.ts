@@ -2,6 +2,7 @@
 // Copyright (c) 2026 ClaymoreLab
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient, type QueryKey } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 
 import {
   claimOwnership,
@@ -17,6 +18,8 @@ import {
 import { useTaskStream } from "@/hooks/use-task-stream";
 import { useCancelTask, useTasks } from "@/lib/queries/tasks";
 import { mergeTaskLogs } from "@/lib/script-feedback";
+import { currentTaskText, taskLogLinesOf } from "@/task-center/derivations";
+import { taskBeatNumbers } from "@/lib/task-types";
 
 /**
  * Public handle returned by `useTaskController`. Mirrors `useStageTask`'s
@@ -30,8 +33,23 @@ export interface TaskControllerHandle {
    * Mark the task as started and open the SSE stream. Pass `{ scope, taskId }`
    * from the backend TaskResponse so the first stream request hits the right
    * row and terminal reconciliation ignores stale rows from older runs.
+   * `beatNumbers` records which beats this run covers — see `covers`.
    */
-  start: (override?: { scope?: string; taskId?: string }) => void;
+  start: (override?: {
+    scope?: string;
+    taskId?: string;
+    beatNumbers?: number[];
+  }) => void;
+  /**
+   * Whether the tracked run covers `beatNum`.
+   *
+   * Per-beat panels for selection-scoped tasks share one registry entry (one
+   * SSE stream per episode), so `started` alone can't tell beat 9's regen from
+   * beat 11's idle panel. Gate the progress UI on `started && covers(n)`.
+   * Returns `true` when the run carries no beat attribution at all, so an
+   * older task row never hides a beat that really is generating.
+   */
+  covers: (beatNum: number) => boolean;
   stop: () => Promise<void>;
   stopping: boolean;
 }
@@ -76,6 +94,7 @@ export function useTaskController(
   // below and also as a runtime guard against stray uses.
   const registry = useTaskRegistry();
   const queryClient = useQueryClient();
+  const { t } = useTranslation();
   const instanceId = useInstanceId();
 
   // Serialize the key so dependency arrays are stable strings rather than
@@ -147,6 +166,21 @@ export function useTaskController(
     episode: key.episode,
   });
 
+  // `coversBeat` 把「跟哪一条 run」从任务行的 beat_num 列换成它的 beat 名单：
+  // selection-scoped 的 sketch_regen / selected_regen 行 beat_num 恒为 null,
+  // 名单落在 metadata.beat_numbers 里(见 ports/tasks.display_metadata_for_task)。
+  // 没名单的行是「覆盖范围未知」,按 covers() 一样的口径当作命中,宁可多显示进度
+  // 也不要把真在跑的 beat 藏掉。
+  const coversBeat = key.coversBeat;
+  const matchesCoverage = useCallback(
+    (task: { beat_num?: number | null; metadata?: Record<string, unknown> | null }) => {
+      if (coversBeat === undefined) return true;
+      const beats = taskBeatNumbers(task);
+      return beats === null || beats.includes(coversBeat);
+    },
+    [coversBeat],
+  );
+
   const logsRef = useRef<string[]>([]);
   const [, forceRerender] = useState(0);
   const appendLogs = useCallback((incoming: readonly string[] | null | undefined) => {
@@ -173,16 +207,34 @@ export function useTaskController(
     // `key.scope` undefined means "no scope filter" (legacy unscoped
     // controllers); when defined, require an exact match on `task.scope`
     // (nullish-normalized).
-    const match = tasks.find(
-      (t) =>
-        candidates.includes(t.task_type) &&
-        (key.beatNum === undefined || t.beat_num === key.beatNum) &&
-        (key.scope === undefined || (t.scope ?? null) === (key.scope ?? null)) &&
-        isActiveStatus(t.status),
-    );
+    const prev = entry.getSnapshot();
+    // When `start()` handed us the exact task id, prefer that row. Otherwise a
+    // concurrent run of the same type (e.g. a batch `sketch_regen` alongside
+    // this beat's) can win `find` and repoint this entry's scope and beat
+    // coverage onto someone else's run. Purely a preference — it never removes
+    // a match, so plain discovery (page reload, activeTaskId still null) is
+    // unaffected.
+    const match =
+      (prev.activeTaskId !== null
+        ? tasks.find((t) => t.task_id === prev.activeTaskId && isActiveStatus(t.status))
+        : undefined) ??
+      tasks.find(
+        (t) =>
+          candidates.includes(t.task_type) &&
+          (key.beatNum === undefined || t.beat_num === key.beatNum) &&
+          (key.scope === undefined || (t.scope ?? null) === (key.scope ?? null)) &&
+          matchesCoverage(t) &&
+          isActiveStatus(t.status),
+      );
     if (match) {
+      // A silent row means "unknown", not "no beats" — but if it is the very
+      // run `start()` just submitted, we already know its beats and must not
+      // throw that away. Older BEs never write `metadata.beat_numbers`, and
+      // reconcile fires right after `start()`; without this the caller's list
+      // is wiped back to null and every beat's panel lights up again.
+      const sameRun = prev.activeTaskId !== null && match.task_id === prev.activeTaskId;
       entry.setSnapshot({
-        ...entry.getSnapshot(),
+        ...prev,
         started: true,
         activeTaskType: match.task_type,
         activeTaskId: match.task_id ?? null,
@@ -191,6 +243,11 @@ export function useTaskController(
         // task SSE endpoint returns "Task not found" and completion events
         // never reach the FE, so callers' invalidateKeys never fire.
         activeScope: match.scope ?? null,
+        // Which beats this run touches. Survives refresh because the BE
+        // persists it on the task row; without it every per-beat panel on the
+        // episode would show this run's progress.
+        activeBeatNumbers:
+          taskBeatNumbers(match) ?? (sameRun ? prev.activeBeatNumbers : null),
       });
     }
     entry.reconciled = true;
@@ -204,6 +261,7 @@ export function useTaskController(
     key.beatNum,
     key.scope,
     alsoReconcile,
+    matchesCoverage,
   ]);
 
   // ─── Stream (owner-only) ─────────────────────────────────────────────────
@@ -230,6 +288,7 @@ export function useTaskController(
         (key.beatNum === undefined || t.beat_num === key.beatNum) &&
         ((snapshot.activeScope ?? key.scope) === undefined ||
           (t.scope ?? null) === ((snapshot.activeScope ?? key.scope) ?? null)) &&
+        matchesCoverage(t) &&
         TERMINAL_STATUSES.has(t.status),
     );
     if (!match) return;
@@ -242,10 +301,14 @@ export function useTaskController(
       streamState: {
         status: match.status,
         progress: match.progress ?? current.streamState.progress,
-        currentTask: match.current_task ?? current.streamState.currentTask,
+        currentTask: match.current_task
+          ? currentTaskText(match, t)
+          : current.streamState.currentTask,
         result: match.result ?? null,
         error: match.error ?? null,
-        logs: Array.isArray(match.logs) ? match.logs : current.streamState.logs,
+        logs: Array.isArray(match.logs)
+          ? taskLogLinesOf(match, t)
+          : current.streamState.logs,
       },
     });
 
@@ -275,6 +338,7 @@ export function useTaskController(
     alsoReconcile,
     invalidateKeys,
     queryClient,
+    matchesCoverage,
   ]);
 
   const ownerStream = useTaskStream({
@@ -358,10 +422,12 @@ export function useTaskController(
         candidates.includes(t.task_type) &&
         (key.beatNum === undefined || t.beat_num === key.beatNum) &&
         (key.scope === undefined || (t.scope ?? null) === (key.scope ?? null)) &&
+        matchesCoverage(t) &&
         isActiveStatus(t.status),
     );
-    appendLogs(match?.logs);
+    appendLogs(match ? taskLogLinesOf(match, t) : undefined);
   }, [
+    t,
     isOwner,
     tasksRes,
     key.taskType,
@@ -369,6 +435,7 @@ export function useTaskController(
     key.scope,
     alsoReconcile,
     appendLogs,
+    matchesCoverage,
   ]);
 
   useEffect(() => {
@@ -391,6 +458,7 @@ export function useTaskController(
         (!snapshot.activeTaskId || t.task_id === snapshot.activeTaskId) &&
         (key.beatNum === undefined || t.beat_num === key.beatNum) &&
         (activeScope === null || (t.scope ?? null) === activeScope) &&
+        matchesCoverage(t) &&
         !isActiveStatus(t.status),
     );
     if (!match) return;
@@ -402,10 +470,10 @@ export function useTaskController(
       streamState: {
         status: match.status,
         progress: match.progress ?? 1,
-        currentTask: match.current_task ?? "",
+        currentTask: currentTaskText(match, t),
         result: match.result ?? null,
         error: match.error ?? null,
-        logs: Array.isArray(match.logs) ? match.logs.filter((x) => typeof x === "string") : [],
+        logs: taskLogLinesOf(match, t),
       },
     });
     if (invalidateKeys) {
@@ -430,6 +498,7 @@ export function useTaskController(
     entry,
     invalidateKeys,
     queryClient,
+    matchesCoverage,
   ]);
 
   useEffect(() => {
@@ -449,7 +518,7 @@ export function useTaskController(
   const cancelTask = useCancelTask();
 
   const start = useCallback(
-    (override?: { scope?: string; taskId?: string }) => {
+    (override?: { scope?: string; taskId?: string; beatNumbers?: number[] }) => {
       logsRef.current = [];
       // Re-open the reconcile window so the NEXT /tasks poll tick can discover
       // the server-assigned scope for this run. Callers that *know* the scope
@@ -464,6 +533,11 @@ export function useTaskController(
         activeTaskType: key.taskType,
         activeTaskId: override?.taskId ?? null,
         activeScope: override?.scope ?? key.scope ?? null,
+        // The caller knows the beats it just submitted; reconcile will confirm
+        // them from the task row on the next /tasks tick.
+        activeBeatNumbers:
+          override?.beatNumbers ??
+          (key.beatNum === undefined ? null : [key.beatNum]),
         streamState: {
           status: "idle",
           progress: 0,
@@ -474,7 +548,14 @@ export function useTaskController(
         },
       });
     },
-    [entry, key.taskType, key.scope],
+    [entry, key.taskType, key.scope, key.beatNum],
+  );
+
+  const activeBeatNumbers = snapshot.activeBeatNumbers;
+  const covers = useCallback(
+    (beatNum: number) =>
+      activeBeatNumbers === null || activeBeatNumbers.includes(beatNum),
+    [activeBeatNumbers],
   );
 
   const stop = useCallback(async () => {
@@ -503,6 +584,7 @@ export function useTaskController(
     stream: snapshot.streamState,
     logs: logsRef.current,
     start,
+    covers,
     stop,
     stopping: cancelTask.isPending,
   };

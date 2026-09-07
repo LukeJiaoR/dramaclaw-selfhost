@@ -1,15 +1,15 @@
 """小说上传 & 导入端点。"""
 
-import asyncio
 import logging
 import os
-import secrets
 import shutil
-import stat
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+import anyio
+from anyio.lowlevel import RunVar
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 
 from novelvideo.api.auth import get_api_user, require_scope
 from novelvideo.api.chapter_preview import (
@@ -17,9 +17,9 @@ from novelvideo.api.chapter_preview import (
     count_billable_novel_chars,
     load_novel_text,
 )
-from novelvideo.api.deps import make_cognee_store_for_context, resolve_project_scope
+from novelvideo.api.deps import resolve_project_scope
 from novelvideo.api.schemas import IngestStart
-from novelvideo.cognee.ladybug_access import ladybug_graph_access
+from novelvideo.knowledge_pipeline import is_structured_pipeline
 from novelvideo.graph_preview import (
     empty_graph_preview,
     load_graph_preview,
@@ -38,10 +38,12 @@ from novelvideo.utils.document_parsers import (
     supported_novel_extensions_label,
 )
 from novelvideo.utils.screenplay_quality import build_import_format_check
+from novelvideo.utils.async_ops import run_sync_bounded
 from novelvideo.utils.upload_safety import (
     MAX_NOVEL_IMPORT_BYTES,
     MAX_NOVEL_UPLOAD_BYTES,
     UploadTooLargeError,
+    create_staged_upload_file,
     is_safe_upload_target,
     sanitize_upload_filename,
     stream_to_file_with_limit,
@@ -49,6 +51,33 @@ from novelvideo.utils.upload_safety import (
 
 logger = logging.getLogger("novelvideo.api.ingest")
 router = APIRouter()
+_INGEST_UPLOAD_CONCURRENCY = 2
+_ingest_upload_limiter_var: RunVar[anyio.CapacityLimiter] = RunVar(
+    "ingest_upload_limiter"
+)
+
+
+def _ingest_upload_limiter() -> anyio.CapacityLimiter:
+    """Return the upload-processing gate scoped to the current async run."""
+
+    limiter = _ingest_upload_limiter_var.get(None)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(_INGEST_UPLOAD_CONCURRENCY)
+        _ingest_upload_limiter_var.set(limiter)
+    return limiter
+
+
+async def _run_ingest_upload_operation(
+    operation: Callable[..., Any], /, *args: Any, **kwargs: Any
+) -> Any:
+    """Run blocking upload work off-loop without abandoning its limiter token."""
+
+    return await run_sync_bounded(
+        operation,
+        *args,
+        limiter=_ingest_upload_limiter(),
+        **kwargs,
+    )
 
 
 @router.get("/projects/{project}/ingest/graph")
@@ -68,48 +97,31 @@ async def get_ingest_knowledge_graph(
     if not (ctx.output_dir / "novel.txt").is_file():
         return {"ok": True, "data": empty_graph_preview()}
 
+    # structured_v1 projects never build a graph, so there is never a sidecar
+    # to read and the client renders nothing for an empty preview.
+    if is_structured_pipeline(ctx.state_dir):
+        return {"ok": True, "data": empty_graph_preview()}
+
+    # Written during import, before novel.txt — which is the public "import
+    # succeeded" marker — so a project that imported successfully has one.
+    #
+    # Projects predating the sidecar do not, and are left without a preview
+    # rather than materialized on demand. Backfilling meant a viewer-role GET
+    # opening Ladybug from an API worker and waiting on the project graph lock
+    # with no timeout: during a rebuild that is the length of the rebuild, held
+    # by a request that asyncio.shield keeps alive after the client is gone.
+    # And the wait bought nothing — the first thing it did on acquiring the
+    # lock was re-check novel.txt, find it removed by the rebuild, and return
+    # the empty preview anyway.
+    #
+    # Nothing downstream reads this file; it is one visualization on the import
+    # page, and the client already renders nothing for an empty one. A missing
+    # preview is a missing picture, not missing data, and re-importing produces
+    # it.
     snapshot = load_graph_preview(ctx.state_dir)
     if snapshot is not None:
         return {"ok": True, "data": snapshot}
-
-    # Legacy projects predate graph-preview.json. Materialize exactly once
-    # under a cross-process lock, then all future requests are sidecar reads.
-    try:
-        async with ladybug_graph_access(str(ctx.state_dir), read_only=True):
-            # A rebuild may have invalidated the project while this request waited
-            # for the lock. Never open Ladybug after the success marker disappears.
-            if not (ctx.output_dir / "novel.txt").is_file():
-                return {"ok": True, "data": empty_graph_preview()}
-
-            snapshot = load_graph_preview(ctx.state_dir)
-            if snapshot is not None:
-                return {"ok": True, "data": snapshot}
-
-            store = await make_cognee_store_for_context(ctx)
-            try:
-                snapshot_task = asyncio.create_task(store.materialize_graph_preview())
-                try:
-                    snapshot = await asyncio.shield(snapshot_task)
-                except asyncio.CancelledError:
-                    logger.info(
-                        "[%s] legacy graph preview request cancelled; "
-                        "waiting for materialization cleanup",
-                        project,
-                    )
-                    await snapshot_task
-                    raise
-            finally:
-                await store.close()
-            return {"ok": True, "data": snapshot}
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.exception("[%s] failed to materialize legacy graph preview", project)
-        raise HTTPException(
-            status_code=503,
-            detail="知识图谱预览暂时不可用，请稍后重试",
-            headers={"Retry-After": "3"},
-        ) from exc
+    return {"ok": True, "data": empty_graph_preview()}
 
 
 def _unsupported_format_response(filename: str) -> dict:
@@ -154,39 +166,21 @@ def _text_too_large_response(actual_chars: int) -> dict:
     }
 
 
-def _create_staged_upload(staging_dir: Path, suffix: str) -> Path:
-    """Create a unique staging file whose mode respects the process umask."""
-
-    for _ in range(10):
-        staged_path = staging_dir / f"upload-{secrets.token_hex(16)}{suffix}"
-        try:
-            fd = os.open(
-                staged_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o666,
-            )
-        except FileExistsError:
-            continue
-        os.close(fd)
-        return staged_path
-    raise OSError("failed to allocate upload staging file")
-
-
-@router.post("/projects/{project}/ingest/upload")
-async def upload_novel(
+def _upload_novel_sync(
+    *,
     project: str,
-    file: UploadFile = File(...),
-    spine_template: Annotated[str | None, Form()] = None,
-    user: dict = Depends(get_api_user),
-):
-    """上传小说文件到项目的 uploads/ 目录。"""
-    logger.info("[%s] upload_novel: %s", project, file.filename)
-    resolved = await resolve_project_scope(project, user, required_role="editor")
-    project_dir = resolved.project_dir
+    upload_stream: Any,
+    filename: str | None,
+    project_dir: Path,
+    state_dir: str | Path,
+    spine_template: str | None,
+) -> dict:
+    """Stage, parse, preview, and atomically persist one novel upload."""
+
     uploads_dir = project_dir / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_name = sanitize_upload_filename(file.filename)
+    safe_name = sanitize_upload_filename(filename)
     if not is_safe_upload_target(uploads_dir, safe_name):
         return {"ok": False, "error": "非法文件名"}
     if not is_supported_novel_path(safe_name):
@@ -194,10 +188,14 @@ async def upload_novel(
     dest = uploads_dir / safe_name
     staging_dir = uploads_dir / ".staging"
     staging_dir.mkdir(exist_ok=True)
-    staged_path = _create_staged_upload(staging_dir, Path(safe_name).suffix)
+    staged_path = create_staged_upload_file(
+        staging_dir,
+        suffix=Path(safe_name).suffix,
+        destination=dest,
+    )
     try:
         try:
-            size = stream_to_file_with_limit(file.file, staged_path)
+            size = stream_to_file_with_limit(upload_stream, staged_path)
         except UploadTooLargeError:
             return _file_too_large_response()
 
@@ -207,9 +205,7 @@ async def upload_novel(
             billable_chars = count_billable_novel_chars(content)
             if billable_chars > MAX_NOVEL_IMPORT_CHARS:
                 return _text_too_large_response(billable_chars)
-            project_config = load_project_config_file_from_state_dir(
-                resolved.state_dir
-            )
+            project_config = load_project_config_file_from_state_dir(state_dir)
             requested_spine_template = str(
                 spine_template
                 or project_config.get("spine_template")
@@ -234,7 +230,9 @@ async def upload_novel(
                 "detail": str(exc),
             }
         except Exception:
-            logger.warning("[%s] failed to build chapter preview", project, exc_info=True)
+            logger.warning(
+                "[%s] failed to build chapter preview", project, exc_info=True
+            )
             return {"ok": False, "error": "解析章节失败"}
 
         has_chapters = bool(preview.get("chapters"))
@@ -251,18 +249,11 @@ async def upload_novel(
             }
 
         try:
-            # Replacements preserve their existing mode. New staging files were
-            # created with mode 0666 filtered through the process umask, matching
-            # the historical ``open(path, "wb")`` behavior.
-            try:
-                destination_mode = stat.S_IMODE(dest.stat().st_mode)
-            except FileNotFoundError:
-                pass
-            else:
-                staged_path.chmod(destination_mode)
             os.replace(staged_path, dest)
         except OSError:
-            logger.exception("[%s] failed to persist uploaded novel: %s", project, safe_name)
+            logger.exception(
+                "[%s] failed to persist uploaded novel: %s", project, safe_name
+            )
             return {"ok": False, "error": "保存上传文件失败"}
 
         data.update(preview)
@@ -278,6 +269,27 @@ async def upload_novel(
                 staged_path.name,
                 exc_info=True,
             )
+
+
+@router.post("/projects/{project}/ingest/upload")
+async def upload_novel(
+    project: str,
+    file: UploadFile = File(...),
+    spine_template: Annotated[str | None, Form()] = None,
+    user: dict = Depends(get_api_user),
+):
+    """上传小说文件到项目的 uploads/ 目录。"""
+    logger.info("[%s] upload_novel: %s", project, file.filename)
+    resolved = await resolve_project_scope(project, user, required_role="editor")
+    return await _run_ingest_upload_operation(
+        _upload_novel_sync,
+        project=project,
+        upload_stream=file.file,
+        filename=file.filename,
+        project_dir=Path(resolved.project_dir),
+        state_dir=resolved.state_dir,
+        spine_template=spine_template,
+    )
 
 
 @router.post("/projects/{project}/ingest/start")
@@ -361,6 +373,30 @@ async def start_ingest(
             require_scene_headers=True,
         )
         if format_check["level"] == "blocking":
+            issue_codes = sorted(
+                {
+                    str(issue.get("code") or "").strip()
+                    for issue in format_check.get("issues", [])
+                    if str(issue.get("code") or "").strip()
+                }
+            )
+            numeric_metrics = {
+                str(key): value
+                for key, value in format_check.get("metrics", {}).items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            }
+            logger.warning(
+                "screenplay_format_blocked project=%s filename=%s "
+                "spine_template=%s level=%s issue_codes=%s metrics=%s "
+                "scene_header_status=%s",
+                project,
+                safe_name,
+                effective_spine_template,
+                format_check.get("level", ""),
+                issue_codes,
+                numeric_metrics,
+                format_check.get("scene_header_status", ""),
+            )
             return {
                 "ok": False,
                 "error": format_check["summary"],

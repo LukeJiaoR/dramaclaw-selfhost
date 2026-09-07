@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,11 +14,10 @@ from novelvideo.audio_request_usage import (
     update_audio_generation_attempt,
 )
 from novelvideo.config import INDEXTTS2_RECORD_MODEL, INDEXTTS2_RECORD_PROVIDER
-from novelvideo.shared.billing_errors import is_insufficient_credits_error
-from novelvideo.project_config import (
-    is_narrated_project,
-    load_effective_narration_style_for_voice,
-    load_narrator_reference_audio,
+from novelvideo.egress_context import TrustedEgressContext
+from novelvideo.shared.billing_errors import (
+    is_fatal_billing_error,
+    is_insufficient_credits_error,
 )
 from novelvideo.seedance2_i2v.models import parse_seedance2_config
 from novelvideo.seedance2_i2v.voice_audio_records import (
@@ -169,8 +169,9 @@ def _audio_usage_request_id(
     return f"indextts2:{uuid.uuid5(uuid.NAMESPACE_URL, stable).hex}"
 
 
-def _is_narrated_project(username: str, project: str) -> bool:
-    return is_narrated_project(username, project)
+def _is_narrated_project(store, username: str, project: str) -> bool:
+    project_config = importlib.import_module("novelvideo.project_config")
+    return project_config.is_narrated_project_from_state_dir(store.state_dir)
 
 
 def _resolve_beat_uploaded_narration_voice(
@@ -245,8 +246,12 @@ async def _resolve_narrator_voice(
     username: str,
     project: str,
 ) -> tuple[Path | None, str, str, str]:
-    narration_style = load_effective_narration_style_for_voice(username, project)
-    narrator_reference = load_narrator_reference_audio(username, project)
+    project_config = importlib.import_module("novelvideo.project_config")
+    state_dir = store.state_dir
+    narration_style = project_config.load_effective_narration_style_for_voice_from_state_dir(
+        state_dir
+    )
+    narrator_reference = project_config.load_narrator_reference_audio_from_state_dir(state_dir)
     characters = await store.list_characters()
     resolution = resolve_narrator_source(
         store=store,
@@ -271,11 +276,14 @@ async def _resolve_narration_voice_for_beat(
     username: str,
     project: str,
 ) -> tuple[Path | None, str, str, str]:
-    if not _is_narrated_project(username, project):
+    if not _is_narrated_project(store, username, project):
         beat_voice = _resolve_beat_uploaded_narration_voice(beat, store.project_dir)
         if beat_voice is not None:
-            narration_style = load_effective_narration_style_for_voice(
-                username, project
+            project_config = importlib.import_module("novelvideo.project_config")
+            narration_style = (
+                project_config.load_effective_narration_style_for_voice_from_state_dir(
+                    store.state_dir
+                )
             )
             return beat_voice, file_sha256(beat_voice), narration_style, ""
     return await _resolve_narrator_voice(
@@ -327,7 +335,7 @@ async def build_indextts2_audio_generation_plan(
 
         if is_narration:
             beat_voice = None
-            if not _is_narrated_project(username, project):
+            if not _is_narrated_project(store, username, project):
                 beat_voice = _resolve_beat_uploaded_narration_voice(
                     beat, store.project_dir
                 )
@@ -432,8 +440,21 @@ async def run_indextts2_beat_audio_generation(
     audio_url_builder: AudioUrlBuilder | None = None,
     progress_callback: ProgressCallback | None = None,
     log_callback: LogCallback | None = None,
+    egress_context: TrustedEgressContext | None = None,
 ) -> IndexTTS2BeatAudioTaskResult:
     """Generate selected beat MP3s with IndexTTS2 character/narrator references."""
+
+    if egress_context is None:
+        from novelvideo.egress_context import ambient_organization_egress_context
+
+        egress_context = ambient_organization_egress_context()
+    if generator is None and egress_context is not None:
+        from novelvideo.generators.indextts2_fal import IndexTTS2FalClient
+
+        generator = IndexTTS2FalClient(
+            provider="newapi",
+            egress_context=egress_context,
+        )
 
     normalized_mode = _normalize_mode(mode)
     result = IndexTTS2BeatAudioTaskResult(mode=normalized_mode)
@@ -599,7 +620,7 @@ async def run_indextts2_beat_audio_generation(
                 status="success",
             )
         except Exception as exc:
-            if is_insufficient_credits_error(exc):
+            if is_fatal_billing_error(exc):
                 raise
             message = f"Beat {beat_num:02d}: {exc}"
             result.failed.append(message)

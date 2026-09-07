@@ -181,6 +181,12 @@ def create_episode_planner_agent(tools: List[Callable]) -> Agent:
 # =============================================================================
 
 
+# Legacy-only AI episode planner.
+# No current frontend workflow selects this mode: the "plan episodes" button
+# posts an empty body (frontend/src/routes/_app/projects.$project/episodes.tsx),
+# so planning_mode falls back to the "chapters" default in api/schemas.py.
+# Reaching this code still requires an explicit planning_mode="ai" from an API
+# client. Structured-v2 projects must not enter this path.
 class EpisodePlannerAgent:
     """剧集规划 Agent - 使用图谱搜索进行多轮迭代式规划。
 

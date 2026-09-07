@@ -5,6 +5,7 @@ import { createPortal } from 'react-dom';
 import {
   Handle,
   Position,
+  useStore,
   useUpdateNodeInternals,
   type NodeProps,
 } from '@xyflow/react';
@@ -19,7 +20,6 @@ import {
   Languages,
   Library,
   Loader2,
-  Palette,
   Upload,
   X,
 } from 'lucide-react';
@@ -27,11 +27,14 @@ import { useTranslation } from 'react-i18next';
 
 import {
   CANVAS_NODE_TYPES,
+  isStyleNode,
+  type CanvasNodeData,
   type ImageGenCameraSelection,
   type ImageGenCount,
   type ImageGenNodeData,
   type ImageQuality,
   type ImageSize,
+  type StyleNodeData,
 } from '@/features/canvas/domain/canvasNodes';
 import { buildImageFeatureBillingParams } from '@/features/canvas/domain/imageBilling';
 import {
@@ -41,9 +44,15 @@ import {
   resolveModelSizeOptions,
 } from '@/features/canvas/domain/mediaModelOptions';
 import {
+  nodeBodyImageMeasurement,
+  nodeBodyImageSrc,
+  nodeBodyRecordDescribesImage,
+  planNaturalSizeRecordWrite,
   parseAspectRatio,
   pickClosestAspectRatio,
+  readNodeNaturalSize,
   resolveImageDisplayUrl,
+  shouldUseOriginalImageByZoom,
   snapToAllowedAspectRatio,
   withImageCacheBust,
 } from '@/features/canvas/application/imageData';
@@ -52,7 +61,7 @@ import {
   resolveMinEdgeFittedSize,
   shouldForceNaturalImageSize,
 } from '@/features/canvas/application/imageNodeSizing';
-import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
+import { localizeNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import {
   isSystemManagedNodeData,
   mainlineNodeVisualState,
@@ -75,6 +84,7 @@ import {
   useAlbumPendingTotal,
 } from '@/features/canvas/nodes/shared/albumPendingTotals';
 import { downloadUrlAsFile } from '@/lib/browserDownload';
+import { useModelTaskAccess } from '@/lib/model-task-access';
 import {
   CANVAS_NODE_INPUT_BODY_FRAME_CLASS,
   CANVAS_NODE_INPUT_PLACEHOLDER_CLASS,
@@ -83,6 +93,8 @@ import {
   CANVAS_NODE_PANEL_SURFACE_CLASS,
   canvasNodeFrameClass,
 } from '@/features/canvas/ui/nodeFrameStyles';
+import { useNaturalSizeRecordTrust } from '@/features/canvas/hooks/useNaturalSizeRecordTrust';
+import { useNodeBodyVariantBudget } from '@/features/canvas/hooks/useNodeBodyVariantBudget';
 import { useCanvasStore, useIsBoxSelecting } from '@/stores/canvasStore';
 import { useShallow } from 'zustand/react/shallow';
 import { getFreezoneCanvasMetadata } from '@/features/freezone/canvasMetadataContext';
@@ -122,6 +134,10 @@ import { useFreezoneImageModels } from '@/features/canvas/hooks/useFreezoneImage
 import { useNodeGenerationHistory } from '@/features/canvas/hooks/useNodeGenerationHistory';
 import { MediaModelParameterChip } from '@/features/canvas/ui/MediaModelParameterChip';
 import { ReferenceTextChip } from '@/features/canvas/nodes/shared/ReferenceTextChip';
+import { ReferenceMentionButton } from '@/features/canvas/nodes/shared/ReferenceMentionButton';
+import { focusReferenceNode } from '@/features/canvas/application/viewportReturnStore';
+import { collectReferenceMaterials } from '@/features/canvas/application/referencePick';
+import { attachReferenceEdge } from '@/features/canvas/application/attachReference';
 import {
   AssetLibraryModal,
   type AssetLibrarySelection,
@@ -144,12 +160,31 @@ import {
 } from '@/features/canvas/application/generationTaskArbitration';
 import { useFreezoneCameraOptions } from '@/features/canvas/hooks/useFreezoneCameraOptions';
 import {
-  StylePickerPopover,
+  StyleGalleryModal,
   describeStyleSelection,
-} from '@/features/canvas/nodes/StylePickerPopover';
+  resolveStyleSelectionState,
+} from '@/features/canvas/ui/StyleGalleryModal';
+import {
+  StyleThumbnail,
+  StyleTriggerChip,
+} from '@/features/canvas/nodes/StyleChip';
 import { useFreezoneStyleTemplates } from '@/features/canvas/hooks/useFreezoneStyleTemplates';
-import { joinUpstreamText } from '@/features/canvas/application/graphContentResolver';
-import { useUpstreamContents } from '@/features/canvas/application/useUpstreamGraph';
+import {
+  STYLE_NODE_HEIGHT,
+  STYLE_NODE_WIDTH,
+} from '@/features/canvas/nodes/StyleNode';
+import {
+  advanceStyleNodeSync,
+  isStyleSyncReady,
+  resolveStyleNodePlacement,
+  readStyleNodeSyncState,
+  writeStyleNodeSyncState,
+} from '@/features/canvas/application/styleNodeSync';
+import {
+  extractUpstreamContent,
+  joinUpstreamText,
+} from '@/features/canvas/application/graphContentResolver';
+import { useUpstreamNodes } from '@/features/canvas/application/useUpstreamGraph';
 import { useNodeGenerationTaskState } from '@/features/canvas/application/useNodeGenerationTaskState';
 import {
   PromptMentionEditor,
@@ -183,6 +218,7 @@ import {
   NodeSideActionRail,
 } from '@/features/canvas/ui/NodeSideActionRail';
 import { NodeContextPromptPaletteButton } from '@/features/canvas/nodes/ContextPromptPaletteButton';
+import { ReferencePickChip } from '@/features/canvas/nodes/shared/ReferencePickChip';
 import {
   contextPromptPaletteInsertionText,
   type ContextPromptPaletteEntry,
@@ -204,7 +240,9 @@ const MIN_HEIGHT = 260;
 const MAX_WIDTH = 1100;
 const MAX_HEIGHT = 1000;
 
-const OPERATIONS_PANEL_HEIGHT = 232;
+// 面板高度。参考素材独占一行（缩略图 48px + 间距）之后，232px 只给提示词剩下两行
+// 多一点，写长一点就要在窄缝里滚——加高到给提示词留出四五行的程度。
+const OPERATIONS_PANEL_HEIGHT = 288;
 const OPERATIONS_PANEL_GAP = 12;
 const OPERATIONS_PANEL_MIN_WIDTH = 720;
 // 「放大」后的操作区尺寸：给提示词编辑区更舒适的高度与宽度。
@@ -212,8 +250,10 @@ const OPERATIONS_PANEL_EXPANDED_HEIGHT = 560;
 const OPERATIONS_PANEL_EXPANDED_MIN_WIDTH = 960;
 const IMAGE_GENERATE_FEATURE_KEY = 'freezone.image_generate';
 
+// 只有 auto 需要翻译，其余标签就是比例本身。模块级常量取不到 t，所以存 key。
+const ASPECT_LABEL_KEYS: Record<string, string> = { auto: 'node.imageGen.aspect.auto' };
 const ASPECT_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
-  { value: 'auto', label: '自适应' },
+  { value: 'auto', label: 'auto' },
   { value: '1:1', label: '1:1' },
   { value: '9:16', label: '9:16' },
   { value: '16:9', label: '16:9' },
@@ -230,10 +270,10 @@ const SIZE_OPTIONS: ReadonlyArray<ImageSize> = ['1K', '2K', '4K'];
 const COUNT_OPTIONS: ReadonlyArray<ImageGenCount> = [1, 2, 4];
 const SELECTED_BACKGROUND_CROP_ASPECT_OPTIONS = ['2:3', '16:9'] as const;
 
-const QUALITY_OPTIONS: ReadonlyArray<{ value: ImageQuality; label: string }> = [
-  { value: 'low', label: '低画质' },
-  { value: 'medium', label: '标准画质' },
-  { value: 'high', label: '高画质' },
+const QUALITY_OPTIONS: ReadonlyArray<{ value: ImageQuality; labelKey: string }> = [
+  { value: 'low', labelKey: 'node.imageGen.quality.low' },
+  { value: 'medium', labelKey: 'node.imageGen.quality.medium' },
+  { value: 'high', labelKey: 'node.imageGen.quality.high' },
 ];
 const DEFAULT_IMAGE_QUALITY: ImageQuality = 'medium';
 const IMAGE_PARAM_POPOVER_CLASS =
@@ -272,6 +312,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
   const updateNodeData = useCanvasStore((state) => state.updateNodeData);
   const updateNodeSize = useCanvasStore((state) => state.updateNodeSize);
   const deleteEdge = useCanvasStore((state) => state.deleteEdge);
+  const deleteNodeAction = useCanvasStore((state) => state.deleteNode);
   const addNodeAction = useCanvasStore((state) => state.addNode);
   const addEdgeAction = useCanvasStore((state) => state.addEdge);
 
@@ -427,9 +468,9 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
         ASPECT_OPTIONS.map((item) => item.value),
       ).map((value) => ({
         value,
-        label: ASPECT_OPTIONS.find((item) => item.value === value)?.label ?? value,
+        label: ASPECT_LABEL_KEYS[value] ? t(ASPECT_LABEL_KEYS[value]) : value,
       })),
-    [selectedModel],
+    [selectedModel, t],
   );
   const effectiveImageSize =
     modelSizeOptions.find((option) => option.toLowerCase() === size.toLowerCase())
@@ -478,10 +519,28 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
   }, [imageBillingRuleMissing, imageCreditCost.data?.data.display, t]);
   const { options: cameraOptions } = useFreezoneCameraOptions();
   const cameraSummary = describeCameraSelection(cameraSelection, cameraOptions);
-  const { templates: styleTemplates } = useFreezoneStyleTemplates();
+  const {
+    templates: styleTemplates,
+    assetBase: styleAssetBase,
+    isLoading: styleTemplatesLoading,
+    error: styleTemplatesError,
+    retry: retryStyleTemplates,
+  } = useFreezoneStyleTemplates();
   const selectedStyle = describeStyleSelection(styleTemplateId, styleTemplates);
+  const styleSelectionState = resolveStyleSelectionState(
+    styleTemplateId,
+    selectedStyle,
+    { isLoading: styleTemplatesLoading, hasError: styleTemplatesError !== null },
+  );
 
-  const upstreamContents = useUpstreamContents(id);
+  // Subscribe to the upstream graph once. Calling useUpstreamContents here and
+  // useUpstreamNodes below created two independent Zustand selectors, so every
+  // canvas-store update walked the full nodes/edges arrays twice per image node.
+  const upstreamNodes = useUpstreamNodes(id);
+  const upstreamContents = useMemo(
+    () => upstreamNodes.map(extractUpstreamContent),
+    [upstreamNodes],
+  );
   // ImageGen 上游只消费「文本 + 图片」，视频/音频内容被丢弃 ——
   // 即便 upload 节点带了视频 URL，也不进 OpsPanel 也不进 reference_urls。
   const upstreamImageContents = useMemo(() => {
@@ -548,10 +607,99 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
     [connectedEdges, id],
   );
   // 节点被连线（存在入边）后：隐藏「试试」CTA，只在节点中间显示一个图标（对齐 libtv）。
+  // 风格节点不算 —— 它是本节点自己的选择在画布上的投影，不是「用户接了个上游」，
+  // 选个风格就把空节点的 CTA 收掉会很莫名。
   const isConnected = useMemo(
-    () => connectedEdges.some((edge) => edge.target === id),
-    [connectedEdges, id],
+    () => upstreamNodes.some((node) => !isStyleNode(node)),
+    [upstreamNodes],
   );
+
+  // 主线只读判定：风格对账（下面）和工具条都要用，所以提到这里统一算一次。
+  const mainlineFlags = useMemo(
+    () => nodeMainlineFlags({ data, id, type: 'imageGenNode', position: { x: 0, y: 0 } } as never),
+    [data, id],
+  );
+  const mainlineCanvasReadonly = mainlineFlags.isPresetManaged && !canAutoCommitOnGenerate;
+
+  // ===== 选中的风格 ⇄ 画布上的风格节点 =====
+  // 真源始终是本节点的 styleTemplateId（提交读的就是它），风格节点只是它在画布上
+  // 的投影。判定规则（含「刚建完还没回流」「存量画布补建」两个时序坑）抽在
+  // styleNodeSync 里，这里只负责把动作落到 store。
+  const upstreamStyleNodeId = useMemo(
+    () => upstreamNodes.find((item) => isStyleNode(item))?.id ?? null,
+    [upstreamNodes],
+  );
+  // 「这个风格节点还连着别人吗」只能看它自己的出边，本节点的 connectedEdges 看不到。
+  // 取成布尔值订阅，别的边怎么动都不会让这里重渲染。
+  const styleNodeIsShared = useCanvasStore((state) =>
+    upstreamStyleNodeId === null
+      ? false
+      : state.edges.filter((edge) => edge.source === upstreamStyleNodeId).length > 1,
+  );
+  const upstreamStyleNode = useMemo(() => {
+    const node = upstreamNodes.find((item) => isStyleNode(item));
+    if (!node) return null;
+    const raw = (node.data as StyleNodeData).styleTemplateId;
+    return {
+      id: node.id,
+      templateId: typeof raw === 'string' && raw.length > 0 ? raw : null,
+      sharedWithOtherTargets: styleNodeIsShared,
+    };
+  }, [styleNodeIsShared, upstreamNodes]);
+  // 对账要等风格清单到手才能开工，理由是补建那一支：清单换代后旧画布里存的
+  // 清单没到、或者选中的是清单里查不到的旧 id，都不许动手（判据见 isStyleSyncReady）。
+  const styleSyncReady = isStyleSyncReady(styleTemplateId, styleTemplates);
+  useEffect(() => {
+    // 只读的主线画布一律不碰：那上面的节点不归用户管，补建/删除都是越权写入。
+    if (!styleSyncReady || mainlineCanvasReadonly) return;
+    const { action, state } = advanceStyleNodeSync(readStyleNodeSyncState(id), {
+      selectedTemplateId: styleTemplateId,
+      styleNode: upstreamStyleNode,
+    });
+    writeStyleNodeSyncState(id, state);
+    switch (action.kind) {
+      case 'create': {
+        const self = useCanvasStore.getState().nodes.find((node) => node.id === id);
+        if (!self) return;
+        const selfHeight =
+          self.measured?.height
+          ?? (typeof self.height === 'number' ? self.height : DEFAULT_HEIGHT);
+        const newNodeId = addNodeAction(
+          CANVAS_NODE_TYPES.style,
+          resolveStyleNodePlacement({
+            imageNodePosition: self.position,
+            imageNodeHeight: selfHeight,
+            styleNodeWidth: STYLE_NODE_WIDTH,
+            styleNodeHeight: STYLE_NODE_HEIGHT,
+          }),
+          { styleTemplateId: action.templateId } as Partial<CanvasNodeData>,
+        );
+        addEdgeAction(newNodeId, id);
+        break;
+      }
+      case 'update':
+        updateNodeData(action.nodeId, { styleTemplateId: action.templateId });
+        break;
+      case 'remove':
+        deleteNodeAction(action.nodeId);
+        break;
+      case 'clear-selection':
+        updateNodeData(id, { styleTemplateId: null });
+        break;
+      default:
+        break;
+    }
+  }, [
+    addEdgeAction,
+    addNodeAction,
+    deleteNodeAction,
+    id,
+    mainlineCanvasReadonly,
+    styleSyncReady,
+    styleTemplateId,
+    updateNodeData,
+    upstreamStyleNode,
+  ]);
 
   // 候选按 orderedReferenceUrls 编号（自身参考图在场时就是图片1），保证 @ 出来的
   // 缩略图与后端解析到的 图片N 是同一张。key 优先用上游 nodeId；自身参考图没有
@@ -562,11 +710,56 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
         key:
           upstreamImageContents.find((content) => content.imageUrl === url)
             ?.nodeId ?? `self:${url}`,
-        name: `图片${index + 1}`,
+        // `@图片N` 是提示词里的引用记号，随 prompt 原样发给后端，不是界面文案。
+        name: `图片${index + 1}`, // i18n-exempt
         imageUrl: resolveImageDisplayUrl(url),
         index: index + 1,
       })),
     [orderedReferenceUrls, upstreamImageContents],
+  );
+
+  // 引用缩略图右下角的 @ 按钮：按这张图当前的编号插进提示词，用户不必自己数第几张。
+  // key 就是 mentionCandidates 里的 key（上游 nodeId），所以直接查表即可。
+  const handleMentionReference = useCallback(
+    (nodeId: string) => {
+      const candidate = mentionCandidates.find((item) => item.key === nodeId);
+      if (!candidate) return;
+      promptEditorRef.current?.insertMentionAtCursor(candidate);
+    },
+    [mentionCandidates],
+  );
+  // 双击引用 → 视口跳到那个上游节点，并在底部留下「返回节点」。
+  const handleJumpToReference = useCallback(
+    (nodeId: string) => {
+      focusReferenceNode(nodeId, id);
+    },
+    [id],
+  );
+
+  // 替换选单的「素材引用」段：画布上还没连过来、可以当参考图的素材（图片节点只
+  // 收图片，collectReferenceMaterials 已按同一套规则筛过）。已经连着的按**边**排除，
+  // 不按已有参考图排除——连着但还没出图的上游节点同样不该再被当成「还没引用」。
+  //
+  // 打开选单时才算：这份清单要扫全画布，做成常驻订阅等于让每个图片节点都跟着
+  // 整个 nodes 数组重渲染，拖一个节点就是一次全画布 O(N²)。
+  const getMentionMaterials = useCallback(() => {
+    const store = useCanvasStore.getState();
+    const attached = new Set(
+      store.edges.filter((edge) => edge.target === id).map((edge) => edge.source),
+    );
+    return collectReferenceMaterials(
+      store.nodes,
+      id,
+      CANVAS_NODE_TYPES.imageGen,
+      attached,
+      t,
+    );
+  }, [id, t]);
+  // 选中一条画布素材：连成上游即可，参考图行与 @ 编号都由上游推导链路跟上。
+  // 被拒（素材上限等）时 attachReferenceEdge 已经把原因弹出来了，这里只回结果。
+  const handleAttachMaterial = useCallback(
+    (sourceNodeId: string) => attachReferenceEdge(sourceNodeId, id),
+    [id],
   );
 
   // 让 prompt 里的 @图片N 始终跟随参考图引用编号：删除 / 重排 / 新增引用连线、
@@ -583,7 +776,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
   );
   useReferenceMentionSync(
     prompt,
-    [{ prefix: "图片", ids: orderedReferenceUrls }],
+    [{ prefix: "图片", ids: orderedReferenceUrls }], // i18n-exempt —— 同 mentionCandidates，属提示词协议
     applyPromptRemap,
   );
 
@@ -648,7 +841,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
         addEdgeAction(newId, id);
         newIds.push(newId);
       });
-      state.autoGroupSpawn(id, newIds, { label: '资产参考组' });
+      state.autoGroupSpawn(id, newIds, { label: t('node.imageGen.assetReferenceGroup') });
     },
     [addEdgeAction, addNodeAction, id],
   );
@@ -669,14 +862,19 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
   }, [refHover]);
 
   const resolvedTitle = useMemo(
-    () => resolveNodeDisplayName(CANVAS_NODE_TYPES.imageGen, data),
-    [data],
+    () => localizeNodeDisplayName(CANVAS_NODE_TYPES.imageGen, data, t),
+    [data, t],
   );
   const resolvedWidth = Math.max(MIN_WIDTH, Math.round(width ?? DEFAULT_WIDTH));
   const resolvedHeight = Math.max(MIN_HEIGHT, Math.round(height ?? DEFAULT_HEIGHT));
   // 收起态浮动面板固定基础尺寸；放大用居中弹窗（见下方 OperationPanelShell）。
   const [panelExpanded, setPanelExpanded] = useState(false);
   const [stylePickerOpen, setStylePickerOpen] = useState(false);
+  // 打开图墙是个明确的用户动作，顺手把上次失败的清单重拉一遍（成功态是空操作）。
+  const openStylePicker = useCallback(() => {
+    retryStyleTemplates();
+    setStylePickerOpen(true);
+  }, [retryStyleTemplates]);
   const panelHeight = OPERATIONS_PANEL_HEIGHT;
   const panelWidth = Math.max(resolvedWidth, OPERATIONS_PANEL_MIN_WIDTH);
 
@@ -687,6 +885,38 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
     return null;
   }, [data.imageUrl, data.previewImageUrl, referenceImageUrl]);
   const visiblePreviewUrl = isGenerating ? null : previewUrl;
+  // selector 返回 boolean，平移中每帧变的 transform[0]/[1] 不会触发重渲染，
+  // 只在缩放跨过 1.45 那一次翻转（与 ImageNode/UploadNode 同一条线）。
+  const preferOriginalImage = useStore((state) => shouldUseOriginalImageByZoom(state.transform[2]));
+  // 已记录的原图像素尺寸；决定主体图能不能喂降采样副本，也是角标的初值。
+  const recordedNaturalSize = useMemo(() => readNodeNaturalSize(data), [data]);
+  // 记录里的尺寸没有和 URL 绑定，而主图是会被换掉的（画册选主图、从历史恢复、
+  // 生成完成回填，三条路都只改 imageUrl/previewImageUrl）。不信任记录的这一轮改
+  // 喂原图，onLoad 就能量到真尺寸并落库，而不是把一组属于别的图的数字写进去。
+  const { distrusted, distrustRecord, trustAgain } = useNaturalSizeRecordTrust(visiblePreviewUrl);
+  // 主体图把整幅原图解码进几百 CSS px 的盒子里；变体只在真实尺寸已知、且没放大
+  // 到细看那一档时启用，详见 nodeBodyImageSrc 的注释。查看器仍拿 visiblePreviewUrl。
+  // 这一格要多少设备像素，决定挑哪一档副本（拉大的节点会一路挑到原图）。
+  const bodyVariantBudget = useNodeBodyVariantBudget({
+    width: resolvedWidth,
+    height: resolvedHeight,
+  });
+  const bodyImage = useMemo(
+    () =>
+      visiblePreviewUrl
+        ? nodeBodyImageSrc(visiblePreviewUrl, recordedNaturalSize, {
+            preferOriginal: preferOriginalImage || distrusted,
+            requiredEdge: bodyVariantBudget,
+          })
+        : null,
+    [
+      bodyVariantBudget,
+      distrusted,
+      preferOriginalImage,
+      recordedNaturalSize,
+      visiblePreviewUrl,
+    ],
+  );
 
   const hasGeneratedResult = Boolean(data.imageUrl);
   // Natural pixel size of the displayed image, mirrored from data when present
@@ -694,13 +924,9 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
   // the resolution badge shows even for nodes whose size already matched (those
   // skip the persist branch). Lets us render a top-right resolution chip like the
   // video node.
-  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(() => {
-    const w = (data as { imageNaturalWidth?: unknown }).imageNaturalWidth;
-    const h = (data as { imageNaturalHeight?: unknown }).imageNaturalHeight;
-    return typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0
-      ? { width: w, height: h }
-      : null;
-  });
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(
+    () => readNodeNaturalSize(data),
+  );
   // ── 叠卡画册（count > 1 的一组生成结果）──
   // 收拢时主图后探出 N-1 张卡片边缘；hover 出现右上角数量徽标，点开展开成
   // 宫格画册（同一节点内，天然不可解组）。展开态可对任意一张「设为主图」
@@ -921,13 +1147,15 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
   const selectedModelReferenceError =
     selectedModel?.referenceImageMax != null &&
     orderedReferenceUrls.length > selectedModel.referenceImageMax
-      ? `该模型最多支持 ${selectedModel.referenceImageMax} 张图片素材`
+      ? t('node.videoModel.reason.maxImages', { count: selectedModel.referenceImageMax })
       : null;
+  const modelTaskAccess = useModelTaskAccess();
   const submitDisabled =
     isGenerating ||
     !selectedModel ||
     !hasEffectivePrompt ||
     imageBillingRuleMissing ||
+    modelTaskAccess.blocked ||
     selectedModelReferenceError !== null;
 
   const handleSubmit = useCallback(async () => {
@@ -1225,7 +1453,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
     async (blob: Blob, meta: ThreeDDirectorCaptureMeta) => {
       const projectId = readUrl().project;
       if (!projectId || effectiveEpisode === null || effectiveBeat === null) {
-        throw new Error('缺少项目或镜头上下文');
+        throw new Error(t('node.imageGen.missingContext'));
       }
 
       let imageUrl = meta.controlFrameUrl
@@ -1267,12 +1495,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
   //   context_only       — 有 mainline_context 但无 slot_target:cyan 细线 + context chip
   //   ordinary           — 都没有:默认白色 border
   //
-  const mainlineFlags = useMemo(
-    () => nodeMainlineFlags({ data, id, type: 'imageGenNode', position: { x: 0, y: 0 } } as never),
-    [data, id],
-  );
   const visualState = mainlineNodeVisualState(mainlineFlags);
-  const mainlineCanvasReadonly = mainlineFlags.isPresetManaged && !canAutoCommitOnGenerate;
   const cardToneClass = (() => {
     switch (visualState) {
       case 'preset_locked':
@@ -1290,6 +1513,10 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
   // 一道，防止展开后用户点节点重新选中时面板叠到宫格上。
   const showImageOpsPanel =
     selected && !isBoxSelecting && !hasActiveOverlay && !mainlineCanvasReadonly && !albumExpanded;
+  // 面板一收（取消选中 / 展开画册），图墙的开关跟着复位，免得下次选中节点弹层自己冒出来。
+  useEffect(() => {
+    if (!showImageOpsPanel) setStylePickerOpen(false);
+  }, [showImageOpsPanel]);
 
   return (
     <div
@@ -1310,7 +1537,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                 key={`album-deck-${index}`}
                 role="button"
                 tabIndex={-1}
-                title="展开画册"
+                title={t('node.imageGen.album.expand')}
                 onClick={(event) => {
                   event.stopPropagation();
                   handleToggleAlbumExpanded();
@@ -1387,7 +1614,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
               handlePickFile();
             }}
             onPointerDown={(event) => event.stopPropagation()}
-            title="上传图片"
+            title={t('node.imageGen.upload')}
             className={NODE_SIDE_ACTION_BUTTON_CLASS}
           >
             {isUploading ? (
@@ -1395,7 +1622,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
             ) : (
               <Upload className={NODE_SIDE_ACTION_ICON_CLASS} />
             )}
-            <span>{isUploading ? '上传中' : '上传图片'}</span>
+            <span>{t(isUploading ? 'node.imageGen.uploading' : 'node.imageGen.upload')}</span>
           </button>
         </NodeSideActionRail>
       )}
@@ -1410,26 +1637,49 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
         {visiblePreviewUrl ? (
           <>
             <CanvasNodeImage
-              src={visiblePreviewUrl}
+              src={bodyImage?.src ?? visiblePreviewUrl}
               alt={resolvedTitle}
+              // 双击进查看器的必须是原图，不能跟着 src 走降采样副本。
               viewerSourceUrl={visiblePreviewUrl}
               onLoad={(event) => {
-                const naturalW = event.currentTarget.naturalWidth;
-                const naturalH = event.currentTarget.naturalHeight;
-                if (naturalW > 0 && naturalH > 0) {
+                // 记录描述的不是这张图：降采样副本上量不出源图真尺寸。第一次退回
+                // 原图重测（preferOriginal 会让下一轮 downscaled 为 false，不会来
+                // 回抖）；已经退过一次还是对不上，就什么都不写——记录和副本都不是
+                // 真相，保留旧值好过写一个确定错误的尺寸。
+                if (
+                  bodyImage?.downscaled &&
+                  !nodeBodyRecordDescribesImage(
+                    event.currentTarget,
+                    recordedNaturalSize,
+                    bodyImage.maxEdge ?? 0,
+                  )
+                ) {
+                  distrustRecord();
+                  return;
+                }
+                // 为纠正记录才退回来的那一轮，真尺寸这就量到了：解除不信任，下一
+                // 轮回到副本。这张图已经纠正过，钩子记着，不会再退第二次。
+                trustAgain();
+                // 喂的是降采样副本时元素上的 naturalWidth 是变体的尺寸，改用记录里的
+                // 真实尺寸——下面的角标、比例、自动尺寸因此与喂原图时完全一致。
+                const measured = bodyImage
+                  ? nodeBodyImageMeasurement(event.currentTarget, bodyImage, recordedNaturalSize)
+                  : { width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight };
+                if (measured.width > 0 && measured.height > 0) {
                   setNaturalSize((prev) =>
-                    prev && prev.width === naturalW && prev.height === naturalH
+                    prev && prev.width === measured.width && prev.height === measured.height
                       ? prev
-                      : { width: naturalW, height: naturalH },
+                      : { width: measured.width, height: measured.height },
                   );
                 }
                 const forceNaturalSize = shouldForceNaturalImageSize(data as Record<string, unknown>);
-                if (data.isSizeManuallyAdjusted === true && !forceNaturalSize) {
-                  return;
-                }
+                // 用户拖定过尺寸：屏幕上的尺寸归他。但记录归事实——这里原本直接
+                // return，于是换图之后真实尺寸永远写不回去，重新挂载读到的还是
+                // 旧记录，同比例换图时副本校验那层也认不出来。
+                const sizeLockedByUser = data.isSizeManuallyAdjusted === true && !forceNaturalSize;
                 const nextAspectRatio = aspectRatioFromImageDimensions(
-                  event.currentTarget.naturalWidth,
-                  event.currentTarget.naturalHeight,
+                  measured.width,
+                  measured.height,
                 );
                 if (!nextAspectRatio) {
                   return;
@@ -1441,17 +1691,40 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                 const displaySizeMismatch =
                   Math.abs(resolvedWidth - nextSize.width) > 1 ||
                   Math.abs(resolvedHeight - nextSize.height) > 1;
-                if (nextAspectRatio !== data.aspectRatio || displaySizeMismatch) {
-                  updateNodeSize(id, nextSize, {
-                    lockManualSize: forceNaturalSize ? false : undefined,
-                    data: {
-                      aspectRatio: nextAspectRatio,
-                      imageNaturalWidth: event.currentTarget.naturalWidth,
-                      imageNaturalHeight: event.currentTarget.naturalHeight,
-                      imageAspectRatioUpdatedAt: Date.now(),
-                    },
-                  });
+                // 记录空着、或者和刚量到的真相对不上，都得写回去——比例和显示尺
+                // 寸这两个条件盖不住它们（同比例换图、老项目里早就贴合的节点）。
+                // 这里没有 ImageNode 那种放大档换 URL 的问题：主体图始终是
+                // visiblePreviewUrl 这一张，所以量到的一定是记录该描述的那张图。
+                const recordWrite = planNaturalSizeRecordWrite({
+                  aspectRatioChanged: nextAspectRatio !== data.aspectRatio,
+                  displaySizeMismatch,
+                  record: recordedNaturalSize,
+                  measured,
+                  measuringRecordSubject: true,
+                  sizeLockedByUser,
+                });
+                if (!recordWrite.persist) {
+                  return;
                 }
+                // 只是补记事实那一类：不碰节点尺寸，也不碰比例。
+                if (!recordWrite.applySize) {
+                  updateNodeData(
+                    id,
+                    { imageNaturalWidth: measured.width, imageNaturalHeight: measured.height },
+                    { recordHistory: false },
+                  );
+                  return;
+                }
+                updateNodeSize(id, nextSize, {
+                  lockManualSize: forceNaturalSize ? false : undefined,
+                  recordHistory: recordWrite.recordHistory,
+                  data: {
+                    aspectRatio: nextAspectRatio,
+                    imageNaturalWidth: measured.width,
+                    imageNaturalHeight: measured.height,
+                    imageAspectRatioUpdatedAt: Date.now(),
+                  },
+                });
               }}
               className="h-full w-full object-contain"
             />
@@ -1462,7 +1735,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                   event.stopPropagation();
                   handleClearReference();
                 }}
-                title="移除参考图"
+                title={t('node.imageGen.removeReference')}
                 className="nodrag absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full bg-black/55 text-white transition-colors hover:bg-black/75"
               >
                 <X className="h-3.5 w-3.5" />
@@ -1477,7 +1750,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                   handleToggleAlbumExpanded();
                 }}
                 onPointerDown={(event) => event.stopPropagation()}
-                title={`展开 ${albumTotalSlots} 张生成结果`}
+                title={t('node.imageGen.album.expandCount', { count: albumTotalSlots })}
                 className="nodrag group/albumpill absolute right-2 top-2 z-10 hidden items-center gap-1 rounded-full bg-black/65 px-2.5 py-1 text-[12px] font-medium tabular-nums text-white shadow-lg backdrop-blur-sm transition-colors hover:bg-black/85 group-hover:inline-flex"
               >
                 {albumPendingCount > 0
@@ -1508,7 +1781,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
             <div className="pointer-events-none absolute inset-x-0 top-0 flex items-center justify-between gap-2 p-2">
               <span className="pointer-events-auto inline-flex items-center gap-1.5 rounded-full bg-black/60 px-2.5 py-1 text-[11px] text-white/90 backdrop-blur">
                 <Loader2 className="h-3 w-3 animate-spin" />
-                新图片生成中…
+                {t('node.imageGen.history.generatingNew')}
               </span>
               <button
                 type="button"
@@ -1519,7 +1792,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                 }}
               >
                 <X className="h-3 w-3" />
-                返回
+                {t('node.imageGen.history.back')}
               </button>
             </div>
           </div>
@@ -1534,7 +1807,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
             {isUploading ? (
               <div className="flex w-full flex-col items-center justify-center gap-2">
                 <Loader2 className="h-7 w-7 animate-spin opacity-70" />
-                <span className="text-[12px] leading-6">上传中…</span>
+                <span className="text-[12px] leading-6">{t('node.imageGen.uploadingEllipsis')}</span>
               </div>
             ) : isConnected ? (
               // 已连线：不再显示文字 CTA，只在节点中间放一个图标（对齐 libtv）。
@@ -1544,7 +1817,9 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
             ) : (
               <>
                 <div className="flex min-h-0 flex-col justify-center gap-2 py-4">
-                  <div className="text-xs text-[var(--canvas-node-input-helper)]">试试：</div>
+                  <div className="text-xs text-[var(--canvas-node-input-helper)]">
+                    {t('node.imageGen.emptyState.tryLabel')}
+                  </div>
                   <div className="flex flex-col gap-0.5">
                   <button
                     type="button"
@@ -1553,11 +1828,11 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                       handleSpawnUpstreamImage();
                     }}
                     onPointerDown={(event) => event.stopPropagation()}
-                    title="新建一个上游图片节点用作参考"
+                    title={t('node.imageGen.emptyState.imageToImageTitle')}
                     className="nodrag -mx-2 inline-flex items-center gap-3 rounded-lg px-2 py-2 text-sm text-text-dark transition-colors hover:bg-white/[0.08]"
                   >
                     <Upload className="h-4 w-4 text-text-muted/90" />
-                    <span>图生图</span>
+                    <span>{t('node.imageGen.emptyState.imageToImage')}</span>
                   </button>
                   </div>
                 </div>
@@ -1647,7 +1922,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
         >
           <div className="mb-2 flex items-center gap-1.5 px-1 text-[12px] font-medium text-white/60">
             <ImageIcon className="h-3.5 w-3.5 text-white/45" />
-            画册 · {albumTotalSlots} 张
+            {t('node.imageGen.album.heading', { count: albumTotalSlots })}
           </div>
           <div className="grid grid-cols-2 gap-3">
           {albumUrls.map((url, index) => {
@@ -1658,7 +1933,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                 key={`album-cell-${index}`}
                 role="button"
                 tabIndex={-1}
-                title="点击设为主图"
+                title={t('node.imageGen.album.setAsMain')}
                 onClick={(event) => {
                   event.stopPropagation();
                   // 拖动画册（移动节点）后松手补发的 click 不算选主图。
@@ -1690,11 +1965,11 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                     event.stopPropagation();
                     handleApplyAlbumImageToCanvas(url);
                   }}
-                  title="把这张图作为独立图片节点放到画布上"
+                  title={t('node.imageGen.album.applyToCanvas')}
                   className="nodrag absolute left-2 top-2 z-10 hidden h-7 items-center gap-1 rounded-md bg-black/70 px-2.5 text-[12px] font-medium text-white backdrop-blur-sm transition-colors hover:bg-black/90 group-hover/albumcell:inline-flex"
                 >
                   <Upload className="h-3.5 w-3.5" />
-                  应用到画布
+                  {t('node.imageGen.album.applyToCanvasLabel')}
                 </button>
                 <button
                   type="button"
@@ -1702,14 +1977,14 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                     event.stopPropagation();
                     void handleDownloadAlbumImage(url, index);
                   }}
-                  title="下载这张图片"
+                  title={t('node.imageGen.album.download')}
                   className="nodrag absolute right-2 top-2 z-10 hidden h-7 w-7 items-center justify-center rounded-full bg-black/70 text-white backdrop-blur-sm transition-colors hover:bg-black/90 group-hover/albumcell:inline-flex"
                 >
                   <Download className="h-3.5 w-3.5" />
                 </button>
                 {isMain && (
                   <span className="absolute bottom-2 left-2 z-10 rounded-md bg-black/65 px-2 py-0.5 text-[11px] font-medium text-white backdrop-blur-sm">
-                    主图
+                    {t('node.imageGen.album.mainImage')}
                   </span>
                 )}
               </div>
@@ -1724,7 +1999,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
             >
               <div className="flex flex-col items-center gap-2 text-text-muted/70">
                 <Loader2 className="h-6 w-6 animate-spin" />
-                <span className="text-[12px]">生成中…</span>
+                <span className="text-[12px]">{t('node.imageGen.album.generating')}</span>
               </div>
             </div>
           ))}
@@ -1750,9 +2025,11 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                 setBgCropperOpen(true);
               }}
               className="inline-flex h-6 items-center gap-1 rounded-md border border-amber-300/55 bg-[rgba(120,77,19,0.78)] px-2 text-[10px] font-medium text-amber-100 shadow-[0_0_0_1px_rgba(0,0,0,0.45)] hover:bg-[rgba(140,90,22,0.88)] disabled:cursor-not-allowed disabled:opacity-50"
-              title={`从 ${sourceRole === 'scene_master' ? 'scene_master' : 'scene_reverse_master'} 选一个 16:9 区域写入本 beat 的 selected_background.png — beat 工作台后续 sketch/render 会用这张做背景锚点`}
+              title={t('node.imageGen.cropBackgroundTitle', {
+                source: sourceRole === 'scene_master' ? 'scene_master' : 'scene_reverse_master',
+              })}
             >
-              📐 截取背景
+              {t('node.imageGen.cropBackground')}
             </button>
           )}
           {canOpenDirectorStage && (
@@ -1804,12 +2081,17 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
             className="absolute right-2 top-2 z-20"
           />
           <div className="flex shrink-0 items-center gap-2 pl-3 pr-10 pt-3">
-            <StyleChip
-              selectedId={styleTemplateId}
-              selectedLabel={selectedStyle?.label ?? null}
-              onChange={(nextId) => updateNodeData(id, { styleTemplateId: nextId })}
-              onOpenChange={setStylePickerOpen}
+            <ReferencePickChip
+              nodeId={id}
+              nodeType={CANVAS_NODE_TYPES.imageGen}
+              onPickExternal={handlePickFile}
             />
+            {styleSelectionState !== 'ready' && (
+              <StyleTriggerChip
+                state={styleSelectionState}
+                onOpen={openStylePicker}
+              />
+            )}
             <NodeContextPromptPaletteButton
               nodeId={id}
               onInsert={insertContextPaletteEntry}
@@ -1821,67 +2103,124 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                 setIsAssetLibraryOpen(true);
               }}
               className={`${NODE_TEXT_CONTROL_TRIGGER_CLASS} group/asset px-1.5`}
-              title="从资产库选择参考图（人物 / 场景 / 道具）"
+              title={t('node.imageGen.assetLibraryTitle')}
             >
               <Library className={`${NODE_TEXT_CONTROL_ICON_CLASS} group-hover/asset:text-text-dark`} />
-              <span>资产库</span>
+              <span>{t('node.imageGen.assetLibrary')}</span>
             </button>
-            {upstreamTextContents.map((content) => (
-              <ReferenceTextChip
-                key={content.nodeId}
-                nodeId={content.nodeId}
-                text={content.text ?? ''}
-                sourceLabel={content.displayName ?? content.nodeType}
-                onDetach={handleDetachUpstream}
-              />
-            ))}
-            {upstreamImageContents.length > 0 && (
-              <div className="ml-3 flex shrink-0 items-center gap-1.5">
-                {upstreamImageContents.map((content) => {
-                  const url = resolveImageDisplayUrl(content.imageUrl as string);
-                  return (
-                    <div
-                      key={`upstream-image-${content.nodeId}`}
-                      className={NODE_REFERENCE_MEDIA_CHIP_CLASS}
-                      title={`来自上游 · ${content.displayName ?? content.nodeType}`}
-                      onMouseEnter={(event) => {
-                        setRefHover({
-                          imageUrl: url,
-                          rect: event.currentTarget.getBoundingClientRect(),
-                        });
-                      }}
-                      onMouseLeave={() => setRefHover(null)}
-                    >
-                      <img
-                        src={url}
-                        alt=""
-                        className="h-full w-full object-cover"
-                        draggable={false}
-                      />
-                      {/* 前端按产品要求不再显示「图片N」数字角标——引用统一呈现为
-                          「图片」，序号只存在于提交给后端的 prompt（@图片N）里。 */}
-                      <button
-                        type="button"
-                        title="取消引用此素材"
-                        className={NODE_REFERENCE_MEDIA_DETACH_CLASS}
-                        onMouseDown={(event) => event.stopPropagation()}
-                        onClick={(event) => {
+          </div>
+
+          {/* 引用素材单独占一行：顶排功能 chip 已经排满，参考图再挤进去会顶掉输入区。 */}
+          {(upstreamTextContents.length > 0 || upstreamImageContents.length > 0) && (
+            <div className="nowheel flex shrink-0 items-center gap-2 overflow-x-auto px-3 pt-2">
+              {upstreamTextContents.map((content) => (
+                <ReferenceTextChip
+                  key={content.nodeId}
+                  nodeId={content.nodeId}
+                  text={content.text ?? ''}
+                  sourceLabel={content.displayName ?? content.nodeType}
+                  onDetach={handleDetachUpstream}
+                  onJump={handleJumpToReference}
+                />
+              ))}
+              {upstreamImageContents.length > 0 && (
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {upstreamImageContents.map((content) => {
+                    const url = resolveImageDisplayUrl(content.imageUrl as string);
+                    // 不在候选里（自身参考图占位、URL 对不上）就不显示 @ 按钮：
+                    // 与其给一个编号错的 mention，不如让用户自己打。
+                    const mentionName =
+                      mentionCandidates.find((item) => item.key === content.nodeId)?.name ??
+                      null;
+                    return (
+                      <div
+                        key={`upstream-image-${content.nodeId}`}
+                        className={NODE_REFERENCE_MEDIA_CHIP_CLASS}
+                        title={t('node.imageGen.fromUpstream', {
+                          name: content.displayName ?? content.nodeType,
+                        })}
+                        onMouseEnter={(event) => {
+                          setRefHover({
+                            imageUrl: url,
+                            rect: event.currentTarget.getBoundingClientRect(),
+                          });
+                        }}
+                        onMouseLeave={() => setRefHover(null)}
+                        onDoubleClick={(event) => {
                           event.stopPropagation();
                           setRefHover(null);
-                          handleDetachUpstream(content.nodeId);
+                          handleJumpToReference(content.nodeId);
                         }}
                       >
-                        <X className="h-3 w-3" strokeWidth={2.5} />
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+                        <img
+                          src={url}
+                          alt=""
+                          className="h-full w-full object-cover"
+                          draggable={false}
+                        />
+                        {/* 前端按产品要求不再显示「图片N」数字角标——引用统一呈现为
+                            「图片」，序号只存在于提交给后端的 prompt（@图片N）里。 */}
+                        {mentionName ? (
+                          <ReferenceMentionButton
+                            mentionName={mentionName}
+                            onInsert={() => {
+                              setRefHover(null);
+                              handleMentionReference(content.nodeId);
+                            }}
+                          />
+                        ) : null}
+                        <button
+                          type="button"
+                          title={t('node.imageGen.dropReference')}
+                          className={NODE_REFERENCE_MEDIA_DETACH_CLASS}
+                          onMouseDown={(event) => event.stopPropagation()}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setRefHover(null);
+                            handleDetachUpstream(content.nodeId);
+                          }}
+                        >
+                          <X className="h-3 w-3" strokeWidth={2.5} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 选中的风格单独占一行，贴着输入区顶部，和顶排的功能 chip 分开。 */}
+          {selectedStyle && (
+            <div className="flex shrink-0 items-center gap-1.5 px-3 pt-2">
+              <StyleThumbnail
+                template={selectedStyle}
+                assetBase={styleAssetBase}
+                onOpen={openStylePicker}
+                onClear={() => updateNodeData(id, { styleTemplateId: null })}
+              />
+            </div>
+          )}
+
+          {/* 图墙走 portal 挂 body，不受节点缩放/裁剪影响，关闭交给弹层自己的遮罩和 Esc。 */}
+          {stylePickerOpen && (
+            <StyleGalleryModal
+              templates={styleTemplates}
+              assetBase={styleAssetBase}
+              selectedId={styleTemplateId}
+              isLoading={styleTemplatesLoading}
+              onSelect={(nextId) => {
+                updateNodeData(id, { styleTemplateId: nextId });
+                setStylePickerOpen(false);
+              }}
+              onClose={() => setStylePickerOpen(false)}
+            />
+          )}
 
           <PromptMentionEditor
             ref={promptEditorRef}
+            getMaterials={getMentionMaterials}
+            onAttachMaterial={handleAttachMaterial}
             value={prompt}
             onChange={(next) => {
               hasUserEditedPromptRef.current = hasImageGenPromptOverride(next);
@@ -1901,9 +2240,11 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
             }}
             candidates={mentionCandidates}
             placeholder={
-              upstreamTextJoined.length > 0
-                ? '上游内容已自动接入，可继续补充提示词…'
-                : '描述你想要生成的画面内容，@引用素材'
+              t(
+                upstreamTextJoined.length > 0
+                  ? 'node.imageGen.promptPlaceholderUpstream'
+                  : 'node.imageGen.promptPlaceholder',
+              )
             }
             className={`nodrag nowheel min-h-0 w-full flex-1 overflow-y-auto whitespace-pre-wrap break-words border-none bg-transparent px-3 py-2 text-sm leading-6 text-text-dark outline-none ${CANVAS_NODE_INPUT_PLACEHOLDER_CLASS}`}
           />
@@ -1917,7 +2258,9 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
                 getOptionDisabledReason={(model) =>
                   model.referenceImageMax != null &&
                   orderedReferenceUrls.length > model.referenceImageMax
-                    ? `该模型最多支持 ${model.referenceImageMax} 张图片素材`
+                    ? t('node.videoModel.reason.maxImages', {
+                        count: model.referenceImageMax,
+                      })
                     : null
                 }
               />
@@ -1950,7 +2293,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
               )}
               <button
                 type="button"
-                title="翻译提示词（中英文互译）"
+                title={t('node.imageGen.translatePrompt')}
                 disabled={isTranslatingPrompt || isGenerating || prompt.trim().length === 0}
                 onClick={(event) => {
                   event.stopPropagation();
@@ -1979,7 +2322,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
               <button
                 type="button"
                 disabled={submitDisabled}
-                title={selectedModelReferenceError ?? "生成"}
+                title={selectedModelReferenceError ?? modelTaskAccess.message ?? t('node.imageGen.generate')}
                 onClick={(event) => {
                   event.stopPropagation();
                   void handleSubmit();
@@ -2084,6 +2427,7 @@ export const ImageGenNode = memo(({ id, data, selected, width, height }: ImageGe
         />
       )}
       <AssetLibraryModal
+        mode="pick"
         open={isAssetLibraryOpen}
         project={readUrl().project ?? null}
         allowedMedia={['image']}
@@ -2129,6 +2473,7 @@ interface AspectSizeChipProps {
 }
 
 function AspectSizeChip({ aspectRatio, size, sizeOptions, aspectOptions, quality, qualityOptions, showQuality, onChange }: AspectSizeChipProps) {
+  const { t } = useTranslation();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const [isOpen, setIsOpen] = useState(false);
@@ -2150,8 +2495,8 @@ function AspectSizeChip({ aspectRatio, size, sizeOptions, aspectOptions, quality
 
   const nearestAspect = resolveNearestAspectOption(aspectRatio, aspectOptions);
   const aspectLabel = nearestAspect.label;
-  const qualityLabel = QUALITY_OPTIONS.find((option) => option.value === quality)?.label
-    ?? quality;
+  const qualityLabelKey = QUALITY_OPTIONS.find((option) => option.value === quality)?.labelKey;
+  const qualityLabel = qualityLabelKey ? t(qualityLabelKey) : quality;
 
   return (
     <div className="relative">
@@ -2184,10 +2529,11 @@ function AspectSizeChip({ aspectRatio, size, sizeOptions, aspectOptions, quality
         >
           {showQuality && (
             <>
-              <div className={IMAGE_PARAM_LABEL_CLASS}>画质</div>
+              <div className={IMAGE_PARAM_LABEL_CLASS}>{t('node.imageGen.param.quality')}</div>
               <div className={IMAGE_PARAM_ROW_CLASS}>
                 {qualityOptions.map((value) => {
-                  const label = QUALITY_OPTIONS.find((option) => option.value === value)?.label ?? value;
+                  const optionKey = QUALITY_OPTIONS.find((option) => option.value === value)?.labelKey;
+                  const label = optionKey ? t(optionKey) : value;
                   const isActive = quality === value;
                   return (
                     <button
@@ -2207,7 +2553,7 @@ function AspectSizeChip({ aspectRatio, size, sizeOptions, aspectOptions, quality
               </div>
             </>
           )}
-          <div className={IMAGE_PARAM_LABEL_CLASS}>分辨率</div>
+          <div className={IMAGE_PARAM_LABEL_CLASS}>{t('node.imageGen.param.resolution')}</div>
           <div className={IMAGE_PARAM_ROW_CLASS}>
             {sizeOptions.map((option) => {
               const isActive = size === option;
@@ -2228,7 +2574,7 @@ function AspectSizeChip({ aspectRatio, size, sizeOptions, aspectOptions, quality
             })}
           </div>
 
-          <div className={IMAGE_PARAM_LABEL_CLASS}>比例</div>
+          <div className={IMAGE_PARAM_LABEL_CLASS}>{t('node.imageGen.param.aspect')}</div>
           <div className="grid grid-cols-4 gap-2">
             {aspectOptions.map((option) => {
               const isActive = nearestAspect.value === option.value;
@@ -2254,79 +2600,6 @@ function AspectSizeChip({ aspectRatio, size, sizeOptions, aspectOptions, quality
   );
 }
 
-interface StyleChipProps {
-  selectedId: string | null;
-  selectedLabel: string | null;
-  onChange: (nextId: string | null) => void;
-  onOpenChange?: (open: boolean) => void;
-}
-
-function StyleChip({ selectedId, selectedLabel, onChange, onOpenChange }: StyleChipProps) {
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const popoverRef = useRef<HTMLDivElement>(null);
-  const [isOpen, setIsOpen] = useState(false);
-
-  useEffect(() => {
-    onOpenChange?.(isOpen);
-  }, [isOpen, onOpenChange]);
-
-  useEffect(() => {
-    return () => onOpenChange?.(false);
-  }, [onOpenChange]);
-
-  useEffect(() => {
-    if (!isOpen) return;
-    const onPointerDown = (event: MouseEvent) => {
-      if (
-        triggerRef.current?.contains(event.target as Node) ||
-        popoverRef.current?.contains(event.target as Node)
-      ) {
-        return;
-      }
-      setIsOpen(false);
-    };
-    document.addEventListener('mousedown', onPointerDown, true);
-    return () => document.removeEventListener('mousedown', onPointerDown, true);
-  }, [isOpen]);
-
-  const isActive = Boolean(selectedId);
-  const label = isActive ? selectedLabel ?? '风格' : '风格';
-
-  return (
-    <div className="relative">
-      <button
-        ref={triggerRef}
-        type="button"
-        onClick={(event) => {
-          event.stopPropagation();
-          setIsOpen((prev) => !prev);
-        }}
-        title={isActive ? selectedLabel ?? undefined : '风格'}
-        className={`${NODE_TEXT_CONTROL_TRIGGER_CLASS} max-w-[160px]`}
-      >
-        <Palette className={`${NODE_TEXT_CONTROL_ICON_CLASS} shrink-0`} />
-        <span className="truncate">{label}</span>
-      </button>
-      {isOpen && (
-        <div
-          ref={popoverRef}
-          className="absolute top-full left-0 z-50 mt-2"
-          onClick={(event) => event.stopPropagation()}
-        >
-          <StylePickerPopover
-            selectedId={selectedId}
-            onSelect={(nextId) => {
-              onChange(nextId);
-              setIsOpen(false);
-            }}
-            onClose={() => setIsOpen(false)}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
 interface CameraChipProps {
   selection: ImageGenCameraSelection | null;
   summary: string | null;
@@ -2334,6 +2607,7 @@ interface CameraChipProps {
 }
 
 function CameraChip({ selection, summary, onChange }: CameraChipProps) {
+  const { t } = useTranslation();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const [isOpen, setIsOpen] = useState(false);
@@ -2380,7 +2654,7 @@ function CameraChip({ selection, summary, onChange }: CameraChipProps) {
   }, [isOpen, syncPopoverPosition]);
 
   const isActive = Boolean(selection) && summary != null;
-  const label = isActive && summary ? summary : '摄像机';
+  const label = isActive && summary ? summary : t('node.imageGen.camera');
 
   return (
     <div className="relative">
@@ -2391,7 +2665,7 @@ function CameraChip({ selection, summary, onChange }: CameraChipProps) {
           event.stopPropagation();
           setIsOpen((prev) => !prev);
         }}
-        title={isActive ? summary ?? undefined : '摄像机'}
+        title={isActive ? summary ?? undefined : t('node.imageGen.camera')}
         className={`${NODE_TEXT_CONTROL_TRIGGER_CLASS} max-w-[220px]`}
       >
         <Camera className={`${NODE_TEXT_CONTROL_ICON_CLASS} shrink-0`} />
@@ -2429,6 +2703,7 @@ interface CountSelectProps {
 }
 
 function CountSelect({ value, onChange }: CountSelectProps) {
+  const { t } = useTranslation();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const [isOpen, setIsOpen] = useState(false);
@@ -2459,7 +2734,7 @@ function CountSelect({ value, onChange }: CountSelectProps) {
         }}
         className={NODE_TEXT_CONTROL_TRIGGER_CLASS}
       >
-        <span>{value}张</span>
+        <span>{t('node.imageGen.countValue', { count: value })}</span>
         <ChevronDown className="h-3 w-3 text-text-muted/90" />
       </button>
       {isOpen && (
@@ -2483,7 +2758,7 @@ function CountSelect({ value, onChange }: CountSelectProps) {
                     : 'text-text-muted/95 hover:bg-white/[0.11] hover:text-text-dark'
                 }`}
               >
-                {option}张
+                {t('node.imageGen.countValue', { count: option })}
               </button>
             );
           })}

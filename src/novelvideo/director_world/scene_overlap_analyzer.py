@@ -57,7 +57,9 @@ def _font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def _fit(image: Image.Image, box: tuple[int, int], fill: str = "#111111") -> Image.Image:
+def _fit(
+    image: Image.Image, box: tuple[int, int], fill: str = "#111111"
+) -> Image.Image:
     target_w, target_h = box
     fitted = Image.new("RGB", (target_w, target_h), fill)
     src = image.convert("RGB")
@@ -112,7 +114,10 @@ def make_crop_sheet(
     label_font = _font(24)
     note_font = _font(20)
     draw.text(
-        (30, 24), "Scene overlap / continuation analysis sheet", fill="#ffffff", font=title_font
+        (30, 24),
+        "Scene overlap / continuation analysis sheet",
+        fill="#ffffff",
+        font=title_font,
     )
     draw.text(
         (30, 66),
@@ -156,7 +161,9 @@ def make_crop_sheet(
     for label, image, origin, size, color in panels:
         x, y = origin
         w, h = size
-        draw.rounded_rectangle((x - 4, y - 42, x + w + 4, y + h + 4), radius=10, fill="#1a1d22")
+        draw.rounded_rectangle(
+            (x - 4, y - 42, x + w + 4, y + h + 4), radius=10, fill="#1a1d22"
+        )
         draw.text((x, y - 34), label, fill=color, font=label_font)
         canvas.paste(_fit(image, size), origin)
 
@@ -262,7 +269,9 @@ def parse_json(text: str) -> dict[str, Any]:
         return json.loads(match.group(0))
 
 
-def render_annotation(sheet_path: Path, analysis: dict[str, Any], output_dir: Path) -> Path:
+def render_annotation(
+    sheet_path: Path, analysis: dict[str, Any], output_dir: Path
+) -> Path:
     sheet = Image.open(sheet_path).convert("RGB")
     side_w = 640
     canvas = Image.new("RGB", (sheet.width + side_w, sheet.height), "#101216")
@@ -329,7 +338,9 @@ def synthesize_pano_prompt_insert(analysis: dict[str, Any]) -> str:
         crop_a = str(pair.get("crop_a") or "")
         crop_b = str(pair.get("crop_b") or "")
         relationship = str(pair.get("relationship") or "unknown")
-        lines.append(f"- {pair_id}: {crop_a} connects to {crop_b}; relationship={relationship}.")
+        lines.append(
+            f"- {pair_id}: {crop_a} connects to {crop_b}; relationship={relationship}."
+        )
         overlap_names = [
             str(item.get("name") or "").strip()
             for item in (pair.get("overlap_items") or [])
@@ -357,10 +368,14 @@ def synthesize_pano_prompt_insert(analysis: dict[str, Any]) -> str:
             lines.append(f"  JOIN INSTRUCTION: {instruction}")
 
     do_not_duplicate = [
-        str(item).strip() for item in (analysis.get("do_not_duplicate") or []) if str(item).strip()
+        str(item).strip()
+        for item in (analysis.get("do_not_duplicate") or [])
+        if str(item).strip()
     ]
     if do_not_duplicate:
-        lines.append("DO NOT DUPLICATE ACROSS JOINS: " + "; ".join(do_not_duplicate) + ".")
+        lines.append(
+            "DO NOT DUPLICATE ACROSS JOINS: " + "; ".join(do_not_duplicate) + "."
+        )
 
     front_unique = [
         str(item).strip()
@@ -368,7 +383,9 @@ def synthesize_pano_prompt_insert(analysis: dict[str, Any]) -> str:
         if str(item).strip()
     ]
     back_unique = [
-        str(item).strip() for item in (analysis.get("back_unique_items") or []) if str(item).strip()
+        str(item).strip()
+        for item in (analysis.get("back_unique_items") or [])
+        if str(item).strip()
     ]
     if front_unique or back_unique:
         lines.extend(
@@ -379,9 +396,13 @@ def synthesize_pano_prompt_insert(analysis: dict[str, Any]) -> str:
             ]
         )
     if front_unique:
-        lines.append("  MASTER FRONT UNIQUE ITEMS TO PRESERVE: " + "; ".join(front_unique) + ".")
+        lines.append(
+            "  MASTER FRONT UNIQUE ITEMS TO PRESERVE: " + "; ".join(front_unique) + "."
+        )
     if back_unique:
-        lines.append("  REVERSE BACK UNIQUE ITEMS TO PRESERVE: " + "; ".join(back_unique) + ".")
+        lines.append(
+            "  REVERSE BACK UNIQUE ITEMS TO PRESERVE: " + "; ".join(back_unique) + "."
+        )
     return "\n".join(lines)
 
 
@@ -401,7 +422,10 @@ def _wrap(text: str, width: int) -> list[str]:
     return lines or [""]
 
 
-async def run(args: argparse.Namespace) -> None:
+async def run(args: argparse.Namespace, *, egress_context=None) -> None:
+    from novelvideo.task_backend.subprocesses import require_direct_model_egress_allowed
+
+    require_direct_model_egress_allowed(egress_context)
     load_env()
     master = repo_path(args.master)
     reverse = repo_path(args.reverse)
@@ -418,7 +442,9 @@ async def run(args: argparse.Namespace) -> None:
         edge_ratio=args.edge_ratio,
     )
     prompt = build_prompt(args.scene_name)
-    (output_dir / "overlap_continuation_prompt.txt").write_text(prompt, encoding="utf-8")
+    (output_dir / "overlap_continuation_prompt.txt").write_text(
+        prompt, encoding="utf-8"
+    )
 
     raw_text = await ask_openrouter(
         image_path=sheet_path,
@@ -429,7 +455,9 @@ async def run(args: argparse.Namespace) -> None:
         if args.api_key
         else None,
     )
-    (output_dir / "overlap_continuation_raw_response.txt").write_text(raw_text, encoding="utf-8")
+    (output_dir / "overlap_continuation_raw_response.txt").write_text(
+        raw_text, encoding="utf-8"
+    )
     analysis = parse_json(raw_text)
     ai_insert = analysis.get("pano_prompt_insert")
     analysis["ai_pano_prompt_insert"] = ai_insert
@@ -442,11 +470,16 @@ async def run(args: argparse.Namespace) -> None:
         "model": args.model,
     }
     analysis_path = output_dir / "overlap_continuation_analysis.json"
-    analysis_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+    analysis_path.write_text(
+        json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     guide_path = render_annotation(sheet_path, analysis, output_dir)
 
     print(
-        json.dumps({"analysis": str(analysis_path), "guide": str(guide_path)}, ensure_ascii=False)
+        json.dumps(
+            {"analysis": str(analysis_path), "guide": str(guide_path)},
+            ensure_ascii=False,
+        )
     )
 
 

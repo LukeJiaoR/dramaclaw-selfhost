@@ -17,6 +17,25 @@ export function backendErrorCodeToastMessage(
   return null;
 }
 
+/**
+ * 排队接口成功时的 toast 文案。
+ *
+ * 后端给了 message_code 就按词条翻，没给的（还没迁移的接口）照旧回显 message
+ * 里那句中文 —— 和进度/日志走同一套约定，接口可以一个一个迁。
+ */
+export function taskResponseToastMessage(
+  response: {
+    message?: string | null;
+    message_code?: string | null;
+    message_params?: Record<string, unknown> | null;
+  },
+  t: TFunction,
+): string {
+  const text = String(response.message ?? "");
+  if (!response.message_code) return text;
+  return t(response.message_code, { defaultValue: text, ...(response.message_params ?? {}) });
+}
+
 export function backendErrorResponseToastMessage(
   response: Pick<ErrorResponse, "code" | "error">,
   t: TFunction,
@@ -27,14 +46,21 @@ export function backendErrorResponseToastMessage(
   );
 }
 
+type TaskLaneLimitScope =
+  | "project"
+  | "user"
+  | "channel"
+  | "platform"
+  | "global_lane_queue";
+
 export class ProjectQueueLimitError extends Error {
   queueKind: string;
-  limitScope: "project" | "user";
+  limitScope: TaskLaneLimitScope;
 
   constructor(
     queueKind: string,
     message: string,
-    limitScope: "project" | "user" = "project",
+    limitScope: TaskLaneLimitScope = "project",
   ) {
     super(message);
     this.name = "ProjectQueueLimitError";
@@ -76,6 +102,11 @@ export class BillingRuleNotConfiguredError extends BackendStatusError {
   }
 }
 
+// 下面这两段合成的是 Error 对象自带的 message，只在拿不到 t 的地方兜底；界面上
+// 真正显示的是 backendErrorToastMessage()，它按同样的措辞查 common.*QueueFull 词条。
+// api-errors 位于 api/client 的依赖里，把 @/i18n 拉进来会在测试里二次 init i18next，
+// 所以这里保留中文兜底，不入词条。
+// i18n-exempt-start
 function queueLabelForPlainMessage(queueKind: string): string {
   if (queueKind === "default") return "默认";
   if (queueKind === "video") return "视频";
@@ -84,15 +115,37 @@ function queueLabelForPlainMessage(queueKind: string): string {
   return queueKind;
 }
 
-function projectQueueLimitPlainMessage(
+function taskQueueLimitPlainMessage(
   queueKind: string,
-  limitScope: "project" | "user",
+  limitScope: TaskLaneLimitScope,
 ): string {
   const queueLabel = queueLabelForPlainMessage(queueKind);
-  if (limitScope === "user") {
-    return `你在当前项目${queueLabel}队列的任务已达个人上限`;
+  switch (limitScope) {
+    case "user":
+      return `你在当前${queueLabel}队列的任务已达个人上限`;
+    case "channel":
+      return `当前组织${queueLabel}队列已满`;
+    case "platform":
+      return `平台${queueLabel}队列已满`;
+    case "global_lane_queue":
+      return `当前节点${queueLabel}队列已满`;
+    default:
+      return `当前项目${queueLabel}队列已满`;
   }
-  return `当前项目${queueLabel}队列已达团队上限`;
+}
+// i18n-exempt-end
+
+function taskLaneLimitScope(value: unknown): TaskLaneLimitScope | null {
+  if (
+    value === "project" ||
+    value === "user" ||
+    value === "channel" ||
+    value === "platform" ||
+    value === "global_lane_queue"
+  ) {
+    return value;
+  }
+  return null;
 }
 
 export function errorFromBackendBody(status: number, body: unknown, fallback: string): Error | null {
@@ -166,10 +219,16 @@ export function errorFromBackendBody(status: number, body: unknown, fallback: st
   }
 
   if (status === 429 && typeof queueKind === "string" && queueKind.trim()) {
-    const normalizedScope = limitScope === "user" ? "user" : "project";
+    // Legacy CE responses did not include limit_scope and are project-scoped.
+    // A supplied but unknown scope must keep the backend's generic message.
+    const normalizedScope =
+      limitScope === undefined ? "project" : taskLaneLimitScope(limitScope);
+    if (!normalizedScope) {
+      return new BackendStatusError(message, status, body);
+    }
     return new ProjectQueueLimitError(
       queueKind,
-      projectQueueLimitPlainMessage(queueKind, normalizedScope) || message,
+      taskQueueLimitPlainMessage(queueKind, normalizedScope) || message,
       normalizedScope,
     );
   }
@@ -424,18 +483,23 @@ export function backendErrorToastMessage(error: unknown, t: TFunction): string {
     });
   }
   if (error instanceof ProjectQueueLimitError) {
-    const scopeSuffix = error.limitScope === "user" ? "UserFull" : "ProjectFull";
+    const translationScope =
+      error.limitScope === "channel"
+        ? "organization"
+        : error.limitScope === "global_lane_queue"
+          ? "node"
+          : error.limitScope;
     if (error.queueKind === "default") {
-      return t(`common.projectDefaultQueue${scopeSuffix}`, {
-        defaultValue: t("common.projectDefaultQueueFull"),
+      return t(`common.${translationScope}DefaultQueueFull`, {
+        defaultValue: error.message,
       });
     }
     const queueLabel = t(`common.projectQueueKinds.${error.queueKind}`, {
       defaultValue: error.queueKind,
     });
-    return t(`common.projectQueue${scopeSuffix}`, {
+    return t(`common.${translationScope}QueueFull`, {
       queue: queueLabel,
-      defaultValue: t("common.projectQueueFull", { queue: queueLabel }),
+      defaultValue: error.message,
     });
   }
   if (error instanceof Error && error.message) {

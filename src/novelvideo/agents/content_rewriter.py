@@ -11,6 +11,7 @@ from novelvideo.config import (
     get_newapi_structured_output_model_settings,
     get_newapi_text_pydantic_model,
 )
+from novelvideo.model_gateway_runtime import model_gateway_output_retries
 
 
 class AdaptedContentOutput(BaseModel):
@@ -294,10 +295,14 @@ async def rewrite_episode_content(
 请输出改写后的逐行文本。"""
 
     agent = Agent(
-        get_newapi_text_pydantic_model("CONTENT_REWRITER_MODEL", "gpt-5.4-mini"),
+        get_newapi_text_pydantic_model(
+            "CONTENT_REWRITER_MODEL",
+            "gpt-5.4-mini",
+            capability="text.generate",
+        ),
         system_prompt=REWRITE_PROMPT,
         output_type=_constrained_output_type(target_beats, min_chars, max_chars),
-        output_retries=3,
+        output_retries=model_gateway_output_retries(3),
         model_settings=get_newapi_structured_output_model_settings(),
         name="短视频解说改写师",
     )

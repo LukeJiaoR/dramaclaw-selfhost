@@ -29,7 +29,7 @@ import {
 } from '@/features/canvas/domain/canvasNodes';
 import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { isSystemManagedNodeData } from '@/features/canvas/domain/mainlineNodeFlags';
-import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
+import { localizeNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { NodeHeader, NODE_HEADER_FLOATING_POSITION_CLASS } from '@/features/canvas/ui/NodeHeader';
 import { NodeResizeHandle } from '@/features/canvas/ui/NodeResizeHandle';
 import { NodeGenerationOverlay } from '@/features/canvas/ui/NodeGenerationOverlay';
@@ -68,6 +68,7 @@ import {
 import { CreditCostInline } from '@/components/credit-cost-inline';
 import type { CreditPromotionDisplay } from '@/components/credits/credit-visual';
 import { useGenerationCreditCost } from '@/lib/queries/generation-credit-cost';
+import { useModelTaskAccess } from '@/lib/model-task-access';
 import {
   BillingRuleNotConfiguredError,
   backendErrorToastMessage,
@@ -98,16 +99,22 @@ const COMPACT_OPS_PANEL_MIN_WIDTH = 480;
 
 const COMPACT_MODES = new Set<TextNodeMode>(['textToVideo', 'imageToPrompt']);
 
+// 预填进文本节点、原样发给模型的反推指令。跟着界面语言走会换掉出词的语言，锁中文。
+// i18n-exempt-start
 const IMAGE_TO_PROMPT_DEFAULT_CONTENT =
   '根据图片生成结构化中文提示词，包括主体描述、环境、光影、镜头语言、风格关键词。';
+// i18n-exempt-end
 
 function countBillableTextChars(text: string): number {
   return text.replace(/[\s\u3000]+/gu, '').length;
 }
 
 // 「文字生成音乐」的默认音乐描述——点击后预填进文本节点，用户可在此基础上改。
+// 同样是原样发给模型的提示词，锁中文。
+// i18n-exempt-start
 const TEXT_TO_MUSIC_DEFAULT_CONTENT =
   '生成一首现代品牌电子音乐（约 110 BPM），干净有力的低频贝斯，清晰电子鼓点，整体风格高级、未来感强。开场节奏型贝斯与简洁合成器音色建立律动。主段加入稳定鼓点，节奏清晰，保持克制的张力。强化段加入更丰富的音层，合成器音色提升，律动增强但不过度拥挤。结尾鼓点减弱，仅保留低频与氛围音渐出，干净利落收尾。';
+// i18n-exempt-end
 
 const SPAWN_UPLOAD_WIDTH = 320;
 
@@ -159,6 +166,7 @@ export const TextAnnotationNode = memo(({
   height,
 }: TextAnnotationNodeProps) => {
   const { t } = useTranslation();
+  const modelTaskAccess = useModelTaskAccess();
   const reactFlow = useReactFlow();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
   const isBoxSelecting = useIsBoxSelecting();
@@ -233,7 +241,7 @@ export const TextAnnotationNode = memo(({
   const isCompactView = isReferenceOnly || COMPACT_MODES.has(mode);
   const [isEditingContent, setIsEditingContent] = useState(false);
   const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const resolvedTitle = resolveNodeDisplayName(CANVAS_NODE_TYPES.textAnnotation, data);
+  const resolvedTitle = localizeNodeDisplayName(CANVAS_NODE_TYPES.textAnnotation, data, t);
   const minHeightForView = isCompactView ? COMPACT_MIN_HEIGHT : MIN_HEIGHT;
   const defaultHeightForView = isCompactView ? COMPACT_DEFAULT_HEIGHT : DEFAULT_HEIGHT;
   const resolvedWidth = Math.max(MIN_WIDTH, Math.round(width ?? DEFAULT_WIDTH));
@@ -304,8 +312,10 @@ export const TextAnnotationNode = memo(({
     };
     const newNodeId = addNode(CANVAS_NODE_TYPES.video, position, seedData);
     addEdge(id, newNodeId);
-    useCanvasStore.getState().autoGroupSpawn(id, [newNodeId], { label: '文生视频组' });
-  }, [addEdge, addNode, findNodePosition, id]);
+    useCanvasStore
+      .getState()
+      .autoGroupSpawn(id, [newNodeId], { label: t('node.textNode.group.textToVideo') });
+  }, [addEdge, addNode, findNodePosition, id, t]);
 
   const spawnUploadNode = useCallback(() => {
     const sourceNode = useCanvasStore
@@ -322,8 +332,10 @@ export const TextAnnotationNode = memo(({
     const seedData: Partial<UploadImageNodeData> = { imageOnly: true };
     const newNodeId = addNode(CANVAS_NODE_TYPES.upload, position, seedData);
     addEdge(newNodeId, id);
-    useCanvasStore.getState().autoGroupSpawn(id, [newNodeId], { label: '图片反推提示词组' });
-  }, [addEdge, addNode, id]);
+    useCanvasStore
+      .getState()
+      .autoGroupSpawn(id, [newNodeId], { label: t('node.textNode.group.imageToPrompt') });
+  }, [addEdge, addNode, id, t]);
 
   // 克隆音频 / 文字生成音乐：在文本节点下游派生一个音频节点并连边（文本 → 音频），
   // 与「文生视频」派生视频节点同构。音频节点默认尺寸 480×180。
@@ -332,9 +344,12 @@ export const TextAnnotationNode = memo(({
     const position = findNodePosition(id, 480, 180);
     const newNodeId = addNode(CANVAS_NODE_TYPES.audio, position, { audioKind });
     addEdge(id, newNodeId);
-    const label = audioKind === 'music' ? '文字生成音乐组' : '克隆音频组';
+    const label =
+      audioKind === 'music'
+        ? t('node.textNode.group.textToMusic')
+        : t('node.textNode.group.cloneAudio');
     useCanvasStore.getState().autoGroupSpawn(id, [newNodeId], { label });
-  }, [addEdge, addNode, findNodePosition, id]);
+  }, [addEdge, addNode, findNodePosition, id, t]);
 
   const handlePickMode = useCallback((nextMode: TextNodeMode) => {
     if (nextMode === 'writing') {
@@ -366,6 +381,7 @@ export const TextAnnotationNode = memo(({
   }, [enterEditMode, id, spawnAudioNode, spawnUploadNode, spawnVideoNode, updateNodeData]);
 
   const runImageToPrompt = useCallback(async () => {
+    if (modelTaskAccess.blocked) return;
     const projectId = readUrl().project;
     if (!projectId) {
       console.error('[text-node] no project in URL');
@@ -409,11 +425,11 @@ export const TextAnnotationNode = memo(({
       console.error('[text-node] reverse-prompt failed', error);
       updateNodeData(id, { isGenerating: false, generationStartedAt: null });
     }
-  }, [id, reversePromptInstruction, updateNodeData]);
+  }, [id, modelTaskAccess.blocked, reversePromptInstruction, updateNodeData]);
 
   const runTextGenerate = useCallback(async (promptOverride?: string) => {
     const prompt = (promptOverride ?? instruction).trim();
-    if (!prompt || textGenerateBillingRuleMissing) return;
+    if (modelTaskAccess.blocked || !prompt || textGenerateBillingRuleMissing) return;
     const projectId = readUrl().project;
     if (!projectId) {
       console.error('[text-node] text generation: no project in URL');
@@ -444,10 +460,10 @@ export const TextAnnotationNode = memo(({
       toast.error(backendErrorToastMessage(error, t));
       updateNodeData(id, { isGenerating: false, generationStartedAt: null });
     }
-  }, [id, instruction, t, textGenerateBillingRuleMissing, updateNodeData]);
+  }, [id, instruction, modelTaskAccess.blocked, t, textGenerateBillingRuleMissing, updateNodeData]);
 
   const runInstructionTranslate = useCallback(async () => {
-    if (isGenerating || isTranslating) return;
+    if (modelTaskAccess.blocked || isGenerating || isTranslating) return;
     const trimmed = instruction.trim();
     if (trimmed.length === 0) return;
     const projectId = readUrl().project;
@@ -471,10 +487,10 @@ export const TextAnnotationNode = memo(({
     } finally {
       setIsTranslating(false);
     }
-  }, [id, instruction, isGenerating, isTranslating, updateNodeData]);
+  }, [id, instruction, isGenerating, isTranslating, modelTaskAccess.blocked, updateNodeData]);
 
   const runContentTranslate = useCallback(async () => {
-    if (isGenerating || isTranslating) return;
+    if (modelTaskAccess.blocked || isGenerating || isTranslating) return;
     const trimmed = content.trim();
     if (trimmed.length === 0) return;
     const projectId = readUrl().project;
@@ -498,7 +514,7 @@ export const TextAnnotationNode = memo(({
     } finally {
       setIsTranslating(false);
     }
-  }, [content, id, isGenerating, isTranslating, updateNodeData]);
+  }, [content, id, isGenerating, isTranslating, modelTaskAccess.blocked, updateNodeData]);
 
   const textPlaceholder = t('node.textNode.placeholder');
   const hasUserContent = content.trim().length > 0 && content.trim() !== textPlaceholder.trim();
@@ -533,6 +549,7 @@ export const TextAnnotationNode = memo(({
   ]);
 
   const submitDisabled = isGenerating
+    || modelTaskAccess.blocked
     || (mode === 'writing' && (textGenerateBillingRuleMissing || instruction.trim().length === 0))
     || (
       mode === 'textToVideo'
@@ -599,7 +616,10 @@ export const TextAnnotationNode = memo(({
           promotion={textGenerateCost.data?.data.promotion}
           submitDisabled={submitDisabled}
           translateDisabled={
-            isGenerating || isTranslating || instruction.trim().length === 0
+            modelTaskAccess.blocked
+            || isGenerating
+            || isTranslating
+            || instruction.trim().length === 0
           }
           onGenerate={handleSubmit}
           onTranslate={runInstructionTranslate}
@@ -614,7 +634,10 @@ export const TextAnnotationNode = memo(({
           isTranslating={isTranslating}
           width={resolvedWidth}
           translateDisabled={
-            isGenerating || isTranslating || content.trim().length === 0
+            modelTaskAccess.blocked
+            || isGenerating
+            || isTranslating
+            || content.trim().length === 0
           }
           onTranslate={runContentTranslate}
         />
@@ -704,7 +727,7 @@ export const TextAnnotationNode = memo(({
                     />
                     <button
                       type="button"
-                      title="取消引用此素材"
+                      title={t('node.textNode.detachUpstreamImage')}
                       className="nodrag absolute right-0 top-0 z-10 hidden h-4 w-4 items-center justify-center rounded-bl-md bg-black/75 text-white transition-colors hover:bg-red-500 group-hover:flex"
                       onMouseDown={(event) => event.stopPropagation()}
                       onClick={(event) => {
@@ -770,7 +793,10 @@ export const TextAnnotationNode = memo(({
                           void runInstructionTranslate();
                         }}
                         disabled={
-                          isGenerating || isTranslating || instruction.trim().length === 0
+                          modelTaskAccess.blocked
+                          || isGenerating
+                          || isTranslating
+                          || instruction.trim().length === 0
                         }
                         className={`${NODE_INLINE_ICON_BUTTON_CLASS} ${
                           isTranslating ? NODE_INLINE_ICON_BUTTON_ACTIVE_CLASS : ''

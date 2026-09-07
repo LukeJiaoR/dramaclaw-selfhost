@@ -46,6 +46,10 @@ class _SceneStore:
     async def delete_scene(self, name: str):
         return self.scenes.pop(name, None) is not None
 
+    async def repair_path_unsafe_asset_names(self, kind: str, move_assets=None):
+        # 这里的名字都是干净的，list 接口上那道存量自愈是空跑。
+        return {}
+
 
 class _PropStore:
     def __init__(self, props: list[NovelProp]):
@@ -74,6 +78,10 @@ class _PropStore:
 
     async def delete_prop(self, name: str):
         return self.props.pop(name, None) is not None
+
+    async def repair_path_unsafe_asset_names(self, kind: str, move_assets=None):
+        # 这里的名字都是干净的，list 接口上那道存量自愈是空跑。
+        return {}
 
 
 class _PropEpisodeStore(_PropStore):
@@ -328,6 +336,75 @@ async def test_list_scenes_returns_master_reverse_and_pano_urls(tmp_path, monkey
     assert "viewer_url" not in asset["stage_3gs"]
     assert "pano_viewer_url" not in asset
     assert asset["updated_at"]
+
+
+@pytest.mark.asyncio
+async def test_list_scenes_summary_never_builds_filesystem_payload(
+    tmp_path, monkeypatch
+):
+    from novelvideo.api.routes import scenes
+
+    store = _SceneStore(
+        [
+            NovelScene(name="故宫", environment_prompt="宫墙"),
+            NovelScene(
+                name="故宫_雪夜",
+                base_scene_id="故宫",
+                variant_id="雪夜",
+                variant_prompt="积雪",
+            ),
+        ]
+    )
+    _patch_project(monkeypatch, scenes, tmp_path, store)
+
+    def fail_full_payload(*_args, **_kwargs):
+        raise AssertionError("summary list must not probe scene files or manifests")
+
+    monkeypatch.setattr(scenes, "_scene_payload", fail_full_payload)
+
+    response = await scenes.list_scenes(
+        project="demo",
+        summary=True,
+        names=None,
+        user={"username": "admin"},
+    )
+
+    assert [item["name"] for item in response["data"]] == ["故宫", "故宫_雪夜"]
+    assert response["data"][1]["derived_from_scene"] == "故宫"
+    assert response["data"][1]["effective_environment_prompt"]
+    assert response["data"][0]["master_url"].endswith(
+        "/assets/scenes/%E6%95%85%E5%AE%AB/master.png"
+    ) or response["data"][0]["master_url"].endswith(
+        "/assets/scenes/故宫/master.png"
+    )
+    assert "stage_3gs" not in response["data"][0]
+
+
+@pytest.mark.asyncio
+async def test_list_scenes_full_payload_filters_to_requested_names(
+    tmp_path, monkeypatch
+):
+    from novelvideo.api.routes import scenes
+
+    store = _SceneStore([NovelScene(name="大厅"), NovelScene(name="后院")])
+    _patch_project(monkeypatch, scenes, tmp_path, store)
+    built: list[str] = []
+
+    def fake_payload(scene, **_kwargs):
+        built.append(scene.name)
+        return {"name": scene.name}
+
+    monkeypatch.setattr(scenes, "_scene_payload", fake_payload)
+
+    response = await scenes.list_scenes(
+        project="demo",
+        summary=False,
+        names=["后院"],
+        user={"username": "admin"},
+    )
+
+    assert response["data"] == [{"name": "后院"}]
+    assert built == ["后院"]
 
 
 @pytest.mark.asyncio
@@ -933,7 +1010,9 @@ async def test_list_scenes_reports_saved_scene_director_world_pano_source(
         snapshot={"schemaVersion": 1, "world": {"activeSourceId": "scene-pano:Hall"}},
     )
 
-    response = await scenes.list_scenes(project="demo", user={"username": "admin"})
+    response = await scenes.list_scenes(
+        project="demo", summary=False, user={"username": "admin"}
+    )
 
     stage = response["data"][0]["stage_3gs"]
     assert stage["active_source"] == "360"
@@ -1643,28 +1722,66 @@ async def test_build_scenes_allows_supplement_when_derived_scenes_exist(
 
 
 @pytest.mark.asyncio
-async def test_list_props_returns_reference_url(tmp_path, monkeypatch):
+async def test_list_props_returns_convention_url_without_filesystem_probes(
+    tmp_path, monkeypatch
+):
     from novelvideo.api.routes import props
 
-    prop = NovelProp(name="Sword", visual_prompt="silver sword")
+    prop = NovelProp(
+        name="Sword",
+        visual_prompt="silver sword",
+        updated_at="2026-08-24T01:02:03+00:00",
+    )
     store = _PropStore([prop])
     _patch_project(monkeypatch, props, tmp_path, store)
-    prop_dir = tmp_path / "assets" / "props" / "Sword"
-    prop_dir.mkdir(parents=True)
-    (prop_dir / "reference_3view.png").write_bytes(b"ref")
+
+    def fail_probe(*_args, **_kwargs):
+        raise AssertionError("the prop list must not probe OSSFS")
+
+    monkeypatch.setattr(props, "compute_prop_reference_path", fail_probe)
+    monkeypatch.setattr(props, "tree_updated_at", fail_probe)
+    monkeypatch.setattr(props, "_asset_url", fail_probe)
 
     res = await props.list_props(
         project="demo",
+        summary=True,
         user={"username": "admin"},
     )
 
     asset = res["data"][0]
-    assert (
-        asset["reference_url"]
-        == "/static/projects/proj_demo/assets/props/Sword/reference_3view.png"
+    assert asset["reference_url"].startswith(
+        "/static/projects/demo/assets/props/Sword/reference_3view.png?v="
     )
     assert asset["scope"] == "global"
-    assert asset["updated_at"]
+    assert asset["updated_at"] == "2026-08-24T01:02:03+00:00"
+
+
+@pytest.mark.asyncio
+async def test_list_props_skips_unrelated_graph_state_hydration(tmp_path, monkeypatch):
+    from novelvideo.api.routes import props
+
+    resolved = _resolution(tmp_path)
+    store = _PropStore([])
+    calls: list[bool] = []
+
+    async def fake_resolve_project_scope(*_args, **_kwargs):
+        return resolved
+
+    async def fake_make_store(_ctx, *, load_graph_state=True):
+        calls.append(load_graph_state)
+        return store
+
+    monkeypatch.setattr(props, "resolve_project_scope", fake_resolve_project_scope)
+    monkeypatch.setattr(props, "make_sqlite_store_for_context", fake_make_store)
+    monkeypatch.setattr(props, "may_run_asset_repair", lambda _ctx: False)
+
+    response = await props.list_props(
+        project="demo",
+        user={"username": "admin"},
+    )
+
+    assert response["data"] == []
+    assert calls == [False]
 
 
 @pytest.mark.asyncio
@@ -1775,6 +1892,7 @@ async def test_list_props_scope_local_only_returns_episode_local_props(
 
 @pytest.mark.asyncio
 async def test_asset_references_match_beat_asset_ids(monkeypatch, tmp_path):
+    from novelvideo.api import deps
     from novelvideo.api.routes import assets
 
     class Store:
@@ -1784,7 +1902,7 @@ async def test_asset_references_match_beat_asset_ids(monkeypatch, tmp_path):
         async def load_graph_state(self):
             return None
 
-        async def list_visual_beats(self):
+        async def list_beat_asset_refs(self):
             return [
                 NovelVisualBeat(
                     episode_number=1,
@@ -1828,13 +1946,20 @@ async def test_asset_references_match_beat_asset_ids(monkeypatch, tmp_path):
             runtime_dir=str(tmp_path / "runtime"),
         )
 
-    async def fake_make_sqlite_store_for_context(ctx_arg):
+    async def fake_make_sqlite_store_for_context(ctx_arg, **kwargs):
         assert ctx_arg is ctx
+        # 引用查询只读 beats 表，不该带上 load_graph_state 的三次全表读。
+        assert kwargs == {"load_graph_state": False}
         return Store()
 
     monkeypatch.setattr(assets, "resolve_project_scope", fake_resolve_project_scope)
+    # Patched on ``deps``, not on the route module: the route now opens the store
+    # through ``sqlite_store_for_context_scope``, and that wrapper resolves the
+    # factory as a ``deps`` global when it runs. Patching the route module would
+    # leave the real factory in play and, worse, would skip the scope's
+    # ``finally`` close — the one thing the wrapper exists to guarantee.
     monkeypatch.setattr(
-        assets, "make_sqlite_store_for_context", fake_make_sqlite_store_for_context
+        deps, "make_sqlite_store_for_context", fake_make_sqlite_store_for_context
     )
 
     res = await assets.get_asset_references(
@@ -1855,6 +1980,170 @@ async def test_asset_references_match_beat_asset_ids(monkeypatch, tmp_path):
             "co_props": ["木凳", "油泼辣子"],
         },
     }
+
+
+def _patch_asset_references(monkeypatch, tmp_path, beats):
+    """Patch the assets routes onto a fixed beat list.
+
+    Returns ``(module, store_kwargs)``; ``store_kwargs`` records how the route
+    opened the store, so a test can assert the graph-state hydration is skipped.
+    """
+    from novelvideo.api import deps
+    from novelvideo.api.routes import assets
+
+    class Store:
+        async def list_beat_asset_refs(self):
+            return beats
+
+    ctx = SimpleNamespace(
+        project_id="proj_demo",
+        owner_username="admin",
+        project_name="demo",
+        output_dir=tmp_path,
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "runtime",
+    )
+    store_kwargs: list[dict] = []
+
+    async def fake_resolve_project_scope(project, user, *, required_role="viewer"):
+        assert required_role == "viewer"
+        return SimpleNamespace(ctx=ctx, username="admin", project_name="demo", project_dir=tmp_path)
+
+    async def fake_make_sqlite_store_for_context(ctx_arg, **kwargs):
+        assert ctx_arg is ctx
+        store_kwargs.append(kwargs)
+        return Store()
+
+    monkeypatch.setattr(assets, "resolve_project_scope", fake_resolve_project_scope)
+    # On ``deps`` — see the note in ``test_asset_references_match_beat_asset_ids``.
+    monkeypatch.setattr(
+        deps, "make_sqlite_store_for_context", fake_make_sqlite_store_for_context
+    )
+    return assets, store_kwargs
+
+
+_REFERENCE_BEATS = [
+    NovelVisualBeat(
+        episode_number=1,
+        beat_number=12,
+        narration="n",
+        visual_description="苏清晏握着[[油泼辣子]]",
+        detected_identities_json='["苏清晏_少女"]',
+        detected_props_json='["油泼辣子"]',
+        scene_ref_json='{"scene_id": "兰州拉面馆"}',
+    ),
+    NovelVisualBeat(
+        episode_number=3,
+        beat_number=4,
+        narration="n",
+        visual_description="v",
+        detected_identities_json='["路人_青年"]',
+        detected_props_json='["木凳"]',
+        scene_ref_json='{"scene_id": "兰州拉面馆"}',
+    ),
+]
+
+
+@pytest.mark.asyncio
+async def test_project_asset_references_does_not_scan_without_requested_ids(
+    monkeypatch, tmp_path
+):
+    assets, store_kwargs = _patch_asset_references(
+        monkeypatch, tmp_path, _REFERENCE_BEATS
+    )
+
+    res = await assets.get_project_asset_references(
+        project="proj_demo", ids=[], user={"username": "admin"}
+    )
+
+    assert res["ok"] is True
+    assert res["data"]["references"] == {}
+    assert res["data"]["scene_co_occurrence"] == {}
+    assert store_kwargs == []
+
+
+@pytest.mark.asyncio
+async def test_project_asset_references_returns_beat_lists_only_for_requested_ids(
+    monkeypatch, tmp_path
+):
+    assets, _ = _patch_asset_references(monkeypatch, tmp_path, _REFERENCE_BEATS)
+
+    res = await assets.get_project_asset_references(
+        project="proj_demo",
+        ids=["scene:兰州拉面馆", "identity:苏清晏_少女"],
+        user={"username": "admin"},
+    )
+
+    assert res["data"]["references"] == {
+        "identity:苏清晏_少女": [{"episode": 1, "beat_number": 12}],
+        "scene:兰州拉面馆": [
+            {"episode": 1, "beat_number": 12},
+            {"episode": 3, "beat_number": 4},
+        ],
+    }
+    # 共现只为被请求的场景计算。
+    assert res["data"]["scene_co_occurrence"] == {
+        "兰州拉面馆": {
+            "identities": ["苏清晏_少女", "路人_青年"],
+            "props": ["木凳", "油泼辣子"],
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_project_asset_references_finds_inline_prop_markers(monkeypatch, tmp_path):
+    # 只在 visual_description 里 [[标记]]、从未色绑到 detected_props 的道具，
+    # 也必须出现在按需引用列表里。
+    assets, _ = _patch_asset_references(
+        monkeypatch,
+        tmp_path,
+        [
+            NovelVisualBeat(
+                episode_number=2,
+                beat_number=7,
+                narration="n",
+                visual_description="桌上放着[[青瓷碗]]和[[竹筷]]",
+                detected_identities_json="[]",
+                detected_props_json="[]",
+                scene_ref_json="",
+            )
+        ],
+    )
+
+    res = await assets.get_project_asset_references(
+        project="proj_demo", ids=["prop:青瓷碗"], user={"username": "admin"}
+    )
+
+    assert res["data"]["references"] == {"prop:青瓷碗": [{"episode": 2, "beat_number": 7}]}
+    # 没有 scene_ref 的 beat 不该凭空造出一个空 key 的场景条目。
+    assert res["data"]["scene_co_occurrence"] == {}
+
+
+@pytest.mark.asyncio
+async def test_project_asset_references_empty_project(monkeypatch, tmp_path):
+    assets, _ = _patch_asset_references(monkeypatch, tmp_path, [])
+
+    res = await assets.get_project_asset_references(
+        project="proj_demo", ids=[], user={"username": "admin"}
+    )
+
+    assert res == {
+        "ok": True,
+        "data": {"references": {}, "scene_co_occurrence": {}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_project_asset_references_skips_graph_state_hydration(monkeypatch, tmp_path):
+    # load_graph_state() 是 characters/episodes/props 三次全表读；引用索引只碰
+    # beats 表，带上它比这里的查询本身还贵。
+    assets, store_kwargs = _patch_asset_references(monkeypatch, tmp_path, _REFERENCE_BEATS)
+
+    await assets.get_project_asset_references(
+        project="proj_demo", ids=["scene:兰州拉面馆"], user={"username": "admin"}
+    )
+
+    assert store_kwargs == [{"load_graph_state": False}]
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Copy, Loader2, ShieldCheck, Trash2, UserPlus, Users } from "lucide-react";
+import { HTTPError } from "ky";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
+import { alertDialog } from "@/components/confirm-dialog-host";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -30,6 +32,7 @@ import {
   type ProjectGrant,
   type UserSearchResult,
 } from "@/lib/queries/projects";
+import { MAX_PROJECT_GRANTS } from "@/lib/limits";
 import { projectRoleLabel } from "@/lib/project-permissions";
 import { isCeRuntime } from "@/lib/runtime-config";
 import { cn } from "@/lib/utils";
@@ -41,6 +44,10 @@ const GRANT_ROLES: GrantRole[] = ["viewer", "editor", "admin"];
 
 function grantDisplayName(grant: ProjectGrant): string {
   return grant.principal_username || grant.principal_id;
+}
+
+function grantIsEffective(grant: ProjectGrant): boolean {
+  return grant.effective !== false;
 }
 
 function roleCaption(role: GrantRole, t: (key: string) => string): string {
@@ -59,6 +66,36 @@ function projectLink(project: ProjectSummary): string {
   return `${window.location.origin}/projects/${project.id}/ingest`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function projectShareFailureMessage(
+  error: unknown,
+  t: (key: string) => string,
+): Promise<string> {
+  if (error instanceof HTTPError) {
+    let body: unknown = error.data;
+    let code: unknown;
+    try {
+      if (body === undefined) {
+        body = await error.response.clone().json();
+      }
+      code = isRecord(body) && isRecord(body.detail) ? body.detail.code : undefined;
+    } catch {
+      code = undefined;
+    }
+
+    if (error.response.status === 403 && code === "project_share_scope_mismatch") {
+      return t("project.shareDialog.toastUserOutOfScope");
+    }
+    if (error.response.status === 404) {
+      return t("project.shareDialog.toastUserNotFound");
+    }
+  }
+  return t("project.shareDialog.toastShareFailed");
+}
+
 export function ShareProjectDialog({
   project,
   open,
@@ -74,29 +111,67 @@ export function ShareProjectDialog({
   const [role, setRole] = useState<GrantRole>("editor");
   const projectId = project?.id ?? "";
   const grants = useProjectGrants(projectId, open && Boolean(projectId));
-  const users = useUserSearch(query);
+  const users = useUserSearch(projectId, query);
   const addGrant = useAddProjectGrant(projectId);
   const updateGrant = useUpdateProjectGrant(projectId);
   const deleteGrant = useDeleteProjectGrant(projectId);
 
+  useEffect(() => {
+    setQuery("");
+    setSelectedUser(null);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!open) {
+      setQuery("");
+      setSelectedUser(null);
+    }
+  }, [open]);
+
   const searchResults = users.data?.data ?? [];
+  const trimmedQuery = query.trim();
   const grantRows = grants.data?.data ?? [];
   const existingPrincipalIds = useMemo(
     () => new Set(grantRows.map((grant) => grant.principal_id)),
     [grantRows],
   );
+  // 项目最多分享给固定人数（所有者不占名额）。后端不数人头，这里是唯一拦截点。
+  // 名单没回来之前 `grantRows` 是空的，那不是「零个人」而是「不知道几个人」——
+  // 按它放行，这一下加进去的可能就是真的第 26 个。
+  // 刷新失败时 React Query 会把上一份名单留着（status 走到 error、data 不清空），
+  // 那份数字已经不能拿来放行了——同样归到「不知道几个人」。
+  const grantsReady = !grants.isLoading && !grants.isError && grants.data !== undefined;
+  const shareLimitReached = grantsReady && grantRows.length >= MAX_PROJECT_GRANTS;
+  const shareLimitHint = t("project.shareDialog.limitReached", { limit: MAX_PROJECT_GRANTS });
+  const showNoShareableUser =
+    trimmedQuery.length >= 3 && users.isSuccess && searchResults.length === 0 && !selectedUser;
 
   const handleAdd = async () => {
-    const username = selectedUser?.username || query.trim();
-    if (!username || username.length < 3) return;
+    const username = selectedUser?.username;
+    if (!username) return;
+    // 选中用户后，按钮不因配额置灰：点得到，才有地方把「为什么加不进去」说清楚。
+    if (!grantsReady) {
+      void alertDialog({
+        title: t("project.shareDialog.quotaUnknownTitle"),
+        description: t("project.shareDialog.quotaUnknown"),
+      });
+      return;
+    }
+    if (shareLimitReached) {
+      void alertDialog({
+        title: t("project.shareDialog.limitTitle"),
+        description: shareLimitHint,
+      });
+      return;
+    }
     try {
       await addGrant.mutateAsync({ principal_username: username, role });
       toast.success(t("project.shareDialog.toastMemberUpdated"));
       setQuery("");
       setSelectedUser(null);
       setRole("editor");
-    } catch {
-      toast.error(t("project.shareDialog.toastShareFailed"));
+    } catch (error) {
+      toast.error(await projectShareFailureMessage(error, t));
     }
   };
 
@@ -156,7 +231,14 @@ export function ShareProjectDialog({
             <div className="mb-3 flex items-center justify-between gap-3">
               <div>
                 <div className="text-sm font-medium text-foreground">{t("project.shareDialog.addMember")}</div>
-                <div className="mt-1 text-xs text-muted-foreground">{t("project.shareDialog.addMemberHint")}</div>
+                <div
+                  className={cn(
+                    "mt-1 text-xs",
+                    shareLimitReached ? "text-destructive" : "text-muted-foreground",
+                  )}
+                >
+                  {shareLimitReached ? shareLimitHint : t("project.shareDialog.addMemberHint")}
+                </div>
               </div>
               <Button variant="outline" size="sm" onClick={handleCopyLink} disabled={!project}>
                 <Copy className="size-3.5" />
@@ -174,7 +256,7 @@ export function ShareProjectDialog({
                   placeholder={t("project.shareDialog.searchPlaceholder")}
                   className="h-9 rounded-[8px] focus-visible:ring-1"
                 />
-                {query.trim().length >= 3 && searchResults.length > 0 && !selectedUser && (
+                {trimmedQuery.length >= 3 && searchResults.length > 0 && !selectedUser && (
                   <div className="absolute left-0 right-0 top-10 z-10 rounded-[8px] border border-border bg-popover p-1 shadow-xl">
                     {searchResults.map((user) => {
                       const disabled = existingPrincipalIds.has(user.id) || user.id === project?.ownerId;
@@ -198,6 +280,11 @@ export function ShareProjectDialog({
                     })}
                   </div>
                 )}
+                {showNoShareableUser && (
+                  <div className="mt-1.5 text-xs text-muted-foreground">
+                    {t("project.shareDialog.noShareableUser")}
+                  </div>
+                )}
               </div>
               <Select value={role} onValueChange={(value) => setRole(value as GrantRole)}>
                 <SelectTrigger className="h-9 w-full rounded-[8px]">
@@ -213,7 +300,10 @@ export function ShareProjectDialog({
                   ))}
                 </SelectContent>
               </Select>
-              <Button onClick={handleAdd} disabled={addGrant.isPending || query.trim().length < 3}>
+              <Button
+                onClick={handleAdd}
+                disabled={addGrant.isPending || !selectedUser}
+              >
                 {addGrant.isPending ? <Loader2 className="size-4 animate-spin" /> : <UserPlus className="size-4" />}
                 {t("project.shareDialog.add")}
               </Button>
@@ -221,7 +311,25 @@ export function ShareProjectDialog({
           </section>
 
           <section className="rounded-[12px] border border-border/70 bg-card/45 p-4">
-            <div className="mb-3 text-sm font-medium text-foreground">{t("project.shareDialog.members")}</div>
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <span className="text-sm font-medium text-foreground">
+                {t("project.shareDialog.members")}
+              </span>
+              {/* 名单没回来之前不报数：显示 0/25 等于给了一个假的余量。 */}
+              {grantsReady && (
+                <span
+                  className={cn(
+                    "text-xs tabular-nums",
+                    shareLimitReached ? "text-destructive" : "text-muted-foreground",
+                  )}
+                >
+                  {t("project.shareDialog.memberCount", {
+                    count: grantRows.length,
+                    limit: MAX_PROJECT_GRANTS,
+                  })}
+                </span>
+              )}
+            </div>
             <div className="space-y-2">
               {project && (
                 <div className="flex items-center gap-3 rounded-[10px] border border-border/60 bg-background/45 px-3 py-2.5">
@@ -239,42 +347,54 @@ export function ShareProjectDialog({
                   {t("project.shareDialog.loadingMembers")}
                 </div>
               )}
-              {!grants.isLoading && grantRows.map((grant) => (
-                <div key={grant.id} className="flex items-center gap-3 rounded-[10px] border border-border/60 bg-background/45 px-3 py-2.5">
-                  <Users className="size-4 text-muted-foreground" />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-medium">{grantDisplayName(grant)}</div>
-                    <div className="text-xs text-muted-foreground">{roleCaption(grant.role, t)}</div>
+              {!grants.isLoading && grantRows.map((grant) => {
+                const effective = grantIsEffective(grant);
+                return (
+                  <div key={grant.id} className="flex items-center gap-3 rounded-[10px] border border-border/60 bg-background/45 px-3 py-2.5">
+                    <Users className="size-4 text-muted-foreground" />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium">{grantDisplayName(grant)}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {effective
+                          ? roleCaption(grant.role, t)
+                          : t("project.shareDialog.inactiveAccessChanged")}
+                      </div>
+                    </div>
+                    {!effective ? (
+                      <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                        {t("project.shareDialog.inactive")}
+                      </span>
+                    ) : null}
+                    <Select
+                      value={grant.role}
+                      onValueChange={(value) => void handleRoleChange(grant, value as GrantRole)}
+                      disabled={!effective || updateGrant.isPending}
+                    >
+                      <SelectTrigger size="sm" className="w-24 rounded-[8px]">
+                        <SelectValue>
+                          {(value: string) => projectRoleLabel(value as ProjectRole)}
+                        </SelectValue>
+                      </SelectTrigger>
+                      <SelectContent alignItemWithTrigger={false}>
+                        {GRANT_ROLES.map((item) => (
+                          <SelectItem key={item} value={item}>
+                            {projectRoleLabel(item)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => void handleRevoke(grant)}
+                      disabled={deleteGrant.isPending}
+                      aria-label={t("project.shareDialog.removeMember")}
+                    >
+                      <Trash2 className="size-4 text-destructive" />
+                    </Button>
                   </div>
-                  <Select
-                    value={grant.role}
-                    onValueChange={(value) => void handleRoleChange(grant, value as GrantRole)}
-                    disabled={updateGrant.isPending}
-                  >
-                    <SelectTrigger size="sm" className="w-24 rounded-[8px]">
-                      <SelectValue>
-                        {(value: string) => projectRoleLabel(value as ProjectRole)}
-                      </SelectValue>
-                    </SelectTrigger>
-                    <SelectContent alignItemWithTrigger={false}>
-                      {GRANT_ROLES.map((item) => (
-                        <SelectItem key={item} value={item}>
-                          {projectRoleLabel(item)}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    onClick={() => void handleRevoke(grant)}
-                    disabled={deleteGrant.isPending}
-                    aria-label={t("project.shareDialog.removeMember")}
-                  >
-                    <Trash2 className="size-4 text-destructive" />
-                  </Button>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </section>
         </div>

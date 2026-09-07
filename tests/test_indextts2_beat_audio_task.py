@@ -1,13 +1,36 @@
 import hashlib
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from novelvideo.shared.billing_errors import InsufficientCreditsError
+from novelvideo.shared.billing_errors import BillingError, InsufficientCreditsError
 
 pytestmark = pytest.mark.m07
+
+
+def test_indextts2_resolves_project_config_from_current_module(monkeypatch):
+    from novelvideo.audio import indextts2_beat_audio_task as task
+
+    current_project_config = SimpleNamespace(
+        is_narrated_project_from_state_dir=lambda _state_dir: True,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "novelvideo.project_config",
+        current_project_config,
+    )
+
+    assert task._is_narrated_project(
+        SimpleNamespace(state_dir="/state/alice/demo"), "alice", "demo"
+    ) is True
+
+
+class _ForeignBillingError(BillingError):
+    def __init__(self, **_kwargs) -> None:
+        super().__init__("foreign billing error")
 
 
 @pytest.mark.asyncio
@@ -87,14 +110,18 @@ class FakeGenerator:
 
 
 class InsufficientCreditGenerator:
+    def __init__(self, error_type=InsufficientCreditsError):
+        self.error_type = error_type
+
     async def generate(self, *, prompt, audio_url, output_path, emotion_prompt=""):
-        raise InsufficientCreditsError(user_id="usr_1", cost=3, balance=0)
+        raise self.error_type(user_id="usr_1", cost=3, balance=0)
 
 
 class FakeStore:
     def __init__(self, project_dir, db_path, beats, *, include_dialogue_voice=True):
         self.project_dir = str(project_dir)
         self.db_path = str(db_path)
+        self.state_dir = str(Path(db_path).parent)
         self._beats = list(beats)
         self.include_dialogue_voice = include_dialogue_voice
 
@@ -1004,8 +1031,16 @@ async def test_indextts2_selected_runner_records_generator_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "InsufficientCreditsError",
+    [
+        InsufficientCreditsError,
+        _ForeignBillingError,
+    ],
+    ids=["personal", "foreign"],
+)
 async def test_indextts2_selected_runner_reraises_insufficient_credit(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, InsufficientCreditsError
 ):
     from novelvideo.audio.indextts2_beat_audio_task import (
         run_indextts2_beat_audio_generation,
@@ -1024,6 +1059,6 @@ async def test_indextts2_selected_runner_reraises_insufficient_credit(
             episode=1,
             beat_numbers=[1],
             mode="redo_selected",
-            generator=InsufficientCreditGenerator(),
+            generator=InsufficientCreditGenerator(InsufficientCreditsError),
             audio_url_builder=lambda path: f"data://{Path(path).name}",
         )

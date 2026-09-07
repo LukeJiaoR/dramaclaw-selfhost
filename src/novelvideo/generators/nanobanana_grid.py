@@ -27,8 +27,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from pypinyin import pinyin, Style
-
 from pydantic import BaseModel, Field
 
 from novelvideo.config import (
@@ -36,8 +34,21 @@ from novelvideo.config import (
     get_grid_generation_config,
     get_style_preset,
 )
-from novelvideo.ports import get_usage_meter
-from novelvideo.shared.billing_errors import is_insufficient_credits_error
+from novelvideo.ports import get_usage_meter, update_current_model_call_log
+from novelvideo.egress_context import (
+    TrustedEgressContext,
+    ambient_organization_egress_context,
+)
+from novelvideo.ports.authz import AdmissionContext
+from novelvideo.ports.egress import EgressError
+from novelvideo.ports.egress_operations import (
+    OperationClaimResult,
+    HandleKind,
+    OperationSpec,
+    canonical_request_digest,
+)
+from novelvideo.ports.model_credentials import ModelCredentialError, RequestCredential
+from novelvideo.shared.billing_errors import is_fatal_billing_error
 from novelvideo.shared.provider_costs import is_definite_no_cost_http_rejection
 from novelvideo.generators.huimengi import (
     HuimengTaskFailed,
@@ -56,7 +67,6 @@ from novelvideo.generators.prompt_builder import (
 from novelvideo.generators.render_identity_guard import render_ai_detection_error
 from novelvideo.models import (
     beat_scene_id,
-    build_prop_menu,
     collect_prop_marker_ids_from_beat,
     real_detected_identities,
 )
@@ -69,10 +79,10 @@ from novelvideo.image_request_usage import (
     record_image_request,
     update_image_request_status,
 )
-from novelvideo.utils.path_resolver import compute_scoped_grid_filename
 from novelvideo.storage.media_relay import (
     IMAGE_TRANSFORM_AI_REFERENCE_JPEG,
     media_relay_ttl_seconds,
+    relay_tenant_image_bytes_from_context,
     upload_image_bytes,
 )
 
@@ -95,6 +105,138 @@ SINGLE_CELL_RENDER_MODE_BY_ASPECT = {
 }
 logger = logging.getLogger(__name__)
 NEWAPI_MEDIA_INPUT_MIN_TTL_SECONDS = 2 * 60 * 60
+
+
+@dataclass(frozen=True, slots=True)
+class _OrganizationImageEgress:
+    credential: RequestCredential
+    operation_port: Any
+    claim: OperationClaimResult
+
+
+def _validate_egress_context(
+    egress_context: TrustedEgressContext | None,
+) -> TrustedEgressContext | None:
+    if egress_context is not None and type(egress_context) is not TrustedEgressContext:
+        raise TypeError("egress_context must be a TrustedEgressContext")
+    return egress_context
+
+
+async def _prepare_organization_image_egress(
+    *,
+    egress_context: TrustedEgressContext | None,
+    provider: str,
+    capability: str,
+    request: dict[str, object],
+    business_task_id: str | None = None,
+) -> _OrganizationImageEgress | None:
+    context = _validate_egress_context(egress_context)
+    if context is None:
+        context = ambient_organization_egress_context()
+    if context is None or not context.is_organization:
+        return None
+    if provider != "newapi":
+        raise EgressError("ORG_EGRESS_DENIED")
+
+    from novelvideo.ports import get_egress_operation_port, get_model_credentials
+
+    admission = AdmissionContext(
+        requester_user_id=context.requester_user_id,
+        billing_principal=context.billing_principal,
+        credential=context.credential,
+        admission_id=context.admission_id,
+        root_task_id=context.root_task_id,
+        admitted_at=context.admitted_at,
+        membership_id=context.membership_id,
+        authz_version=context.authz_version,
+    )
+    operation_port = get_egress_operation_port()
+    claim = await operation_port.claim(
+        spec=OperationSpec(
+            organization_id=context.billing_principal.id,
+            project_id=context.project_id,
+            root_task_id=context.root_task_id,
+            business_task_id=business_task_id or context.envelope_id,
+            capability=capability,
+            credential_id=context.credential.credential_id,
+            credential_version=context.credential.key_version,
+            request_digest=canonical_request_digest(request),
+            handle_kind=HandleKind.PROVIDER_JOB,
+        )
+    )
+    if not claim.won:
+        raise EgressError("EGRESS_OPERATION_REPLAYED")
+    try:
+        credential = await get_model_credentials().resolve(admission)
+        if (
+            type(credential) is not RequestCredential
+            or credential.reference != context.credential
+        ):
+            raise ModelCredentialError("ORG_CREDENTIAL_VERSION_MISMATCH")
+    except Exception:
+        await operation_port.mark_rejected_before_submit(
+            operation_id=claim.operation.operation_id,
+            transition_token=claim.transition_token,
+            expected_version=claim.operation.version,
+        )
+        raise
+    return _OrganizationImageEgress(
+        credential=credential,
+        operation_port=operation_port,
+        claim=claim,
+    )
+
+
+async def _complete_organization_image_egress(
+    state: _OrganizationImageEgress | None,
+    *,
+    trace: dict[str, str],
+    result_ref: str,
+) -> None:
+    if state is None:
+        return
+    provider_job_id = str(
+        trace.get("request_id") or trace.get("response_id") or ""
+    ).strip()
+    if not provider_job_id:
+        await state.operation_port.mark_unknown(
+            operation_id=state.claim.operation.operation_id,
+            transition_token=state.claim.transition_token,
+            expected_version=state.claim.operation.version,
+        )
+        raise RuntimeError("gateway response is missing a request id")
+    accepted = await state.operation_port.mark_accepted(
+        operation_id=state.claim.operation.operation_id,
+        transition_token=state.claim.transition_token,
+        expected_version=state.claim.operation.version,
+        provider_job_id=provider_job_id,
+    )
+    await state.operation_port.mark_completed(
+        operation_id=state.claim.operation.operation_id,
+        transition_token=state.claim.transition_token,
+        expected_version=accepted.version,
+        result_ref=result_ref,
+    )
+
+
+async def _abandon_organization_image_egress(
+    state: _OrganizationImageEgress | None,
+) -> None:
+    """Close out a claim whose outcome we cannot observe.
+
+    Deliberately `mark_unknown` rather than `mark_rejected_before_submit`: once the
+    credential is out of our hands we cannot prove the request was never submitted,
+    and only the ledger's unknown state is honest about that.
+    """
+
+    if state is None:
+        return
+    await state.operation_port.mark_unknown(
+        operation_id=state.claim.operation.operation_id,
+        transition_token=state.claim.transition_token,
+        expected_version=state.claim.operation.version,
+    )
+
 
 _SCENE_REFERENCE_FEATURE_BILLING = contextvars.ContextVar(
     "scene_reference_feature_billing", default=False
@@ -2133,9 +2275,6 @@ def crop_sketch_panels(
     from novelvideo.generators.grid_splitter import _trim_outer_border
     import numpy as np
 
-    sketch_dir = (
-        str(Path(sketch_path).parent) if Path(sketch_path).is_file() else sketch_path
-    )
 
     def _trim_panel(panel_img):
         """裁掉单个 panel 的白边。"""
@@ -2874,6 +3013,8 @@ async def generate_text_to_image(
     quality: str | None = None,
     api_key: Optional[str] = None,
     config: Optional[dict] = None,
+    egress_context: TrustedEgressContext | None = None,
+    egress_capability: str = "image.generate",
 ) -> Path:
     """Generate one image from a prompt only — no reference images.
 
@@ -2890,6 +3031,8 @@ async def generate_text_to_image(
         quality=quality,
         api_key=api_key,
         config=config,
+        egress_context=egress_context,
+        egress_capability=egress_capability,
     )
 
 
@@ -2903,6 +3046,8 @@ async def generate_reference_edit_image(
     quality: str | None = None,
     api_key: Optional[str] = None,
     config: Optional[dict] = None,
+    egress_context: TrustedEgressContext | None = None,
+    egress_capability: str = "image.edit",
 ) -> Path:
     """Generate one edited image from reference images plus a free-form edit prompt.
 
@@ -2924,6 +3069,8 @@ async def generate_reference_edit_image(
         quality=quality,
         api_key=api_key,
         config=config,
+        egress_context=egress_context,
+        egress_capability=egress_capability,
     )
 
 
@@ -2937,10 +3084,52 @@ async def _generate_image(
     quality: str | None,
     api_key: Optional[str],
     config: Optional[dict],
+    egress_context: TrustedEgressContext | None,
+    egress_capability: str,
 ) -> Path:
     """Shared body for text-only and image-edit single-image generation."""
-    generator = NanoBananaGridGenerator(api_key=api_key, config=config)
     ref_paths = list(reference_image_paths or [])
+    context = _validate_egress_context(egress_context)
+    if context is None:
+        # claim 本身不漏（`_prepare_organization_image_egress` 自己回落到作用域），漏的是
+        # 转发给叶子的身份：`context` 留成 None，参考图中继就静默走平台分支而不是
+        # `relay_tenant_image_bytes_from_context`。只补组织这一支——把平台身份也回落
+        # 进去，会让平台流量撞上组织 deny 闸门（OI-48 的房规）。
+        context = ambient_organization_egress_context()
+    configured_provider = (
+        str((config or {}).get("provider") or "newapi").strip().lower()
+    )
+    request = {
+        "model": str((config or {}).get("model") or ""),
+        "prompt": prompt,
+        "reference_sha256": [
+            hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in ref_paths
+        ],
+        "aspect_ratio": aspect_ratio,
+        "image_size": image_size,
+        "quality": quality or "",
+    }
+    organization_egress = await _prepare_organization_image_egress(
+        egress_context=context,
+        provider=configured_provider,
+        capability=egress_capability,
+        request=request,
+    )
+    effective_config = config
+    effective_api_key = api_key
+    if organization_egress is not None:
+        effective_config = dict(config or {})
+        effective_config.update(
+            {
+                "provider": "newapi",
+                "api_key": organization_egress.credential.api_key,
+                "base_url": organization_egress.credential.base_url,
+            }
+        )
+        effective_api_key = organization_egress.credential.api_key
+    generator = NanoBananaGridGenerator(
+        api_key=effective_api_key, config=effective_config
+    )
 
     if generator.provider == "openrouter":
         ref_bytes = [Path(path).read_bytes() for path in ref_paths]
@@ -2992,7 +3181,8 @@ async def _generate_image(
                 f"OpenAI edit image generation failed: {error_detail or 'empty image'}"
             )
     elif generator.provider == "newapi":
-        ref_bytes = [Path(path).read_bytes() for path in ref_paths]
+        ref_bytes = [(Path(path).read_bytes(), path) for path in ref_paths]
+        trace: dict[str, str] = {}
         image_bytes, _, error_detail = await _call_newapi_image_api(
             api_key=generator.api_key,
             model=generator.model,
@@ -3006,6 +3196,8 @@ async def _generate_image(
                 "model_params": generator.newapi_model_params,
             },
             base_url=generator.base_url,
+            trace=trace,
+            egress_context=context,
         )
         if not image_bytes:
             raise ValueError(
@@ -3052,6 +3244,11 @@ async def _generate_image(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(image_bytes)
+    await _complete_organization_image_egress(
+        organization_egress,
+        trace=trace if generator.provider == "newapi" else {},
+        result_ref=str(output),
+    )
     return output
 
 
@@ -3319,7 +3516,7 @@ async def _call_openrouter_image_api(
             else f"HTTP {e.response.status_code}",
         )
     except Exception as e:
-        if is_insufficient_credits_error(e):
+        if is_fatal_billing_error(e):
             raise
         detail = f"{type(e).__name__}: {e!r}"
         print(f"[OpenRouter] 请求异常: {detail}")
@@ -3388,8 +3585,6 @@ async def _call_openai_image_api(
         )
 
     async def _refund(reservation_id: str, source: str, error: str) -> None:
-        if not reservation_id:
-            return
         try:
             await get_usage_meter().refund_model_call_credit_reservation(
                 reservation_id,
@@ -3431,7 +3626,7 @@ async def _call_openai_image_api(
         effective_base_url = str(base_url or "").strip().rstrip("/")
         if not effective_base_url and model == PROVIDER_HUB_IMAGE_MODEL:
             effective_base_url = PROVIDER_HUB_BASE_URL
-        client_kwargs: dict[str, object] = {"api_key": api_key, "timeout": 300.0}
+        client_kwargs: dict[str, object] = {"api_key": api_key, "timeout": 660.0, "max_retries": 0}
         if effective_base_url:
             client_kwargs["base_url"] = effective_base_url
         client = AsyncOpenAI(**client_kwargs)
@@ -3528,7 +3723,7 @@ async def _call_openai_image_api(
         return image_bytes, "", ""
     except Exception as exc:
         await _refund(reservation_id, "openai_image_api", type(exc).__name__)
-        if is_insufficient_credits_error(exc):
+        if is_fatal_billing_error(exc):
             raise
         detail = f"{type(exc).__name__}: {exc!r}"
         print(f"[OpenAI Image] 请求异常: {detail}")
@@ -3540,15 +3735,18 @@ async def _call_newapi_image_api(
     api_key: str,
     model: str,
     prompt: str,
-    reference_images: list[bytes | tuple[bytes, str] | tuple[str, bytes, str]]
-    | None = None,
+    reference_images: (
+        list[bytes | tuple[bytes, str] | tuple[str, bytes, str]] | None
+    ) = None,
     image_config: dict | None = None,
     base_url: str | None = None,
     trace: dict[str, str] | None = None,
+    egress_context: TrustedEgressContext | None = None,
 ) -> tuple[bytes | None, str, str]:
     """Call newAPI's OpenAI-compatible Images API."""
     import httpx
 
+    context = _validate_egress_context(egress_context)
     if not api_key:
         return None, "", "DramaClawAPI API key is missing"
 
@@ -3613,10 +3811,35 @@ async def _call_newapi_image_api(
 
     if reference_images:
         try:
-            payload["image"] = await _relay_reference_images_for_newapi(
-                reference_images
-            )
+            relay_helper = _relay_reference_images_for_newapi
+            if relay_helper is _ORIGINAL_RELAY_REFERENCE_IMAGES_FOR_NEWAPI:
+                payload["image"] = await relay_helper(
+                    reference_images,
+                    egress_context=context,
+                )
+            else:
+                payload["image"] = await relay_helper(reference_images)
         except Exception as exc:
+            if context is not None and context.is_organization:
+                # The organization path hides `exc` because an arbitrary
+                # exception may carry a signed URL or a key. The relay's own
+                # three failures are secret-free by construction, though, and
+                # they need three different fixes — a port registration, a
+                # retry, an object-storage policy — so name which one fired
+                # (OI-45). Anything else stays opaque.
+                code = getattr(type(exc), "code", None)
+                reason = getattr(exc, "reason", None)
+                if not isinstance(code, str):
+                    return None, "", "media relay upload failed"
+                logger.warning(
+                    "organization media relay failed: code=%s reason=%s "
+                    "envelope=%s project=%s",
+                    code,
+                    reason or "-",
+                    context.envelope_id,
+                    context.project_id,
+                )
+                return None, "", f"media relay upload failed ({code})"
             return None, "", f"media relay upload failed: {exc}"
         request_path = "/images/edits"
     else:
@@ -3673,8 +3896,6 @@ async def _call_newapi_image_api(
         http_status: int | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
-        if not reservation_id:
-            return
         try:
             metadata: dict[str, object] = {"source": source, "error": error[:200]}
             if request_id:
@@ -3730,6 +3951,9 @@ async def _call_newapi_image_api(
     provider_request_id = ""
     try:
         reservation_id = await _reserve("newapi_image_api")
+        await update_current_model_call_log(
+            request_payload=payload,
+        )
 
         async with httpx.AsyncClient(
             timeout=NEWAPI_IMAGE_HTTP_TIMEOUT_SECONDS,
@@ -3752,6 +3976,9 @@ async def _call_newapi_image_api(
             response_headers = getattr(response, "headers", {}) or {}
             provider_request_id = _newapi_request_id_from_headers(response_headers)
             result = response.json()
+            await update_current_model_call_log(
+                response_payload=result,
+            )
             logger.info(
                 "DramaClawAPI image POST parsed: data_count=%d keys=%s",
                 len(result.get("data") or []),
@@ -3846,8 +4073,14 @@ async def _call_newapi_image_api(
         body = (exc.response.text or "")[:2000]
         response_headers = getattr(exc.response, "headers", {}) or {}
         safe_headers = _newapi_safe_header_summary(response_headers)
-        request_id = (
-            _newapi_request_id_from_headers(response_headers) or provider_request_id
+        request_id = _newapi_request_id_from_headers(response_headers) or provider_request_id
+        await update_current_model_call_log(
+            response_payload={
+                "status_code": exc.response.status_code,
+                "headers": safe_headers,
+                "body": body,
+            },
+            error_message=f"HTTP {exc.response.status_code}",
         )
         if is_definite_no_cost_http_rejection(exc.response.status_code):
             try:
@@ -3889,13 +4122,16 @@ async def _call_newapi_image_api(
             f"HTTP {exc.response.status_code}: {header_context}{error_context}; body={body}",
         )
     except Exception as exc:
+        await update_current_model_call_log(
+            error_message=type(exc).__name__,
+        )
         await _refund(
             reservation_id,
             "newapi_image_api",
             type(exc).__name__,
             request_id=provider_request_id,
         )
-        if is_insufficient_credits_error(exc):
+        if is_fatal_billing_error(exc):
             raise
         error_context = _newapi_context_for_error(request_context)
         detail = f"{type(exc).__name__}: {exc!r}; {error_context}"
@@ -3903,19 +4139,129 @@ async def _call_newapi_image_api(
         return None, "", f"请求异常: {detail}"
 
 
+def _reference_image_bytes(
+    image_ref: bytes | tuple[bytes, str] | tuple[str, bytes, str],
+) -> bytes:
+    """Unpack the three reference-image shapes the newAPI path accepts."""
+    if isinstance(image_ref, tuple):
+        if len(image_ref) == 3:
+            return bytes(image_ref[1])
+        if len(image_ref) == 2:
+            return bytes(image_ref[0])
+        return bytes(image_ref[0])
+    return bytes(image_ref)
+
+
+async def _call_newapi_image_api_with_egress(
+    *,
+    capability: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    reference_images: (
+        list[bytes | tuple[bytes, str] | tuple[str, bytes, str]] | None
+    ) = None,
+    image_config: dict | None = None,
+    base_url: str | None = None,
+    egress_context: TrustedEgressContext | None = None,
+) -> tuple[bytes | None, str, str]:
+    """grid 家族的出网闸门（OI-52）：把 `_generate_image` 已验证的形状装到叶子外围。
+
+    闸门装在**调用点**而不是叶子内部，因为叶子复原不出 `capability`、归一化前的
+    `image_size`、fallback 前的 `quality`，也拿不到结果引用；而 `_generate_image`
+    与 `scene_reference_images.py` 已经在叶子上方 claim 过，叶子内再 claim 一次会以
+    同键不同 digest 撞成 `EGRESS_OPERATION_CONFLICT`。
+
+    非组织身份走逐字节透传：叶子收到的实参与没有这层包装时完全一致，
+    `tests/test_newapi_image_gateway.py` 的直调因此不受影响。
+    """
+
+    context = _validate_egress_context(egress_context)
+    if context is None:
+        context = ambient_organization_egress_context()
+    if context is None or not context.is_organization:
+        return await _call_newapi_image_api(
+            api_key=api_key,
+            model=model,
+            prompt=prompt,
+            reference_images=reference_images,
+            image_config=image_config,
+            base_url=base_url,
+        )
+
+    from novelvideo.model_gateway_runtime import next_model_gateway_business_task_id
+
+    config = image_config or {}
+    request = {
+        "model": model,
+        "prompt": prompt,
+        "reference_sha256": [
+            hashlib.sha256(_reference_image_bytes(item)).hexdigest()
+            for item in (reference_images or [])
+        ],
+        "aspect_ratio": str(config.get("aspect_ratio") or ""),
+        "image_size": str(config.get("image_size") or ""),
+        "quality": str(config.get("quality") or ""),
+    }
+    # 同一 envelope 内可以有多次同 capability 的图像操作（`_render_single_panel_gemini`
+    # 用 asyncio.gather 扇出 N 路），`envelope_id` 当 business_task_id 会把它们压成同一
+    # 个操作键。这个 helper 带请求内序号，且在 envelope 重投递时可复现。
+    state = await _prepare_organization_image_egress(
+        egress_context=context,
+        provider="newapi",
+        capability=capability,
+        request=request,
+        business_task_id=next_model_gateway_business_task_id(
+            capability,
+            request_digest=canonical_request_digest(request),
+        ),
+    )
+    if state is None:
+        raise EgressError("ORG_EGRESS_DENIED")
+
+    async def _mark_unknown() -> None:
+        await state.operation_port.mark_unknown(
+            operation_id=state.claim.operation.operation_id,
+            transition_token=state.claim.transition_token,
+            expected_version=state.claim.operation.version,
+        )
+
+    trace: dict[str, str] = {}
+    try:
+        image_bytes, text, error = await _call_newapi_image_api(
+            api_key=state.credential.api_key,
+            model=model,
+            prompt=prompt,
+            reference_images=reference_images,
+            image_config=image_config,
+            base_url=state.credential.base_url,
+            trace=trace,
+            egress_context=context,
+        )
+    except Exception:
+        await _mark_unknown()
+        raise
+    if not image_bytes:
+        # 叶子把传输失败压成 `(None, "", error)`，操作已经出过网但没有可用结果，
+        # 只能落 unknown——不能当没发生过，否则重试会以同键再 claim 一次。
+        await _mark_unknown()
+        return image_bytes, text, error
+    await _complete_organization_image_egress(
+        state,
+        trace=trace,
+        result_ref=f"image:sha256:{hashlib.sha256(image_bytes).hexdigest()}",
+    )
+    return image_bytes, text, error
+
+
 async def _relay_reference_images_for_newapi(
     reference_images: list[bytes | tuple[bytes, str] | tuple[str, bytes, str]],
+    *,
+    egress_context: TrustedEgressContext | None = None,
 ) -> list[str]:
     """Upload reference image bytes to OSS relay for URL-only upstream channels."""
 
-    def _image_bytes(image_ref) -> bytes:
-        if isinstance(image_ref, tuple):
-            if len(image_ref) == 3:
-                return bytes(image_ref[1])
-            if len(image_ref) == 2:
-                return bytes(image_ref[0])
-            return bytes(image_ref[0])
-        return bytes(image_ref)
+    context = _validate_egress_context(egress_context)
 
     def _image_ext(image_ref) -> str:
         if isinstance(image_ref, tuple):
@@ -3936,6 +4282,25 @@ async def _relay_reference_images_for_newapi(
                     return suffix
         return "png"
 
+    if context is not None and context.is_organization:
+        urls: list[str] = []
+        for index, image_ref in enumerate(reference_images):
+            data = _reference_image_bytes(image_ref)
+            content_digest = hashlib.sha256(data).hexdigest()
+            object_id = (
+                f"{context.envelope_id}:{context.project_id}:{index}:{content_digest}"
+            )
+            urls.append(
+                await relay_tenant_image_bytes_from_context(
+                    data,
+                    object_id=object_id,
+                    context=context,
+                    ext=_image_ext(image_ref),
+                    ttl=NEWAPI_MEDIA_INPUT_MIN_TTL_SECONDS,
+                )
+            )
+        return urls
+
     def upload_all() -> list[str]:
         urls: list[str] = []
         relay_ttl = media_relay_ttl_seconds(
@@ -3944,7 +4309,7 @@ async def _relay_reference_images_for_newapi(
         for image_ref in reference_images:
             urls.append(
                 upload_image_bytes(
-                    _image_bytes(image_ref),
+                    _reference_image_bytes(image_ref),
                     ext=_image_ext(image_ref),
                     ttl=relay_ttl,
                     image_transform=IMAGE_TRANSFORM_AI_REFERENCE_JPEG,
@@ -3953,6 +4318,9 @@ async def _relay_reference_images_for_newapi(
         return urls
 
     return await asyncio.to_thread(upload_all)
+
+
+_ORIGINAL_RELAY_REFERENCE_IMAGES_FOR_NEWAPI = _relay_reference_images_for_newapi
 
 
 async def _call_huimeng_image_api(
@@ -4106,6 +4474,13 @@ class NanoBananaGridGenerator:
                 key_name = "GOOGLE_AI_API_KEY"
             raise ValueError(f"API key not set. Set {key_name} environment variable.")
 
+        # EG-09b（OI-52）：组织只许经网关出图。这条判决 `_prepare_organization_image_egress`
+        # 早就有，但 grid 家族的调用点不经过它，于是对 `generate_grid` 这些入口从未生效。
+        # 提到构造点是因为那 6 个入口共用 `self.provider` 选分支，一处判就够。
+        # 只对组织身份生效——平台/个人走 direct provider 行为不变。
+        if self.provider != "newapi" and ambient_organization_egress_context() is not None:
+            raise EgressError("ORG_EGRESS_DENIED")
+
         print(f"[NanoBanana Grid] Provider: {self.provider}, Model: {self.model}")
 
     async def generate_grid(
@@ -4192,7 +4567,7 @@ class NanoBananaGridGenerator:
         if len(beats) < 1:
             return GridGenerationResult(
                 success=False,
-                error=f"需要至少 1 个 beat，当前没有 beats",
+                error="需要至少 1 个 beat，当前没有 beats",
                 generation_time=time.time() - start_time,
             )
 
@@ -4371,7 +4746,7 @@ class NanoBananaGridGenerator:
 
             if sketch:
                 # Sketch 模式使用 UnifiedPromptBuilder（与导出逻辑一致）
-                print(f"[NanoBananaPro] 进入 Sketch 模式")
+                print("[NanoBananaPro] 进入 Sketch 模式")
 
                 # 当前网格的全局 beat 范围 (1-based)
                 grid_beat_start = beat_start_index + 1
@@ -4444,7 +4819,7 @@ class NanoBananaGridGenerator:
                     )
 
                 if sketch_result or has_all_pool_sketches:
-                    print(f"[NanoBananaPro] 进入 Render 模式 (基于草图渲染)")
+                    print("[NanoBananaPro] 进入 Render 模式 (基于草图渲染)")
                     if has_all_pool_sketches:
                         print(
                             f"[Render] 使用图片池草图: {len(beat_sketch_paths)} 个 beat"
@@ -4549,7 +4924,7 @@ class NanoBananaGridGenerator:
 
             # Prompt-Only 模式：只生成提示词，跳过 API 调用
             if prompt_only:
-                print(f"[NanoBananaPro] Prompt-Only 模式，跳过 API 调用")
+                print("[NanoBananaPro] Prompt-Only 模式，跳过 API 调用")
                 # 在 Render 模式下，显示 sketch 切片信息（用于验证）
                 if is_render_mode:
                     sketch_capacity = (
@@ -4851,7 +5226,8 @@ class NanoBananaGridGenerator:
                     contents,
                     include_mime=True,
                 )
-                image_bytes, _text, newapi_error = await _call_newapi_image_api(
+                image_bytes, _text, newapi_error = await _call_newapi_image_api_with_egress(
+                    capability="image.generate.grid",
                     api_key=self.api_key,
                     model=self.model,
                     prompt=prompt_text,
@@ -5024,7 +5400,7 @@ class NanoBananaGridGenerator:
                     status="failed",
                     error_message=str(e),
                 )
-            if is_insufficient_credits_error(e):
+            if is_fatal_billing_error(e):
                 raise
             return GridGenerationResult(
                 success=False,
@@ -5188,7 +5564,8 @@ class NanoBananaGridGenerator:
                     contents,
                     include_mime=True,
                 )
-                image_bytes, _, error_detail = await _call_newapi_image_api(
+                image_bytes, _, error_detail = await _call_newapi_image_api_with_egress(
+                    capability="image.generate.action_grid",
                     api_key=self.api_key,
                     model=self.model,
                     prompt=prompt_text,
@@ -5457,7 +5834,8 @@ class NanoBananaGridGenerator:
                     contents,
                     include_mime=True,
                 )
-                image_bytes, _text, newapi_error = await _call_newapi_image_api(
+                image_bytes, _text, newapi_error = await _call_newapi_image_api_with_egress(
+                    capability="image.edit.sketch_reformat",
                     api_key=self.api_key,
                     model=self.model,
                     prompt=prompt_text,
@@ -5515,7 +5893,7 @@ class NanoBananaGridGenerator:
                 if not response.candidates or not response.candidates[0].content:
                     return GridGenerationResult(
                         success=False,
-                        error=f"[Reformat] API 响应无有效内容",
+                        error="[Reformat] API 响应无有效内容",
                         generation_time=time.time() - start_time,
                     )
 
@@ -5612,9 +5990,6 @@ class NanoBananaGridGenerator:
             if detection_error:
                 raise RuntimeError(detection_error)
 
-        from google import genai
-        from google.genai import types
-
         # 验证参考图
         valid_character_map = {}
         for char_name, info in character_map.items():
@@ -5678,8 +6053,6 @@ class NanoBananaGridGenerator:
         )
 
         if sketch:
-            grid_beat_start = beat_start_index + 1
-            grid_beat_end = beat_start_index + grid_capacity
             ctx = create_prompt_context(
                 mode=PromptMode.SKETCH,
                 beats=beats[:grid_capacity],
@@ -5734,7 +6107,7 @@ class NanoBananaGridGenerator:
                 else:
                     temp_dir = Path("output")
                 temp_dir.mkdir(parents=True, exist_ok=True)
-                sub_sketch_path = str(temp_dir / f"temp_sub_sketch_batch.jpg")
+                sub_sketch_path = str(temp_dir / "temp_sub_sketch_batch.jpg")
                 target_aspect_batch = None
                 if sketch_aspect_padding and mode_key:
                     target_aspect_batch = cell_aspect_ratio(mode_key)
@@ -6085,7 +6458,7 @@ class NanoBananaGridGenerator:
         print(
             f"[NanoBananaPro Batch] 共 {total_beats} 个 beats，最大网格: {max_grid_rows}x{max_grid_cols}"
         )
-        print(f"[NanoBananaPro Batch] 动态网格优化已启用（最小化黑色填充）")
+        print("[NanoBananaPro Batch] 动态网格优化已启用（最小化黑色填充）")
 
         # 确保输出目录存在
         if output_dir:
@@ -6745,13 +7118,10 @@ class NanoBananaGridGenerator:
         然后用本地偏移切出正确的 panel。
         """
         from PIL import Image
-        import io
 
         # 1. 查找覆盖当前 beat 范围的草图文件
         try:
-            sketch_capacity = (
-                SKETCH_GRID_CONFIG["rows"] * SKETCH_GRID_CONFIG["cols"]
-            )  # 25
+
             beat_range_start = beat_start_index + 1  # 1-based
             beat_range_end = beat_start_index + len(beats)
 
@@ -6814,11 +7184,6 @@ class NanoBananaGridGenerator:
             )
 
         # 2. 准备并行任务
-        from novelvideo.generators import create_image_generator
-
-        # 假设我们总是使用 VolcengineImageGenerator (Seedream)
-        image_gen = create_image_generator("volcengine")
-
         if not output_path:
             # Default path if none provided
             output_path = "output/render_grid_temp.png"
@@ -6831,7 +7196,6 @@ class NanoBananaGridGenerator:
 
         # 3. 准备并行任务 (使用 NanoBanana/Gemini)
         tasks = []
-        import time
 
         for i, beat in enumerate(beats):
             if i >= len(panels):
@@ -6940,7 +7304,7 @@ CRITICAL: Keep exact composition from sketch. Only add color, texture, and light
                     img = Image.open(res)
                     rendered_panels.append(img)
                     success_count += 1
-                except:
+                except Exception:
                     rendered_panels.append(panels[idx])
 
         print(f"[Render] Completed {success_count}/{len(beats)} panels.")
@@ -7064,7 +7428,8 @@ CRITICAL: Keep exact composition from sketch. Only add color, texture, and light
                     contents,
                     include_mime=True,
                 )
-                image_bytes, _, error_detail = await _call_newapi_image_api(
+                image_bytes, _, error_detail = await _call_newapi_image_api_with_egress(
+                    capability="image.generate.render_panel",
                     api_key=self.api_key,
                     model=self.model,
                     prompt=prompt_text,
@@ -7286,7 +7651,8 @@ CRITICAL: The output must look like a higher-resolution vertical crop/extension 
                             or "image/png",
                         )
                     )
-                image_bytes, _, newapi_error = await _call_newapi_image_api(
+                image_bytes, _, newapi_error = await _call_newapi_image_api_with_egress(
+                    capability="image.edit.upscale",
                     api_key=self.api_key,
                     model=self.model,
                     prompt=prompt,
@@ -7483,7 +7849,8 @@ OUTPUT: Single high-quality image, no watermarks, no text overlays.
                     contents,
                     include_mime=True,
                 )
-                image_bytes, _, error_detail = await _call_newapi_image_api(
+                image_bytes, _, error_detail = await _call_newapi_image_api_with_egress(
+                    capability="image.generate.preview",
                     api_key=self.api_key,
                     model=self.model,
                     prompt=prompt_text,
@@ -7629,108 +7996,6 @@ def _generation_beat_number(beat: dict, fallback_index: int) -> int:
         except (TypeError, ValueError):
             pass
     return fallback_index + 1
-
-
-async def regenerate_selected_beats(
-    selected_beats: List[dict],
-    mode_key: str,
-    character_map: Dict[str, dict],
-    style: str,
-    output_dir: str,
-    scene_menu: list[dict] | list | None = None,
-    prop_menu: list[dict] | list | None = None,
-    sketch_colors: dict[str, str] | None = None,
-    ethnicity: str = "Chinese",
-    is_sketch: bool = False,
-    sketch_dir: str = "",
-    api_key: Optional[str] = None,
-    episode_grids_dir: str = "",
-) -> List[GridGenerationResult]:
-    """再生选中的 beats（支持 render 和 sketch 模式）。
-
-    从 REGEN_MODE_CONFIGS[mode_key] 读取 rows, cols, aspect_ratio, image_size，
-    使用 perfect_grid_split 分割后逐 grid 调用 generate_grid。
-
-    Args:
-        selected_beats: 选中的 beat 数据列表
-        mode_key: 再生模式 key，如 "1x1_9-16", "2x2_1-1"
-        character_map: 角色映射
-        style: 风格
-        output_dir: 输出目录
-        ethnicity: 种族
-        is_sketch: 是否为草图模式
-        sketch_dir: 草图目录
-        api_key: API key
-
-    Returns:
-        GridGenerationResult 列表
-    """
-    rows, cols, aspect_ratio, image_size = parse_regen_mode(mode_key)
-    capacity = rows * cols
-
-    # 分割 beats
-    grid_splits = perfect_grid_split(
-        len(selected_beats), max_grid=capacity, is_portrait=(rows != cols)
-    )
-    print(
-        f"[RegenBeats] mode={mode_key}, beats={len(selected_beats)}, "
-        f"splits={grid_splits}, aspect_ratio={aspect_ratio}"
-    )
-
-    generator = create_grid_generator(api_key)
-    results = []
-    beat_offset = 0
-
-    for grid_idx, (g_rows, g_cols) in enumerate(grid_splits, start=1):
-        grid_beat_count = g_rows * g_cols
-        grid_beats = selected_beats[beat_offset : beat_offset + grid_beat_count]
-        beat_offset += grid_beat_count
-
-        # UUID 命名避免多次再生时文件名冲突
-        output_path = str(Path(output_dir) / f"regen_{uuid.uuid4().hex[:12]}.png")
-
-        # 提取 beat 编号用于 location_beat_numbers
-        beat_numbers = [_generation_beat_number(b, i) for i, b in enumerate(grid_beats)]
-
-        # 从图片池构建 per-beat 草图路径
-        grid_beat_sketch_paths = None
-        if episode_grids_dir and not is_sketch:
-            from novelvideo.generators.pool_indexer import build_beat_sketch_paths
-
-            grid_beat_sketch_paths = build_beat_sketch_paths(
-                episode_grids_dir, beat_numbers
-            )
-
-        result = await generator.generate_grid(
-            beats=grid_beats,
-            character_map=character_map,
-            scene_menu=scene_menu,
-            prop_menu=prop_menu,
-            sketch_colors=sketch_colors,
-            style=style,
-            output_path=output_path,
-            ethnicity=ethnicity,
-            rows=g_rows,
-            cols=g_cols,
-            sketch=is_sketch,
-            sketch_dir=sketch_dir if not is_sketch else "",
-            location_beat_numbers=beat_numbers,
-            aspect_ratio_override=aspect_ratio,
-            image_size_override=image_size,
-            beat_sketch_paths=grid_beat_sketch_paths,
-        )
-        result.beat_start_index = beat_offset - grid_beat_count
-        result.beat_count = len(grid_beats)
-        result.grid_rows = g_rows
-        result.grid_cols = g_cols
-        results.append(result)
-
-        if result.success:
-            print(f"[RegenBeats] Grid {grid_idx} 成功: {result.grid_image_path}")
-        else:
-            print(f"[RegenBeats] Grid {grid_idx} 失败: {result.error}")
-
-    return results
 
 
 async def regenerate_selected_beats(

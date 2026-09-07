@@ -1,30 +1,35 @@
 ---
-version: 1.3.2
-attention: low
+version: 2.0.2
+attention: medium
 ---
-# v1.3.2
+# v2.0.2
 
 ## User-facing Highlights (zh)
 
-- **本地 ComfyUI 配置更简单**: MiniMax H3 现在以单一模型接入多个 Workflow，由虾驿根据文生视频、首帧或全能参考模式自动选择流程，并支持一键清理本地配置。
-- **视频生成模式更准确**: 画布选择的首帧、首尾帧等业务模式会在校验、计费、任务执行和历史恢复中保持一致，不再根据素材数量被静默改写。
-- **主线生成默认值优化**: 场景参考图提升为中等质量，主线视频模型列表加入 Seedance 2.0 Mini 并精简不推荐选项，同时将新小说上传上限调整为 512KB。
+- **视频参考能力进一步扩展**: 视频节点新增文件和网页链接参考，并支持从画布选择图片或视频作为参考素材、在提示词中替换引用素材；CE 推荐模型列表新增 Seedance 2.5。
+- **英文创作流程更加完整**: 完善前后端英文文案、英文剧本场景识别和 Fountain 格式指引，并确保英文剧本生成的资产继续使用原始语言。
+- **虾画创作效率提升**: 优化画布切换、节点对齐、历史资产、资产库管理和虾导消息体验，减少切换画布时的整页加载和重复操作。
+- **视频任务更稳定透明**: 在排队前检查缺失的提示词和参考素材，保留安全的上游错误原因，并确保已提交任务在组织 Key 轮换后仍能完成。
+- **账号与项目管理更方便**: 新增用户自助修改密码入口，并将项目名称长度上限统一为 64 个字符。
 
 ## User-facing Highlights (en)
 
-- **Simpler local ComfyUI setup**: MiniMax H3 now uses one model entry for multiple workflows, with RelayClaw selecting the appropriate text-to-video, first-frame, or all-reference workflow and an option to clear local configuration in one action.
-- **More accurate video generation modes**: Canvas selections such as first-frame and first/last-frame now remain consistent through validation, billing, task execution, and history restoration instead of being silently changed based on reference count.
-- **Improved mainline defaults**: Scene reference images now use medium quality, Seedance 2.0 Mini is available while less suitable mainline choices are hidden, and the new novel upload limit is set to 512KB.
+- **More flexible video references**: Video nodes now accept file and public web-link references, support picking image or video references directly from the canvas, and can replace referenced materials in prompts. Seedance 2.5 is included in the CE recommended model catalog.
+- **A more complete English workflow**: Frontend and backend English coverage, English screenplay scene parsing, and Fountain-format guidance have been improved, while generated assets preserve the screenplay's source language.
+- **Faster Canvas workflows**: Canvas switching, node alignment, generation history, asset management, and Xia Director messages have been refined to reduce full-page loading and repeated actions.
+- **More reliable and transparent video tasks**: Missing prompts and references are checked before queueing, safe upstream rejection details are retained, and accepted jobs can finish after an organization key rotation.
+- **Easier account and project management**: Users can now change their own password, and project names consistently support up to 64 characters.
 
-## New Features
+## Fixes
 
-- 简化本地 ComfyUI 配置，使用单一 MiniMax-H3-local 模型承载多个 Workflow，并支持一键清理配置 (#277).
-- 主线视频模型新增 Seedance 2.0 Mini，并保留已有项目和任务对旧模型的执行兼容性 (#267).
-
-## Bug Fixes
-
-- 修复首帧、首尾帧等视频生成模式会因参考图片数量而被错误改写的问题 (#273).
+- 修复视频任务缺少必要提示词或素材时仍进入队列的问题，并完善上游明确拒绝的错误分类 (#413, #454, #464).
+- 修复组织 Gateway Key 轮换后，已被上游接受的视频任务无法继续查询的问题 (#422).
+- 修复英文剧本场景标记识别、生成资产语言继承和任务进度翻译问题 (#441, #462, #463, #469).
+- 修复部分同步工作阻塞 API 事件循环，以及上传取消和并发锁处理问题 (#444).
 
 ## Improvements
 
-- 将场景参考图质量提升为 medium，并同步实际请求的计费参数；新小说上传限制调整为 512KB (#267).
+- 增加视频文件/链接参考、画布素材选择和提示词素材替换能力 (#419, #424).
+- 优化画布切换、节点对齐、历史资产、资产库和虾导交互体验 (#409, #412, #417, #435).
+- 完善英文界面覆盖、Fountain 剧本格式说明，并增加中英文硬编码检查 (#447, #448).
+- 新增 Seedance 2.5 推荐配置、自助修改密码和项目名称长度统一限制 (#450, #453, #458).

@@ -35,10 +35,12 @@ from novelvideo.freezone.video_node import (
     normalize_video_duration_for_backend,
     normalize_video_resolution,
     normalize_video_resolution_for_backend,
+    rename_video_character_library_item,
     resolve_freezone_video_backend,
     summarize_omni_reference_counts,
     sync_mainline_assets_into_library,
     validate_omni_reference_audio_durations,
+    validate_omni_reference_image_dimensions,
     validate_omni_reference_limits,
 )
 
@@ -81,6 +83,42 @@ def test_video_character_library_roundtrip(tmp_path: Path) -> None:
     deleted = delete_video_character_library_item(project_dir, item["id"])
     assert deleted is True
     assert load_video_character_library(project_dir) == []
+
+
+def test_video_character_library_rename_keeps_everything_else(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    item = add_video_character_library_item(
+        project_dir,
+        name="未命名",
+        image_urls=["/static/admin/58/freezone/_uploads/char.png"],
+        category="character",
+        folder="character",
+    )
+
+    renamed = rename_video_character_library_item(project_dir, item["id"], name="  林小满  ")
+
+    assert renamed is not None
+    assert renamed["name"] == "林小满"
+    # 改名只动名字：地址/类目/保存位置都得原样留着，画布上引用它的节点才不会裂。
+    assert renamed["image_urls"] == item["image_urls"]
+    assert renamed["category"] == "character"
+    assert renamed["folder"] == "character"
+    assert [it["name"] for it in load_video_character_library(project_dir)] == ["林小满"]
+
+
+def test_video_character_library_rename_rejects_bad_names(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    item = add_video_character_library_item(
+        project_dir, name="原名", image_urls=["/static/a.png"]
+    )
+
+    assert rename_video_character_library_item(project_dir, "missing", name="新名") is None
+    with pytest.raises(ValueError):
+        rename_video_character_library_item(project_dir, item["id"], name="   ")
+    with pytest.raises(ValueError):
+        rename_video_character_library_item(project_dir, item["id"], name="长" * 61)
+    # 校验失败不能把库写脏。
+    assert [it["name"] for it in load_video_character_library(project_dir)] == ["原名"]
 
 
 def test_video_character_library_category(tmp_path: Path) -> None:
@@ -643,6 +681,8 @@ def test_validate_omni_reference_limits_and_summary() -> None:
         "image_count": 9,
         "video_count": 3,
         "audio_count": 0,
+        "file_count": 0,
+        "link_count": 0,
         "total_count": 12,
     }
 
@@ -671,6 +711,32 @@ def test_validate_omni_reference_limits_and_summary() -> None:
             image_max=1,
             video_max=0,
             audio_max=0,
+            total_max=2,
+        )
+
+    validate_omni_reference_limits(
+        [
+            {"type": "image", "url": "/static/a.png"},
+            {"type": "file", "url": "/static/brief.pdf"},
+        ],
+        image_max=1,
+        video_max=0,
+        audio_max=0,
+        file_max=1,
+        link_max=1,
+        total_max=2,
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        validate_omni_reference_limits(
+            [
+                {"type": "file", "url": "/static/brief.pdf"},
+                {"type": "link", "url": "https://example.com/brief"},
+            ],
+            image_max=0,
+            video_max=0,
+            audio_max=0,
+            file_max=1,
+            link_max=1,
             total_max=2,
         )
 
@@ -763,3 +829,52 @@ def test_validate_reference_duration_uses_video_label() -> None:
             total_max_seconds=None,
             media_label="video",
         )
+
+
+def _write_png(path: Path, width: int, height: int) -> Path:
+    from PIL import Image
+
+    Image.new("RGB", (width, height), (255, 255, 255)).save(path, format="PNG")
+    return path
+
+
+def test_validate_omni_reference_image_dimensions_rejects_small_image(
+    tmp_path: Path,
+) -> None:
+    """3060 实例：338x191 的参考图被火山 HeightTooSmall 打回，要在入队前拦住。"""
+    small = _write_png(tmp_path / "logo.png", 338, 191)
+    ok = _write_png(tmp_path / "frame.png", 1280, 720)
+
+    with pytest.raises(ValueError) as exc:
+        validate_omni_reference_image_dimensions([str(ok), str(small)])
+
+    message = str(exc.value)
+    assert "logo.png" in message
+    assert "338x191" in message
+    assert "300" in message
+    assert "frame.png" not in message
+
+
+def test_validate_omni_reference_image_dimensions_accepts_valid_and_skips_unreadable(
+    tmp_path: Path,
+) -> None:
+    ok = _write_png(tmp_path / "frame.png", 1280, 720)
+    missing = tmp_path / "missing.png"
+    not_an_image = tmp_path / "notes.txt"
+    not_an_image.write_text("hello", encoding="utf-8")
+
+    validate_omni_reference_image_dimensions(
+        [str(ok), str(missing), str(not_an_image), ""]
+    )
+
+
+def test_validate_omni_reference_image_dimensions_rejects_extreme_aspect_ratio(
+    tmp_path: Path,
+) -> None:
+    banner = _write_png(tmp_path / "banner.png", 3000, 400)
+
+    with pytest.raises(ValueError) as exc:
+        validate_omni_reference_image_dimensions([str(banner)])
+
+    assert "banner.png" in str(exc.value)
+    assert "0.4" in str(exc.value) and "2.5" in str(exc.value)

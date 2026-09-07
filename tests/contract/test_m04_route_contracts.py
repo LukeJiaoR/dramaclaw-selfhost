@@ -65,6 +65,13 @@ class _M04Store:
     def get_all_characters(self):
         return list(self.characters.values())
 
+    async def list_characters(self):
+        return list(self.characters.values())
+
+    async def repair_path_unsafe_asset_names(self, kind: str, move_assets=None):
+        # 这里的名字都是干净的，list 接口上那道存量自愈是空跑。
+        return {}
+
     def get_character(self, name: str):
         return self.characters.get(name)
 
@@ -75,6 +82,9 @@ class _M04Store:
         character = self.characters[name]
         for key, value in updates.items():
             setattr(character, key, value)
+
+    async def touch_character_asset(self, name: str):
+        return name in self.characters
 
     async def rename_character(self, old_name: str, new_name: str):
         character = self.characters.pop(old_name)
@@ -170,6 +180,9 @@ class _FakeTaskBackend:
 def m04_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from novelvideo import project_config
     from novelvideo.api import auth as api_auth
+    # 在函数里 import：``test_m01_auth`` 会把 ``novelvideo.api.*`` 整片从
+    # ``sys.modules`` 弹掉以 CE 模式重建 app，模块级绑定到那时是死对象，打上去会落空。
+    from novelvideo.api import deps
     from novelvideo.api.deps import ProjectResolution
     from novelvideo.api.routes import characters, generation, projects, props, styles
     from novelvideo.services.style_service import StyleService
@@ -238,7 +251,7 @@ def m04_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         assert project == _PROJECT
         return ctx, "alice", _PROJECT, project_dir, str(project_dir), store
 
-    async def make_store_for_context(_ctx):
+    async def make_store_for_context(_ctx, **_kwargs):
         return store
 
     async def make_store(_username: str, _project: str):
@@ -252,6 +265,11 @@ def m04_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(projects, "resolve_project_context", resolve_project_context)
     monkeypatch.setattr(generation, "_resolve_generation_project", resolve_project_scope)
     monkeypatch.setattr(characters, "_resolve_character_project", resolve_character_project)
+    monkeypatch.setattr(characters, "make_sqlite_store_for_context", make_store_for_context)
+    # 打在 ``deps`` 上：角色列表 / identities 走 ``_character_project_scope``，里头的
+    # ``sqlite_store_for_context_scope`` 是按 ``deps`` 模块全局解析工厂的，打 route
+    # 模块够不着——同时也把 scope 的 ``finally: close()`` 纳进了这条合同的覆盖面。
+    monkeypatch.setattr(deps, "make_sqlite_store_for_context", make_store_for_context)
     monkeypatch.setattr(props, "make_sqlite_store_for_context", make_store_for_context)
     monkeypatch.setattr(props, "make_sqlite_store", make_store)
     monkeypatch.setattr(projects, "make_sqlite_store_for_context", make_store_for_context)

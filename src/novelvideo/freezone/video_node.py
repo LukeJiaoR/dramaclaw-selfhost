@@ -21,7 +21,6 @@ from novelvideo.video_duration import (
     video_duration_bounds_for_backend,
 )
 
-
 VIDEO_CAMERA_TEMPLATES: list[dict[str, str]] = [
     {
         "id": "locked_off",
@@ -206,7 +205,8 @@ def normalize_freezone_seedance2_scene_optimize(
 
 
 def normalize_video_resolution_for_backend(
-    backend: str | None, value: str | None,
+    backend: str | None,
+    value: str | None,
     configured_options: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     resolution = normalize_video_resolution(value)
@@ -235,7 +235,9 @@ def normalize_video_resolution_for_backend(
     return options[0]
 
 
-def freezone_video_duration_bounds(backend: str | None) -> tuple[int | None, int | None]:
+def freezone_video_duration_bounds(
+    backend: str | None,
+) -> tuple[int | None, int | None]:
     return video_duration_bounds_for_backend(backend)
 
 
@@ -252,7 +254,9 @@ def _freezone_newapi_video_options() -> dict[str, str]:
         return options
     ordered = {FREEZONE_DEFAULT_VIDEO_BACKEND: options[FREEZONE_DEFAULT_VIDEO_BACKEND]}
     ordered.update(
-        (key, value) for key, value in options.items() if key != FREEZONE_DEFAULT_VIDEO_BACKEND
+        (key, value)
+        for key, value in options.items()
+        if key != FREEZONE_DEFAULT_VIDEO_BACKEND
     )
     return ordered
 
@@ -281,8 +285,12 @@ def get_freezone_video_model_options() -> list[dict[str, Any]]:
                 {
                     "sceneOptimizeOptions": ["anime", "realistic"],
                     "scene_optimize_options": ["anime", "realistic"],
-                    "defaultSceneOptimize": default_freezone_seedance2_scene_optimize(backend),
-                    "default_scene_optimize": default_freezone_seedance2_scene_optimize(backend),
+                    "defaultSceneOptimize": default_freezone_seedance2_scene_optimize(
+                        backend
+                    ),
+                    "default_scene_optimize": default_freezone_seedance2_scene_optimize(
+                        backend
+                    ),
                 }
             )
         data.append(item)
@@ -321,7 +329,10 @@ def resolve_freezone_video_backend(model: str | None) -> str:
 
     from novelvideo.generators.video_generator import parse_newapi_video_backend
 
-    if parse_newapi_video_backend(text) and text not in FREEZONE_DISABLED_VIDEO_BACKENDS:
+    if (
+        parse_newapi_video_backend(text)
+        and text not in FREEZONE_DISABLED_VIDEO_BACKENDS
+    ):
         return text
     raise ValueError(f"unknown video model: {text}")
 
@@ -338,10 +349,25 @@ def is_freezone_seedance2_backend(backend: str | None) -> bool:
     return bool(model and model.startswith("seedance-2.0"))
 
 
+def is_freezone_seedance_backend(backend: str | None) -> bool:
+    """任何代际的 Seedance（1.0/1.5/2.x）——参考图尺寸规则只对它们成立。"""
+    text = str(backend or "").strip()
+    if text in {"seedance_2", "seedance_fast"}:
+        return True
+
+    from novelvideo.generators.huimengi import parse_huimeng_video_backend
+    from novelvideo.generators.video_generator import parse_newapi_video_backend
+
+    model = parse_newapi_video_backend(text) or parse_huimeng_video_backend(text)
+    return bool(model and model.startswith("seedance"))
+
+
 def is_freezone_happyhorse_backend(backend: str | None) -> bool:
     from novelvideo.generators.video_generator import parse_newapi_video_backend
 
-    model = parse_newapi_video_backend(backend) or _freezone_video_model_from_backend(backend)
+    model = parse_newapi_video_backend(backend) or _freezone_video_model_from_backend(
+        backend
+    )
     return model == "happyhorse-1.0"
 
 
@@ -353,7 +379,10 @@ def _coarse_mark_region(mark: dict[str, Any]) -> str:
         box_y = mark.get("box_y")
         box_width = mark.get("box_width")
         box_height = mark.get("box_height")
-        if all(isinstance(value, (int, float)) for value in [box_x, box_y, box_width, box_height]):
+        if all(
+            isinstance(value, (int, float))
+            for value in [box_x, box_y, box_width, box_height]
+        ):
             px = float(box_x) + float(box_width) / 2.0
             py = float(box_y) + float(box_height) / 2.0
     if isinstance(px, (int, float)) and isinstance(py, (int, float)):
@@ -364,7 +393,9 @@ def _coarse_mark_region(mark: dict[str, Any]) -> str:
 
 
 def format_video_marks(marks: list[dict[str, Any]] | None) -> str:
-    clean_marks = [mark for mark in (marks or []) if str(mark.get("label") or "").strip()]
+    clean_marks = [
+        mark for mark in (marks or []) if str(mark.get("label") or "").strip()
+    ]
     if not clean_marks:
         return ""
 
@@ -395,7 +426,9 @@ def build_freezone_video_prompt(
     if character_names:
         joined = "、".join(name for name in character_names if name)
         if joined:
-            parts.append(f"角色一致性要求：保持 {joined} 的外观、服装和身份特征稳定一致。")
+            parts.append(
+                f"角色一致性要求：保持 {joined} 的外观、服装和身份特征稳定一致。"
+            )
 
     marks_block = format_video_marks(marks)
     if marks_block:
@@ -473,7 +506,9 @@ def build_freezone_keyframe_video_prompt(
             "首帧约束：严格继承输入图片中的主体、构图、服装、光线和场景信息，把输入图作为视频首帧参考。"
         )
     elif has_last_frame:
-        parts.append("尾帧约束：以输入图片作为目标收束画面，确保镜头最终自然落到该主体状态和构图。")
+        parts.append(
+            "尾帧约束：以输入图片作为目标收束画面，确保镜头最终自然落到该主体状态和构图。"
+        )
 
     parts.append(
         "输出要求：生成单条连贯视频镜头，动作自然，运动平滑，避免闪烁、变形、跳帧、主体身份漂移和首尾帧跳变。"
@@ -503,7 +538,8 @@ def build_freezone_omni_video_prompt(
         parts.append(marks_block)
 
     parts.append(
-        "全能参考模式要求：综合文本、图像、视频和音频参考进行统一建模，优先保持主体身份、场景连续性、风格一致性和动作自然性。"
+        "全能参考模式要求：综合文本、图像、视频、音频、文件和网页链接参考进行统一建模，"
+        "优先保持主体身份、场景连续性、风格一致性和动作自然性。"
     )
     counts = summarize_omni_reference_counts(reference_items or [])
     single_video_reference_instruction = "这是视频参考生成新的视频，不是视频编辑。"
@@ -511,6 +547,8 @@ def build_freezone_omni_video_prompt(
         counts["video_count"] == 1
         and counts["image_count"] == 0
         and counts["audio_count"] == 0
+        and counts["file_count"] == 0
+        and counts["link_count"] == 0
         and single_video_reference_instruction not in "\n".join(parts)
     ):
         parts.append(single_video_reference_instruction)
@@ -524,11 +562,15 @@ def summarize_omni_reference_counts(items: list[dict[str, Any]]) -> dict[str, in
     image_count = sum(1 for item in items if str(item.get("type")) == "image")
     video_count = sum(1 for item in items if str(item.get("type")) == "video")
     audio_count = sum(1 for item in items if str(item.get("type")) == "audio")
+    file_count = sum(1 for item in items if str(item.get("type")) == "file")
+    link_count = sum(1 for item in items if str(item.get("type")) == "link")
     return {
         "image_count": image_count,
         "video_count": video_count,
         "audio_count": audio_count,
-        "total_count": image_count + video_count + audio_count,
+        "file_count": file_count,
+        "link_count": link_count,
+        "total_count": image_count + video_count + audio_count + file_count + link_count,
     }
 
 
@@ -538,6 +580,8 @@ def validate_omni_reference_limits(
     image_max: int = 9,
     video_max: int = 3,
     audio_max: int = 3,
+    file_max: int = 0,
+    link_max: int = 0,
     total_max: int = 12,
 ) -> None:
     counts = summarize_omni_reference_counts(items)
@@ -549,7 +593,161 @@ def validate_omni_reference_limits(
         raise ValueError(f"video references count must be <= {video_max}")
     if counts["audio_count"] > audio_max:
         raise ValueError(f"audio references count must be <= {audio_max}")
+    if counts["file_count"] > file_max:
+        raise ValueError(f"file references count must be <= {file_max}")
+    if counts["link_count"] > link_max:
+        raise ValueError(f"link references count must be <= {link_max}")
+    if counts["file_count"] and counts["link_count"]:
+        raise ValueError("reference_file and reference_link are mutually exclusive")
 
+
+# 火山 Seedance 对参考图的硬规则（从 400 报文里实测）：
+#   `[InvalidParameter.HeightTooSmall] Height must be between 300px and 6000px.`
+# 宽高比 0.4~2.5 与 seedance2_i2v/assets.py 里分镜路径用的同一组数字。
+MIN_OMNI_REFERENCE_IMAGE_PX = 300
+MAX_OMNI_REFERENCE_IMAGE_PX = 6000
+MIN_OMNI_REFERENCE_IMAGE_ASPECT = 0.4
+MAX_OMNI_REFERENCE_IMAGE_ASPECT = 2.5
+
+
+def _read_reference_image_size(path: Path) -> tuple[int, int] | None:
+    """只读文件头拿尺寸；读不出（文件不存在 / 不是图片）返回 None 交给厂商判。"""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            width, height = img.size
+    except Exception:  # noqa: BLE001 - 任何读取失败都不该替厂商拦请求
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return int(width), int(height)
+
+
+def validate_omni_reference_image_dimensions(
+    paths: list[str | Path | None],
+    *,
+    min_px: int = MIN_OMNI_REFERENCE_IMAGE_PX,
+    max_px: int = MAX_OMNI_REFERENCE_IMAGE_PX,
+    min_aspect: float = MIN_OMNI_REFERENCE_IMAGE_ASPECT,
+    max_aspect: float = MAX_OMNI_REFERENCE_IMAGE_ASPECT,
+) -> None:
+    """参考图尺寸兜底校验，入队前拦住厂商必拒的图，省掉一次预扣 + 上传 + 退款。
+
+    与 `validate_omni_reference_audio_durations` 同一口径：读不出尺寸的条目**不参与判定**。
+    先报边长越界，再报宽高比，两类同时出现时只报前者。
+    """
+    out_of_range: list[str] = []
+    bad_aspect: list[str] = []
+    for raw in paths:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        size = _read_reference_image_size(path)
+        if size is None:
+            continue
+        width, height = size
+        label = path.name or text
+        if not (min_px <= width <= max_px and min_px <= height <= max_px):
+            out_of_range.append(f"{label} ({width}x{height})")
+            continue
+        aspect = width / height
+        if not (min_aspect <= aspect <= max_aspect):
+            bad_aspect.append(f"{label} ({width}x{height}, {aspect:.2f})")
+    if out_of_range:
+        raise ValueError(
+            f"参考图尺寸不符合要求，宽度和高度需在 {min_px} 至 {max_px} 像素之间: "
+            + ", ".join(out_of_range)
+        )
+    if bad_aspect:
+        raise ValueError(
+            f"参考图宽高比需在 {min_aspect:g} 至 {max_aspect:g} 之间: "
+            + ", ".join(bad_aspect)
+        )
+
+
+async def run_trusted_freezone_video_gen(
+    *,
+    project_dir: Path,
+    job_id: str,
+    prompt: str,
+    egress_context: object,
+    task_type: str,
+    episode: int,
+    beat_num: int,
+    scope: str,
+    reference_items: list[dict[str, str]] | None = None,
+    aspect_ratio: str = "16:9",
+    resolution: str = "720p",
+    duration_seconds: int = 5,
+    generate_audio: bool = False,
+    human_review: bool = False,
+    scene_optimize: str | None = None,
+    backend: str = "newapi_seedance-2.0-fast",
+    last_frame_path: str | None = None,
+    audio_setting: str | None = None,
+    gen_mode: str | None = None,
+    model_params: dict[str, Any] | None = None,
+    request_schema: dict[str, Any] | None = None,
+) -> Path:
+    """Run the Freezone video leaf without losing its verified egress context."""
+
+    from novelvideo.freezone.jobs import outputs_dir
+    from novelvideo.generators.video_generator import (
+        ShotReference,
+        VideoGenStatus,
+        create_video_generator,
+    )
+
+    output_path = outputs_dir(project_dir, "freezone_video_gen") / f"{job_id}.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    references = [
+        ShotReference(
+            str(item.get("type") or "image"),
+            str(item.get("path") or ""),
+            str(item.get("role") or ""),
+        )
+        for item in (reference_items or [])
+        if str(item.get("path") or "").strip()
+    ]
+    generator = create_video_generator(
+        backend=backend,
+        resolution=resolution,
+        generate_audio=generate_audio,
+        model_params=model_params,
+        request_schema=request_schema,
+        egress_context=egress_context,
+    )
+    first_image = next((ref for ref in references if ref.type == "image"), None)
+    generate_kwargs: dict[str, Any] = {
+        "image_path": first_image.path if first_image is not None else None,
+        "prompt": prompt,
+        "output_path": str(output_path),
+        "aspect_ratio": aspect_ratio,
+        "duration": float(duration_seconds),
+        "last_frame_path": last_frame_path,
+        "references": references,
+        "human_review": bool(human_review),
+        "seedance2_config": (
+            {"scene_optimize": scene_optimize} if scene_optimize else None
+        ),
+        "gen_mode": gen_mode,
+        "egress_context": egress_context,
+        "task_type": task_type,
+        "episode": episode,
+        "beat_num": beat_num,
+        "scope": scope,
+    }
+    if audio_setting:
+        generate_kwargs["audio_setting"] = audio_setting
+    result = await generator.generate(**generate_kwargs)
+    if not result or result.status is not VideoGenStatus.DONE:
+        error = result.error if result else "video generation failed"
+        raise RuntimeError(f"freezone video generation failed: {error}")
+    if not output_path.exists():
+        raise RuntimeError("video generation returned success without output")
+    return output_path
 
 # 全能参考音频时长：厂商（doubao-seedance-2-0 / r2v）有**两条互相独立**的规则，
 # 两条都以 400 打回，只卡其中一条就等于没卡：
@@ -675,7 +873,9 @@ def load_video_character_library(project_dir: Path) -> list[dict[str, Any]]:
     return [item for item in data if isinstance(item, dict)]
 
 
-def save_video_character_library(project_dir: Path, items: list[dict[str, Any]]) -> None:
+def save_video_character_library(
+    project_dir: Path, items: list[dict[str, Any]]
+) -> None:
     path = video_character_library_path(project_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -940,6 +1140,34 @@ def add_video_character_library_item(
     )
     save_video_character_library(project_dir, items)
     return item
+
+
+# 资产名只用于展示，给个宽松上限防止有人贴一整段文案进来把列表撑爆。
+LIBRARY_ITEM_NAME_MAX_LEN = 60
+
+
+def rename_video_character_library_item(
+    project_dir: Path, item_id: str, *, name: str
+) -> dict[str, Any] | None:
+    """给资产库条目改名。条目不存在返回 ``None``，名字非法抛 ``ValueError``。
+
+    只动 ``name`` 和 ``updated_at``：URL / 类目 / 保存位置一概不碰，画布上已经引用
+    该素材的节点不受影响。和文件夹改名不同，素材名不要求唯一——同名素材在库里是
+    常态（同一角色的多张参考图）。
+    """
+    clean = name.strip()
+    if not clean:
+        raise ValueError("item name is required")
+    if len(clean) > LIBRARY_ITEM_NAME_MAX_LEN:
+        raise ValueError(f"item name must be <= {LIBRARY_ITEM_NAME_MAX_LEN} characters")
+    items = load_video_character_library(project_dir)
+    target = next((item for item in items if str(item.get("id")) == item_id), None)
+    if target is None:
+        return None
+    target["name"] = clean
+    target["updated_at"] = datetime.now().isoformat()
+    save_video_character_library(project_dir, items)
+    return target
 
 
 def delete_video_character_library_item(project_dir: Path, item_id: str) -> bool:

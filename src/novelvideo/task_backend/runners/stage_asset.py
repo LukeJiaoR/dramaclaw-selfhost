@@ -5,14 +5,45 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from novelvideo.egress_context import (
+    TRUSTED_EGRESS_CONTEXT_KEY,
+    TrustedEgressContext,
+    TrustedRunnerEnvelope,
+)
 from novelvideo.project_context import ProjectContext
 from novelvideo.task_backend.cancel import (
     raise_if_envelope_cancel_requested,
     remaining_timeout_seconds,
 )
+from novelvideo.task_backend.envelope import InvalidTaskEnvelope
 from novelvideo.task_backend.registry import register_project_task_runner
 from novelvideo.task_identity import project_task_state_key
 from novelvideo.task_state import get_task_manager
+
+SUPPORTED_STAGE_ASSET_STEPS = frozenset(
+    {
+        "single_face_sharp",
+        "pano_sharp",
+        "splat_collision",
+        "voxel_world_from_360",
+        "upload_scene_package",
+        "pano_from_master",
+        "pano_from_text",
+    }
+)
+
+
+def _extract_trusted_egress_context(
+    envelope: dict[str, Any],
+) -> TrustedEgressContext | None:
+    if type(envelope) is TrustedRunnerEnvelope:
+        context = envelope.get(TRUSTED_EGRESS_CONTEXT_KEY)
+        if type(context) is not TrustedEgressContext:
+            raise InvalidTaskEnvelope() from None
+        return context
+    if type(envelope) is not dict or TRUSTED_EGRESS_CONTEXT_KEY in envelope:
+        raise InvalidTaskEnvelope() from None
+    return None
 
 
 def _splat_format_for_path(path: Path) -> str:
@@ -60,6 +91,8 @@ def run_stage_asset(
     payload = envelope.get("payload") or {}
     scene_name = str(payload["scene_name"])
     step = str(payload["step"])
+    if step not in SUPPORTED_STAGE_ASSET_STEPS:
+        raise ValueError(f"unknown stage_asset step: {step}")
     params = dict(payload.get("params") or {})
     project_dir = Path(str(payload.get("project_dir") or ctx.output_dir))
     scope = envelope.get("scope")
@@ -152,10 +185,42 @@ def run_stage_asset(
             max_abs_coord=int(params.get("max_abs_coord", 96)),
             max_y=int(params.get("max_y", 64)),
             progress_callback=update,
+            egress_context=_extract_trusted_egress_context(envelope),
         )
     elif step in {"pano_from_master", "pano_from_text"}:
         source = "master" if step == "pano_from_master" else "text"
         artifact_dir = params.get("artifact_dir")
+        authority_payload = payload.get("scene_360_model_authority")
+        model_authority = None
+        if authority_payload is not None:
+            if (
+                type(envelope) is not TrustedRunnerEnvelope
+                or type(authority_payload) is not dict
+                or set(authority_payload)
+                != {"kind", "catalog_id", "provider", "model"}
+                or authority_payload.get("kind") != "catalog"
+            ):
+                raise InvalidTaskEnvelope() from None
+            catalog_id = authority_payload.get("catalog_id")
+            authority_provider = authority_payload.get("provider")
+            authority_model = authority_payload.get("model")
+            if any(
+                type(value) is not str or not value.strip()
+                for value in (catalog_id, authority_provider, authority_model)
+            ):
+                raise InvalidTaskEnvelope() from None
+            if (
+                authority_provider.strip().lower()
+                != str(params.get("provider") or "").strip().lower()
+                or authority_model.strip()
+                != str(params.get("model") or "").strip()
+            ):
+                raise InvalidTaskEnvelope() from None
+            model_authority = stage_asset_tasks.Scene360CatalogModelAuthority(
+                catalog_id=catalog_id.strip(),
+                provider=authority_provider.strip().lower(),
+                model=authority_model.strip(),
+            )
         result = stage_asset_tasks.run_scene_360(
             project_dir,
             scene_name,
@@ -180,6 +245,8 @@ def run_stage_asset(
                 int(params.get("timeout_seconds", 1800))
             ),
             progress_callback=update,
+            model_authority=model_authority,
+            egress_context=_extract_trusted_egress_context(envelope),
         )
     else:
         raise ValueError(f"unknown stage_asset step: {step}")
@@ -286,6 +353,7 @@ def run_scene_pano_generation(
             default_seconds=int(params.get("timeout_seconds", 1800)),
         ),
         progress_callback=update,
+        egress_context=_extract_trusted_egress_context(envelope),
     )
     check_cancel()
     if isinstance(result, dict):
@@ -442,4 +510,6 @@ def run_freezone_image_to_3gs(
     return result
 
 
-register_project_task_runner("freezone_image_to_3gs", run_freezone_image_to_3gs)
+register_project_task_runner(
+    "freezone_image_to_3gs", run_freezone_image_to_3gs, requires_home_node=False
+)

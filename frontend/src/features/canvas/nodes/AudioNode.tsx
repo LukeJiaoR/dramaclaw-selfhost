@@ -23,7 +23,7 @@ import {
 } from '@/features/canvas/domain/canvasNodes';
 import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
 import { useExternalFileHandoff } from '@/features/canvas/hooks/useExternalFileHandoff';
-import { resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
+import { localizeNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import {
   NodeHeader,
   NODE_HEADER_FLOATING_POSITION_CLASS,
@@ -37,6 +37,7 @@ import { CANVAS_NODE_PANEL_SURFACE_CLASS, canvasNodeFrameClass } from '@/feature
 import { useCanvasStore, useIsBoxSelecting } from '@/stores/canvasStore';
 import { AudioOperationsPanel } from '@/features/canvas/nodes/AudioOperationsPanel';
 import { useAudioGeneration } from '@/features/canvas/nodes/useAudioGeneration';
+import { createInFlightRequestCache } from '@/features/canvas/nodes/inFlightRequestCache';
 import { RegenerateButton } from '@/features/canvas/ui/RegenerateButton';
 import {
   hasMainlineContexts,
@@ -72,26 +73,10 @@ function isAudioFile(file: File): boolean {
   return AUDIO_UPLOAD_EXTENSIONS.has(ext);
 }
 
-// 模块级 references 缓存：同一 project 下所有音频节点共享一次拉取。
-// 用 Promise 而不是 result，保证多个节点同时挂载时也只发一次请求
-// （都 await 同一个 in-flight promise），不会出现并发风暴。
-const audioReferencesPromiseCache = new Map<
-  string,
-  Promise<Awaited<ReturnType<typeof fetchFreezoneAudioReferences>>>
->();
-
-function getCachedAudioReferences(project: string) {
-  let p = audioReferencesPromiseCache.get(project);
-  if (!p) {
-    p = fetchFreezoneAudioReferences(project).catch((err) => {
-      // 失败时把 promise 从缓存里清掉，下一次挂载有机会重试。
-      audioReferencesPromiseCache.delete(project);
-      throw err;
-    });
-    audioReferencesPromiseCache.set(project, p);
-  }
-  return p;
-}
+// 只合并同时发生的请求；settled 后立即失效，避免空结果在上传声线后仍被复用。
+const getCachedAudioReferences = createInFlightRequestCache(
+  fetchFreezoneAudioReferences,
+);
 
 export const AudioNode = memo(({ id, data, selected, width, height }: AudioNodeProps) => {
   const { t } = useTranslation();
@@ -123,8 +108,8 @@ export const AudioNode = memo(({ id, data, selected, width, height }: AudioNodeP
     !isGenerating && !data.audioUrl && generationError.length > 0;
 
   const resolvedTitle = useMemo(
-    () => resolveNodeDisplayName(CANVAS_NODE_TYPES.audio, data),
-    [data],
+    () => localizeNodeDisplayName(CANVAS_NODE_TYPES.audio, data, t),
+    [data, t],
   );
   const resolvedWidth = Math.max(MIN_WIDTH, Math.round(width ?? DEFAULT_WIDTH));
   const resolvedHeight = Math.max(MIN_HEIGHT, Math.round(height ?? DEFAULT_HEIGHT));
@@ -216,7 +201,13 @@ export const AudioNode = memo(({ id, data, selected, width, height }: AudioNodeP
         const res = await getCachedAudioReferences(project);
         if (cancelled) return;
         const first = (res.available ?? [])[0];
-        if (!first) return;
+        if (!first) {
+          updateNodeData(id, {
+            voiceAvailable: false,
+            voiceLabel: t('node.audioNode.noVoiceConfigured'),
+          });
+          return;
+        }
         const fresh = useCanvasStore.getState().nodes.find((n) => n.id === id);
         if (!fresh) return;
         const freshData = fresh.data as AudioNodeData;
@@ -256,6 +247,7 @@ export const AudioNode = memo(({ id, data, selected, width, height }: AudioNodeP
         }
         updateNodeData(id, {
           voiceRef: ref,
+          voiceAvailable: true,
           voiceLabel: nextLabel,
           voiceLanguage: nextLanguage,
         });
@@ -337,7 +329,7 @@ export const AudioNode = memo(({ id, data, selected, width, height }: AudioNodeP
           <div className="nodrag flex flex-col items-center px-5 text-center">
             <div className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-red-200">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-red-300/90" />
-              <span>生成失败</span>
+              <span>{t('node.audioNode.generateFailed')}</span>
             </div>
             <div
               className="mt-1 max-h-12 max-w-full overflow-y-auto break-words text-[11px] leading-4 text-red-100/76 [overflow-wrap:anywhere]"
@@ -349,14 +341,14 @@ export const AudioNode = memo(({ id, data, selected, width, height }: AudioNodeP
               <RegenerateButton
                 onClick={() => void generate()}
                 busy={isGenerating}
-                label="重试"
+                label={t('common.retry')}
               />
             </div>
           </div>
         ) : (
           <div className="flex flex-col items-center gap-2 text-text-muted/70">
             <Music2 className="h-7 w-7 opacity-60" />
-            <span className="text-[12px]">暂无音频</span>
+            <span className="text-[12px]">{t('node.audioNode.empty')}</span>
           </div>
         )}
       </div>

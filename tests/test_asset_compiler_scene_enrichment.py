@@ -14,10 +14,21 @@ async def _return_async(value):
 
 
 class _FakeSQLiteStore:
-    def __init__(self, scenes: list[NovelScene] | None = None):
+    def __init__(
+        self, scenes: list[NovelScene] | None = None, *, raw_content: str = ""
+    ):
+        # The real SQLiteStore owns episode content; CogneeStore only delegates
+        # to it. Keeping the fake the same way round means planners that talk to
+        # the SQLite store directly resolve content exactly as they do in
+        # production.
+        self.raw_content = raw_content
         self.scenes = {scene.name: scene for scene in scenes or []}
         self.added: list[NovelScene] = []
         self.updated: list[tuple[str, dict]] = []
+        self.patched: list[tuple[int, dict]] = []
+
+    async def load_episode_content(self, ep_num: int):
+        return self.raw_content
 
     async def get_scene(self, name: str):
         return self.scenes.get(name)
@@ -36,6 +47,12 @@ class _FakeSQLiteStore:
             setattr(scene, key, value)
         return True
 
+    async def patch_episode(self, episode_number: int, **updates):
+        # Menu writes go through the column-level patch so concurrent scene and
+        # prop planning cannot overwrite each other.
+        self.patched.append((episode_number, updates))
+        return None
+
 
 class _FakeCogneeStore:
     def __init__(
@@ -45,13 +62,13 @@ class _FakeCogneeStore:
         raw_content: str = "",
         project_dir: str = "",
     ):
-        self.sqlite_store = _FakeSQLiteStore(scenes)
+        self.sqlite_store = _FakeSQLiteStore(scenes, raw_content=raw_content)
         self.project_dir = project_dir
         self.raw_content = raw_content
         self.updated: list[tuple[int, dict]] = []
 
     async def load_episode_content(self, ep_num: int):
-        return self.raw_content
+        return await self.sqlite_store.load_episode_content(ep_num)
 
     async def update_episode(self, episode_number: int, **updates):
         self.updated.append((episode_number, updates))
@@ -374,7 +391,9 @@ async def test_compile_episode_scenes_uses_narrated_fallback_without_scene_heade
     assert new_count == 1
     assert scene_menu[0].scene_id == "医院走廊"
     assert store.sqlite_store.added[0].name == "医院走廊"
-    assert store.updated == [(1, {"scene_menu": scene_menu})]
+    # Both tracks take the column-level patch, so concurrent scene and prop
+    # planning cannot overwrite each other's menu.
+    assert store.sqlite_store.patched == [(1, {"scene_menu": scene_menu})]
 
 
 @pytest.mark.asyncio
@@ -446,7 +465,9 @@ async def test_drama_without_scene_headers_uses_semantic_scene_planning(monkeypa
 
     assert new_count == 1
     assert [item.scene_id for item in scene_menu] == ["医院走廊"]
-    assert store.updated == [(1, {"scene_menu": scene_menu})]
+    # Both tracks take the column-level patch, so concurrent scene and prop
+    # planning cannot overwrite each other's menu.
+    assert store.sqlite_store.patched == [(1, {"scene_menu": scene_menu})]
     assert any("项目类型仍保持精品剧" in message for message in logs)
 
 
@@ -619,7 +640,48 @@ async def test_compile_episode_scenes_persists_base_and_derived_as_normal_scenes
     assert [item.scene_id for item in scene_menu] == ["咖啡馆", "咖啡馆_暴雨版"]
     assert scene_menu[1].base_scene_id == "咖啡馆"
     assert scene_menu[1].variant_id == "暴雨版"
-    assert store.updated == [(1, {"scene_menu": scene_menu})]
+    # Both tracks take the column-level patch, so concurrent scene and prop
+    # planning cannot overwrite each other's menu.
+    assert store.sqlite_store.patched == [(1, {"scene_menu": scene_menu})]
+
+
+@pytest.mark.asyncio
+async def test_base_scene_reconcile_strips_english_time_before_persisting(monkeypatch):
+    import novelvideo.agents.asset_compiler as asset_compiler
+
+    async def fake_enrich(**kwargs):
+        return NovelScene(
+            name=kwargs["scene_name"],
+            scene_type=kwargs["scene_type"],
+            environment_prompt=ENRICHED_ENVIRONMENT_PROMPT,
+        )
+
+    monkeypatch.setattr(
+        asset_compiler,
+        "enrich_scene_environment_from_context",
+        fake_enrich,
+    )
+    store = _FakeCogneeStore()
+    compiler = asset_compiler.AssetCompiler(store)
+
+    created = await compiler._apply_base_scene_reconcile_output(
+        asset_compiler.EpisodeBaseSceneReconcileOutput(
+            scenes=[
+                asset_compiler.BaseSceneReconcileDecision(
+                    action="create",
+                    scene_name="Seoul Subway Station 11:47 PM",
+                    scene_type="interior",
+                    evidence_lines=["Location: Seoul Subway Station"],
+                )
+            ]
+        ),
+        "Location: Seoul Subway Station\nTime: 11:47 PM",
+        SimpleNamespace(number=1),
+        lambda _message: None,
+    )
+
+    assert created == ["Seoul Subway Station"]
+    assert sorted(store.sqlite_store.scenes) == ["Seoul Subway Station"]
 
 
 @pytest.mark.asyncio
@@ -699,3 +761,29 @@ def test_derived_scene_normalization_filters_plain_time_but_keeps_stable_light_p
     )
 
     assert [item.label for item in normalized] == ["暴雨夜霓虹版"]
+
+
+@pytest.mark.asyncio
+async def test_menu_writes_go_through_the_column_patch(tmp_path):
+    """Every project gets the race-free write, whichever track it is on."""
+    import json
+
+    from novelvideo.agents.asset_compiler import AssetCompiler
+    from novelvideo.knowledge_pipeline import (
+        KNOWLEDGE_PIPELINE_KEY, KNOWLEDGE_PIPELINE_STRUCTURED,
+    )
+
+    state_dir = tmp_path / "structured"
+    state_dir.mkdir()
+    (state_dir / "project_config.json").write_text(
+        json.dumps({KNOWLEDGE_PIPELINE_KEY: KNOWLEDGE_PIPELINE_STRUCTURED}),
+        encoding="utf-8",
+    )
+
+    store = _FakeCogneeStore(project_dir=str(state_dir))
+    store.state_dir = str(state_dir)
+    compiler = AssetCompiler(store)
+    await compiler._write_menus(1, scene_menu=[])
+
+    assert store.sqlite_store.patched == [(1, {"scene_menu": []})]
+    assert store.updated == []

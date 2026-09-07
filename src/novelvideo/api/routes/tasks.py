@@ -17,6 +17,7 @@ from novelvideo.api.auth import (
     get_api_user_or_query,
     verify_credential_for_request,
 )
+from novelvideo.i18n_message import has_localizable_log, log_lines_text
 from novelvideo.ports import get_project_access, get_task_backend
 from novelvideo.project_context import ProjectContext, resolve_project_context
 from novelvideo.task_backend.limits import (
@@ -115,15 +116,17 @@ def _serialize_task_timestamp(value: str) -> str:
     return parsed.isoformat().replace("+00:00", "Z")
 
 
-async def _sse_token_still_valid(request: Request, last_check: float) -> tuple[bool, float]:
+async def _sse_token_still_valid(
+    request: Request, last_check: float
+) -> tuple[bool, float]:
     now = asyncio.get_event_loop().time()
     if now - last_check < _SSE_REVERIFY_INTERVAL_S:
         return True, last_check
     try:
         user = await verify_credential_for_request(request)
     except Exception:
-        logger.debug("SSE credential recheck failed", exc_info=True)
-        return True, last_check
+        logger.debug("SSE credential recheck failed")
+        return False, now
     return (user is not None), now
 
 
@@ -211,11 +214,46 @@ def _sanitize_task_result_for_client(value: Any, *, ctx: ProjectContext | None) 
             if isinstance(item, str) and _is_local_abs_path_value(item):
                 continue
             if isinstance(item, list) and any(
-                isinstance(path, str) and _is_local_abs_path_value(path) for path in item
+                isinstance(path, str) and _is_local_abs_path_value(path)
+                for path in item
             ):
                 continue
         sanitized[key_text] = _sanitize_task_result_for_client(item, ctx=ctx)
     return sanitized
+
+
+def _current_task_message_fields(metadata: dict | None) -> dict:
+    """把 current_task 的 i18n code/params 摊平到响应顶层。
+
+    存储层为了不给 CE tasks 表和 EE ee_task_states 加列，把 code/params 塞在
+    metadata 里；对外仍然给独立字段，前端不用知道这个存储细节。
+    没有 code 时不下发字段，前端直接回落到 current_task 的中文。
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    message = metadata.get("current_task_message")
+    if not isinstance(message, dict) or not message.get("code"):
+        return {}
+    return {
+        "current_task_code": message["code"],
+        "current_task_params": message.get("params") or {},
+    }
+
+
+def _task_log_fields(entries: list | None) -> dict:
+    """`logs` 的对外形状。
+
+    `logs` 从一开始就是 `string[]`，老前端拿到就 `logs.join("\\n")`，所以存储层的
+    `{text, code, params}` 条目**不能**从这个字段出去——滚动发布期间新后端配老前端、
+    或者用户手上还开着缓存的旧页面，日志就会显示/下载成一串 `[object Object]`。
+    这里把它压回中文字符串，结构化条目另走 `logs_i18n`，新前端优先读它，没有再回落
+    到 `logs`。这样前后端不需要原子部署，外部调用方也不会被打断。
+    """
+    fields: dict = {"logs": log_lines_text(entries)}
+    # 没有任何一条带 code 时不下发这个字段，省得给每个任务白挂一份重复日志。
+    if has_localizable_log(entries):
+        fields["logs_i18n"] = list(entries or [])
+    return fields
 
 
 def _serialize_task(t: TaskState, *, ctx: ProjectContext | None = None) -> dict:
@@ -254,6 +292,7 @@ def _serialize_task(t: TaskState, *, ctx: ProjectContext | None = None) -> dict:
     payload = asdict(t)
     for field in ("created_at", "updated_at", "completed_at", "expires_at"):
         payload[field] = _serialize_task_timestamp(payload.get(field, ""))
+    payload.update(_task_log_fields(payload.get("logs")))
     payload["result"] = _sanitize_task_result_for_client(payload.get("result"), ctx=ctx)
     payload["status"] = _effective_task_status(t)
     return {
@@ -262,6 +301,16 @@ def _serialize_task(t: TaskState, *, ctx: ProjectContext | None = None) -> dict:
         "task_key": key,
         "task_type_label": task_type_label,
         "display_name": display_name,
+        # display_name 一律是中文：要么这里按 task_type 拼，要么调用方
+        # (freezone / scripts 的 task_display) 传的写死中文，两者英文界面下都不能直接用，
+        # 所以默认可本地化，前端按 task_type / metadata 重拼。
+        #
+        # 只有真正的用户自定义名称（画布名、素材名之类）不能翻译，那种由生产者在
+        # metadata 里显式标 `display_name_user_content: True` 退出本地化。注意
+        # task_display 全部由服务端构造、请求体注入不进来，所以这个标记必须是后端
+        # 自己打的，不能改成读客户端字段。
+        "display_name_localizable": not bool(metadata.get("display_name_user_content")),
+        **_current_task_message_fields(t.metadata),
     }
 
 
@@ -274,7 +323,9 @@ def _remaining(limit: int | None, active: int) -> int | None:
 @router.get("/projects/{project}/tasks")
 async def list_project_tasks(project: str, user: dict = Depends(get_api_user)):
     """列出单个项目的任务。生产多节点路径由 OpenResty 路由到项目 home node。"""
-    ctx = await resolve_project_context(user=user, project_id=project, required_role="viewer")
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="viewer"
+    )
     mgr = get_task_manager()
     tasks = await run_in_threadpool(mgr.list_tasks_for_project, ctx)
     tasks.sort(key=lambda task: task.updated_at or task.created_at or "", reverse=True)
@@ -284,7 +335,9 @@ async def list_project_tasks(project: str, user: dict = Depends(get_api_user)):
 @router.get("/projects/{project}/tasks/limits")
 async def get_project_task_limits(project: str, user: dict = Depends(get_api_user)):
     """查询单个项目各队列的项目池和当前用户额度。"""
-    ctx = await resolve_project_context(user=user, project_id=project, required_role="viewer")
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="viewer"
+    )
     mgr = get_task_manager()
     eligible_user_count = await get_project_access().count_project_task_eligible_users(
         project_id=ctx.project_id,
@@ -316,23 +369,29 @@ async def get_project_task_limits(project: str, user: dict = Depends(get_api_use
 
 
 @router.delete("/projects/{project}/tasks/completed")
-async def clear_project_completed_tasks(project: str, user: dict = Depends(get_api_user)):
+async def clear_project_completed_tasks(
+    project: str, user: dict = Depends(get_api_user)
+):
     """删除单个项目的已完成任务记录。"""
-    ctx = await resolve_project_context(user=user, project_id=project, required_role="editor")
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="editor"
+    )
     mgr = get_task_manager()
 
     def clear_completed() -> int:
         deleted = 0
         for task in mgr.list_tasks_for_project(ctx):
             if _effective_task_status(task) == "completed":
-                mgr.delete_task_for_project(
+                was_deleted = mgr.delete_task_for_project(
                     ctx,
                     task.task_type,
                     task.episode,
                     beat_num=task.beat_num,
                     scope=task.scope,
+                    expected_task_id=task.task_id,
                 )
-                deleted += 1
+                if was_deleted:
+                    deleted += 1
         return deleted
 
     deleted = await run_in_threadpool(clear_completed)
@@ -344,12 +403,18 @@ async def get_project_task(
     project: str,
     task_type: str,
     episode: int,
-    beat_num: int = Query(None, description="Beat 编号（single_video 等按 beat 区分的任务需要）"),
-    scope: str | None = Query(None, description="任务作用域（mode_key、grid_index 等）"),
+    beat_num: int = Query(
+        None, description="Beat 编号（single_video 等按 beat 区分的任务需要）"
+    ),
+    scope: str | None = Query(
+        None, description="任务作用域（mode_key、grid_index 等）"
+    ),
     user: dict = Depends(get_api_user),
 ):
     """查询单个项目内指定任务的状态。"""
-    ctx = await resolve_project_context(user=user, project_id=project, required_role="viewer")
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="viewer"
+    )
     mgr = get_task_manager()
     task = await run_in_threadpool(
         mgr.get_task_for_project,
@@ -380,7 +445,9 @@ async def stream_project_tasks(
     user: dict = Depends(get_api_user_or_query),
 ):
     """项目级 SSE 任务流。OpenResty 可按 project_id 路由到 home node。"""
-    ctx = await resolve_project_context(user=user, project_id=project, required_role="viewer")
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="viewer"
+    )
 
     async def event_generator():
         mgr = get_task_manager()
@@ -404,6 +471,20 @@ async def stream_project_tasks(
         }
 
         while True:
+            try:
+                still_valid, last_auth_check = await _sse_token_still_valid(
+                    request, last_auth_check
+                )
+            except Exception:
+                logger.debug("SSE credential recheck failed")
+                still_valid = False
+            if not still_valid:
+                yield {
+                    "event": "auth_revoked",
+                    "data": json.dumps({"reason": "unauthorized"}),
+                }
+                return
+
             tasks = await run_in_threadpool(mgr.list_tasks_for_project, ctx)
             seen: set[str] = set()
             for t in tasks:
@@ -434,14 +515,6 @@ async def stream_project_tasks(
                 }
                 last_heartbeat = now
 
-            still_valid, last_auth_check = await _sse_token_still_valid(request, last_auth_check)
-            if not still_valid:
-                yield {
-                    "event": "auth_revoked",
-                    "data": json.dumps({"reason": "credential revoked or expired"}),
-                }
-                return
-
             await asyncio.sleep(interval)
 
     return EventSourceResponse(event_generator())
@@ -459,7 +532,9 @@ async def stream_project_task(
     user: dict = Depends(get_api_user_or_query),
 ):
     """项目级单任务 SSE 端点。"""
-    ctx = await resolve_project_context(user=user, project_id=project, required_role="viewer")
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="viewer"
+    )
 
     async def event_generator():
         last_progress = -1.0
@@ -467,11 +542,17 @@ async def stream_project_task(
         last_auth_check = asyncio.get_event_loop().time()
         not_found_deadline = None
         while True:
-            still_valid, last_auth_check = await _sse_token_still_valid(request, last_auth_check)
+            try:
+                still_valid, last_auth_check = await _sse_token_still_valid(
+                    request, last_auth_check
+                )
+            except Exception:
+                logger.debug("SSE credential recheck failed")
+                still_valid = False
             if not still_valid:
                 yield {
                     "event": "auth_revoked",
-                    "data": json.dumps({"reason": "credential revoked or expired"}),
+                    "data": json.dumps({"reason": "unauthorized"}),
                 }
                 return
 
@@ -502,7 +583,9 @@ async def stream_project_task(
             not_found_deadline = None
 
             effective_status = _effective_task_status(task)
-            changed = (task.progress != last_progress) or (task.current_task != last_task)
+            changed = (task.progress != last_progress) or (
+                task.current_task != last_task
+            )
             is_terminal = effective_status in ("completed", "failed", "cancelled")
 
             if changed or is_terminal:
@@ -510,7 +593,8 @@ async def stream_project_task(
                     "status": effective_status,
                     "progress": round(task.progress, 3),
                     "current_task": task.current_task,
-                    "logs": task.logs[-100:],
+                    **_task_log_fields(task.logs[-100:]),
+                    **_current_task_message_fields(task.metadata),
                 }
                 if is_terminal:
                     payload["result"] = task.result
@@ -538,8 +622,12 @@ async def cancel_project_task_route(
     project: str,
     task_type: str,
     episode: int,
-    beat_num: int = Query(None, description="Beat 编号（single_video 等按 beat 区分的任务需要）"),
-    scope: str | None = Query(None, description="任务作用域（mode_key、grid_index 等）"),
+    beat_num: int = Query(
+        None, description="Beat 编号（single_video 等按 beat 区分的任务需要）"
+    ),
+    scope: str | None = Query(
+        None, description="任务作用域（mode_key、grid_index 等）"
+    ),
     force: bool = Query(False, description="确认终止已开始执行的任务"),
     acknowledge_no_refund: bool = Query(False, description="确认运行中终止不退积分"),
     user: dict = Depends(get_api_user),
@@ -549,7 +637,9 @@ async def cancel_project_task_route(
     队列态任务通过原子状态迁移取消并退款。运行中任务首次请求返回 409，
     只有再次明确确认“不退款”后才发送协作取消标记和 Celery revoke。
     """
-    ctx = await resolve_project_context(user=user, project_id=project, required_role="editor")
+    ctx = await resolve_project_context(
+        user=user, project_id=project, required_role="editor"
+    )
     logger.info(
         "[%s] EP%d cancel_project_task: type=%s, beat=%s, scope=%s",
         project,

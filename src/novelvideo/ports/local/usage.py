@@ -8,9 +8,19 @@ from novelvideo.llm_instrumentation import (
     clear_llm_usage_context,
     set_llm_usage_context,
 )
+from novelvideo.ports.usage import (
+    FeatureSettlementResolution,
+    VerifiedTaskSettlementIdentity,
+)
 
 
 class NoOpUsageMeter:
+    async def resolve_feature_credit_reservation(
+        self,
+        identity: VerifiedTaskSettlementIdentity,
+    ) -> FeatureSettlementResolution:
+        return FeatureSettlementResolution(outcome="not_applicable")
+
     async def reserve_current_model_call_credit(
         self,
         *,
@@ -29,6 +39,15 @@ class NoOpUsageMeter:
         reservation_id: str,
         *,
         metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        return None
+
+    async def update_current_model_call_log(
+        self,
+        *,
+        request_payload: Optional[dict[str, Any]] = None,
+        response_payload: Optional[dict[str, Any]] = None,
+        error_message: str = "",
     ) -> None:
         return None
 
@@ -118,6 +137,29 @@ class NoOpUsageMeter:
             "status": "completed",
         }
 
+    async def mark_feature_credit_settlement_for_review(
+        self,
+        reservation_id: str,
+        *,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        return {
+            "reservation_id": reservation_id,
+            "action": "review",
+            "status": "awaiting",
+        }
+
+    async def mark_model_call_credit_settlement_for_review(
+        self,
+        reservation_id: str,
+        *,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        return {
+            "reservation_id": reservation_id,
+            "action": "review",
+            "status": "awaiting",
+        }
     async def mark_current_paid_execution_attempt(
         self,
         *,

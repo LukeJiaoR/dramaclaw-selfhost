@@ -2,15 +2,22 @@
 // Copyright (c) 2026 ClaymoreLab
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
+// 这里取的是 i18next 默认实例（`@/i18n` 初始化的就是它）。不 import `@/i18n`
+// 本身，是因为那个模块会顺带拉进 react-i18next / HttpBackend，把它塞进这条被
+// 到处 import 的底层链路上，会让所有 mock 掉 react-i18next 的测试在 import 期炸掉。
+import i18n from "i18next";
 
 import type { PanoViewerManifest } from "@/features/viewer-kit/pano/panoManifest";
 import type { DirectorStageManifest } from "@/features/viewer-kit/three-d/directorManifest";
-import { api } from "@/lib/api";
+import { api, uploadApi } from "@/lib/api";
 import { jsonWithBackendError } from "@/lib/api-errors";
 import { p } from "@/lib/api-path";
 import { queryKeys } from "@/lib/query-keys";
+import { invalidateAssetReferences } from "@/lib/queries/asset-references";
+import { seedance2BeatStatusKey } from "@/lib/queries/video";
 import type { ApiResponse, ErrorResponse, OkResponse, TaskResponse } from "@/types/api";
 import type { Beat } from "@/types/episode";
+import type { RejectedDispatch } from "@/types/render-plan";
 
 // Mirrors backend `PoolImage` (novelvideo/models.py) plus the route-injected
 // `cell_url` / `grid_url` / `stale` fields from `GET /grids`.
@@ -269,7 +276,7 @@ export function useUploadBeatBackgroundAnchor(project: string, episode: number, 
     mutationFn: ({ file }: { file: File }) => {
       const form = new FormData();
       form.append("file", file, file.name);
-      return api
+      return uploadApi
         .post(
           p`api/v1/projects/${project}/episodes/${episode}/beats/${beatNum}/background-anchor/upload`,
           { body: form },
@@ -326,12 +333,19 @@ export function useCropBeatBackgroundAnchor(project: string, episode: number, be
   });
 }
 
-// Mirrors backend response from /sketches/generate-missing-manual:
-// scopes / segments are surfaced for diagnostics only (not currently rendered).
+// Mirrors backend response from /sketches/generate-missing-manual.
+// `scopes` / `segments` are informational (not currently rendered). `rejected`
+// is NOT: it reports the entries a concurrency lane refused, and re-dispatch is
+// driven off it. This endpoint is self-healing — the backend recomputes
+// `missing_manual_shot_segments` on every call — so re-dispatching the refused
+// part is literally the same request again: no body change, no scope, no new
+// parameter. Never widen the request to replay (that double-bills the part
+// that WAS dispatched). See TCP-P65.
 export interface GenerateMissingManualResult {
   dispatched: number;
   scopes: string[];
   segments: number[][];
+  rejected?: RejectedDispatch[];
 }
 
 export function useGenerateMissingManualSketches(
@@ -395,7 +409,7 @@ export function usePoolSelect(project: string, episode: number) {
         )
         .json<PoolSelectResponse>();
       if (!res.ok) {
-        const msg = res.error ?? "选择失败";
+        const msg = res.error ?? i18n.t("episode.sketches.selectFailed");
         if (res.stale) throw new StalePoolSelectError(msg);
         throw new Error(msg);
       }
@@ -437,6 +451,14 @@ export function usePoolSelect(project: string, episode: number) {
             };
           },
         );
+        // The canonical frame file this rewrites also backs the "current
+        // render" asset in the video pane's Reference details, which reads
+        // seedance2 beat status. Without this the panel keeps the pre-switch
+        // thumbnail (staleTime is 30s and window-focus refetch is off).
+        // Scoped to this beat so we don't refetch status for the whole episode.
+        qc.invalidateQueries({
+          queryKey: seedance2BeatStatusKey(project, episode, beatNum),
+        });
       }
       if (patched?.sketch_url) {
         qc.invalidateQueries({
@@ -492,6 +514,9 @@ export function useAssignColors(project: string, episode: number) {
       qc.invalidateQueries({
         queryKey: queryKeys.episodeDetail(project, episode),
       });
+      // Colour binding is what writes detected_identities / detected_props,
+      // i.e. exactly the fields the on-demand asset usage lists are built from.
+      invalidateAssetReferences(qc, project);
     },
   });
 }
@@ -526,6 +551,7 @@ export function useDetectIdentities(project: string, episode: number) {
       if (!res.ok) return;
       qc.invalidateQueries({ queryKey: queryKeys.beats(project, episode) });
       qc.invalidateQueries({ queryKey: queryKeys.script(project, episode) });
+      invalidateAssetReferences(qc, project);
     },
   });
 }
@@ -547,7 +573,7 @@ export function useUploadBeatImage(
     mutationFn: ({ beatNum, file }: { beatNum: number; file: File }) => {
       const body = new FormData();
       body.append("file", file, file.name);
-      return api
+      return uploadApi
         .post(
           p`api/v1/projects/${project}/episodes/${episode}/beats/${beatNum}/${imageType}/upload`,
           { body },
@@ -696,7 +722,7 @@ export function useUploadGrid(project: string, episode: number) {
       body.append("grid_type", gridType);
       body.append("mode_key", modeKey);
       body.append("beat_numbers", beatNumbers.join(","));
-      return api
+      return uploadApi
         .post(
           p`api/v1/projects/${project}/episodes/${episode}/grids/${gridIndex}/upload`,
           { body },

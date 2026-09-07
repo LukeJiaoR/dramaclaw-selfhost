@@ -30,7 +30,6 @@ import { useCharacters } from "@/lib/queries/characters";
 import {
   derivePipelineEpisodeStatuses,
   isPlanEpisodeAssetsResult,
-  useEpisodeBeats,
   useEpisodeDetail,
   useEpisodes,
   usePipelineStatus,
@@ -40,8 +39,10 @@ import {
   usePlanIdentities,
 } from "@/lib/queries/episodes";
 import { deriveEpisodeStats, type EpisodeStats } from "@/lib/episode-stats";
+import { episodeDisplayTitle } from "@/lib/episode-title";
 import { useStageTask } from "@/hooks/use-stage-task";
 import { useTaskController } from "@/hooks/use-task-controller";
+import { useTaskActivity } from "@/task-center/use-task-activity";
 import { TASK_TYPES } from "@/lib/task-types";
 import { queryKeys } from "@/lib/query-keys";
 import {
@@ -143,10 +144,6 @@ function EpisodeHeaderLayout({
 
 // ─── Top bar ────────────────────────────────────────────────────────────────
 
-function episodeDisplayTitle(episode: Episode, episodeNumberLabel: string) {
-  return episode.title?.trim() || episodeNumberLabel;
-}
-
 function EpisodeTitleSwitcher({
   selectedEpisode,
   episodes,
@@ -158,8 +155,9 @@ function EpisodeTitleSwitcher({
 }) {
   const { t } = useTranslation();
   const currentTitle = episodeDisplayTitle(
-    selectedEpisode,
-    t("episode.list.episodeNumber", { n: selectedEpisode.number }),
+    selectedEpisode.number,
+    selectedEpisode.title,
+    t,
   );
 
   if (episodes.length <= 1) {
@@ -198,10 +196,7 @@ function EpisodeTitleSwitcher({
           <div className="max-h-[min(62vh,26rem)] overflow-y-auto overscroll-contain pr-1">
             {episodes.map((episode) => {
               const isCurrent = episode.number === selectedEpisode.number;
-              const title = episodeDisplayTitle(
-                episode,
-                t("episode.list.episodeNumber", { n: episode.number }),
-              );
+              const title = episodeDisplayTitle(episode.number, episode.title, t);
               const lines = countContentLines(
                 episode.beat_source_text || episode.raw_content,
               );
@@ -285,9 +280,14 @@ function TopBar({
   const { t } = useTranslation();
   const episodeNumber = selectedEpisode?.number ?? 0;
   const { data: episodeDetailRes } = useEpisodeDetail(project, episodeNumber);
-  const { data: beatsRes } = useEpisodeBeats(project, episodeNumber);
   const episodeDetail = episodeDetailRes?.data ?? selectedEpisode;
-  const beatCount = beatsRes?.data.length ?? 0;
+  // Same `beat_count` the cards read, from the list response — this header used
+  // to pull the auto-selected episode's whole beats payload just to take
+  // `.length`. Auto-selection is not a signal the user is heading into that
+  // episode, so nothing was being usefully prefetched: it was one more full
+  // beats request (sketch/frame/video URLs, an ffprobe per audio clip) on every
+  // visit to this page, for one integer already present in the list.
+  const beatCount = selectedEpisode?.beat_count ?? 0;
   const sourceLineCount = countContentLines(
     episodeDetail?.beat_source_text || episodeDetail?.raw_content,
   );
@@ -488,6 +488,7 @@ function EpisodePlanShortcut({
   promotion,
   pending,
   disabled = false,
+  disabledReason,
   onClick,
 }: {
   icon: React.ReactNode;
@@ -497,6 +498,7 @@ function EpisodePlanShortcut({
   promotion?: CreditPromotionDisplay | null;
   pending: boolean;
   disabled?: boolean;
+  disabledReason?: string | null;
   onClick: () => void;
 }) {
   return (
@@ -517,7 +519,7 @@ function EpisodePlanShortcut({
         onKeyDown={(event) => event.stopPropagation()}
         disabled={pending || disabled}
         aria-label={actionLabel}
-        title={actionLabel}
+        title={disabledReason || actionLabel}
         className="h-7 shrink-0 gap-1 rounded-[7px] bg-transparent px-2 text-[11px] font-normal text-foreground shadow-none transition-colors hover:bg-primary/12 hover:text-primary disabled:bg-transparent disabled:text-muted-foreground/50 [&_svg]:size-3"
       >
         {pending ? (
@@ -540,6 +542,8 @@ function EpisodeListItem({
   onSelect,
   identityCostDisplay,
   identityPromotion,
+  identityDisabledReason,
+  sceneDisabledReason,
   sceneCostDisplay,
   scenePromotion,
   propCostDisplay,
@@ -550,16 +554,19 @@ function EpisodeListItem({
   onSelect: () => void;
   identityCostDisplay?: string | null;
   identityPromotion?: CreditPromotionDisplay | null;
+  identityDisabledReason?: string | null;
+  sceneDisabledReason?: string | null;
   sceneCostDisplay?: string | null;
   scenePromotion?: CreditPromotionDisplay | null;
   propCostDisplay?: string | null;
   propPromotion?: CreditPromotionDisplay | null;
 }) {
   const { t } = useTranslation();
-  // 镜头数量 = 该集 beats 数。复用既有的 beats 查询（无需后端新增字段）；react-query
-  // 会缓存，进入该集详情时本就要拉这份数据。未就绪时不显示，避免闪烁。
-  const { data: beatsRes } = useEpisodeBeats(project, episode.number);
-  const shotCount = beatsRes?.data.length;
+  // 镜头数直接读列表接口带出的 beat_count。这里曾经是 useEpisodeBeats(episode.number)
+  // ——每张卡片自己拉一次该集的完整 beats 载荷，只为取 .length。列表有几集就发几个
+  // 请求，每个都要解析项目上下文、开库、给每个 beat 拼 sketch/frame/video URL 并对
+  // 每条音频 fork 一次 ffprobe。改成后端一次 GROUP BY 带出来，这一页的扇出归零。
+  const shotCount = episode.beat_count;
   const planIdentities = usePlanIdentities(project);
   const identityTask = useStageTask({
     taskType: "identity_planner",
@@ -636,8 +643,7 @@ function EpisodeListItem({
       );
     },
   });
-  const title =
-    episode.title?.trim() || t("episode.list.episodeNumber", { n: episode.number });
+  const title = episodeDisplayTitle(episode.number, episode.title, t);
   const snippet = (episode.summary || "")
     .replace(/\s+/g, " ")
     .trim()
@@ -649,10 +655,12 @@ function EpisodeListItem({
     identityCount > 0
       ? t("episode.list.identityCount", { count: identityCount })
       : t("episode.list.noIdentities");
+  const identitySummary = identityDisabledReason || identityLabel;
   const sceneLabel =
     sceneCount > 0
       ? t("episode.list.sceneCount", { count: sceneCount })
       : t("episode.list.noScenes");
+  const sceneSummary = sceneDisabledReason || sceneLabel;
   const propLabel =
     propCount > 0
       ? t("episode.list.propCount", { count: propCount })
@@ -755,28 +763,30 @@ function EpisodeListItem({
       <div className="grid gap-1.5 pt-1">
         <EpisodePlanShortcut
           icon={<Users className="size-3.5 shrink-0 text-sky-400" />}
-          summary={identityLabel}
+          summary={identitySummary}
           actionLabel={
             identityCount > 0
               ? t("episode.list.replanIdentities")
               : t("episode.list.planIdentities")
           }
           pending={identityPending}
-          disabled={identityPending}
+          disabled={identityPending || Boolean(identityDisabledReason)}
+          disabledReason={identityDisabledReason}
           costDisplay={identityCostDisplay}
           promotion={identityPromotion}
           onClick={handlePlanIdentities}
         />
         <EpisodePlanShortcut
           icon={<MapPinned className="size-3.5 shrink-0 text-emerald-400" />}
-          summary={sceneLabel}
+          summary={sceneSummary}
           actionLabel={
             sceneCount > 0
               ? t("episode.list.replanScenes")
               : t("episode.list.planScenes")
           }
           pending={scenePending}
-          disabled={scenePending}
+          disabled={scenePending || Boolean(sceneDisabledReason)}
+          disabledReason={sceneDisabledReason}
           costDisplay={sceneCostDisplay}
           promotion={scenePromotion}
           onClick={handlePlanScenes}
@@ -819,7 +829,10 @@ function EpisodeListItem({
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-function EpisodesPage() {
+// 导出只为页面级网络合同测试（``episodes-list-beats-contract.test.tsx``）：那条断言
+// 要的是"整页渲染出来一共发了哪些请求"，hook 单测覆盖不到组合层重新接回
+// ``useEpisodeBeats`` 的情况。路由本身仍只用下面那个 ``Route``。
+export function EpisodesPage() {
   const { t } = useTranslation();
   const { project } = Route.useParams();
   const navigate = useNavigate();
@@ -838,7 +851,14 @@ function EpisodesPage() {
     isLoading: pipelineLoading,
     isFetching: pipelineFetching,
   } = usePipelineStatus(project);
-  const { data: charactersRes } = useCharacters(project);
+  const { data: charactersRes, isLoading: charactersLoading } =
+    useCharacters(project);
+  const characterBuildActivity = useTaskActivity(TASK_TYPES.BUILD_CHARACTERS, {
+    episode: 0,
+  });
+  const sceneBuildActivity = useTaskActivity(TASK_TYPES.BUILD_SCENES, {
+    episode: 0,
+  });
 
   const episodes = episodesRes?.data ?? [];
   const isLoading = episodesLoading || pipelineLoading;
@@ -847,6 +867,18 @@ function EpisodesPage() {
     () => charactersRes?.data?.length ?? 0,
     [charactersRes],
   );
+  const identityDisabledReason = characterBuildActivity.isActive
+    ? t("episode.list.identityCharactersBuilding")
+    : characterBuildActivity.isRestoring || charactersLoading
+      ? t("episode.list.identityCharactersLoading")
+      : totalCharacters === 0
+        ? t("episode.list.identityCharactersRequired")
+        : null;
+  const sceneDisabledReason = sceneBuildActivity.isActive
+    ? t("episode.list.sceneCatalogBuilding")
+    : sceneBuildActivity.isRestoring
+      ? t("episode.list.sceneCatalogLoading")
+      : null;
   const pipelineEpisodes = useMemo(
     () => derivePipelineEpisodeStatuses(pipelineRes?.data),
     [pipelineRes?.data],
@@ -1083,6 +1115,8 @@ function EpisodesPage() {
                         onSelect={() => handleSelectEpisode(ep.number)}
                         identityCostDisplay={planIdentitiesCostDisplay}
                         identityPromotion={planIdentitiesCost.data?.data.promotion}
+                        identityDisabledReason={identityDisabledReason}
+                        sceneDisabledReason={sceneDisabledReason}
                         sceneCostDisplay={planScenesCostDisplay}
                         scenePromotion={planScenesCost.data?.data.promotion}
                         propCostDisplay={planPropsCostDisplay}

@@ -236,6 +236,110 @@ async def test_build_scenes_from_graph_only_adds_missing_base_scenes(tmp_project
 
 
 @pytest.mark.asyncio
+async def test_build_scenes_from_graph_repairs_its_own_boilerplate(
+    tmp_project, monkeypatch
+):
+    """Legacy projects get the same repair as structured ones.
+
+    While the contract validator rejected valid single-line model output, every
+    scene built on this track stored generated boilerplate. Skipping existing
+    scenes on rebuild would leave those projects on it permanently, so a stored
+    prompt carrying the fallback fingerprint is replaced — and nothing else is.
+    """
+    from novelvideo.cognee import pipeline
+    from novelvideo.models import NovelScene
+
+    boilerplate = pipeline._ensure_directional_environment_prompt(
+        prompt="",
+        scene_name="主任办公室",
+        scene_type="interior",
+        time_of_day="",
+        context_lines=["▲张秉权坐在办公桌后翻看文件。"],
+    )
+    assert pipeline.SCENE_FALLBACK_FINGERPRINT in boilerplate
+
+    await tmp_project.sqlite_store.add_scene(
+        NovelScene(
+            name="主任办公室",
+            scene_type="interior",
+            environment_prompt=boilerplate,
+            spatial_layout_image="/generated/plate.png",
+            notes="人工备注",
+        )
+    )
+
+    real = (
+        "正面：主墙平整素雅，中央悬挂单位标识，下方为办公桌。"
+        "左侧：浅色实体墙连接前后，靠前设磨砂玻璃木门。"
+        "右侧：墙面延伸至后方，设大面积窗户与百叶帘。"
+        "背面：与主墙相对的墙面完整平直，设嵌入式资料柜。"
+    )
+
+    async def fake_extract_scenes_from_graph(**_kwargs):
+        return [
+            NovelScene(
+                name="主任办公室", scene_type="interior", environment_prompt=real
+            )
+        ]
+
+    monkeypatch.setattr(
+        pipeline, "extract_scenes_from_graph", fake_extract_scenes_from_graph
+    )
+    tmp_project.save_novel_content("剧本文本")
+
+    added = await tmp_project.build_scenes_from_graph()
+
+    assert added == []  # a repair is not an addition
+    scene = await tmp_project.sqlite_store.get_scene("主任办公室")
+    assert pipeline.SCENE_FALLBACK_FINGERPRINT not in scene.environment_prompt
+    assert "单位标识" in scene.environment_prompt
+    # Only the prompt moved; generated assets and human notes stay put.
+    assert scene.spatial_layout_image == "/generated/plate.png"
+    assert scene.notes == "人工备注"
+
+
+@pytest.mark.asyncio
+async def test_build_scenes_from_graph_keeps_boilerplate_over_invalid_output(
+    tmp_project, monkeypatch
+):
+    """A malformed rebuild must not overwrite storage with something worse."""
+    from novelvideo.cognee import pipeline
+    from novelvideo.models import NovelScene
+
+    boilerplate = pipeline._ensure_directional_environment_prompt(
+        prompt="",
+        scene_name="主任办公室",
+        scene_type="interior",
+        time_of_day="",
+        context_lines=["▲张秉权坐在办公桌后翻看文件。"],
+    )
+    await tmp_project.sqlite_store.add_scene(
+        NovelScene(
+            name="主任办公室",
+            scene_type="interior",
+            environment_prompt=boilerplate,
+        )
+    )
+
+    async def fake_extract_scenes_from_graph(**_kwargs):
+        return [
+            NovelScene(
+                name="主任办公室", scene_type="interior", environment_prompt="正面：a"
+            )
+        ]
+
+    monkeypatch.setattr(
+        pipeline, "extract_scenes_from_graph", fake_extract_scenes_from_graph
+    )
+    tmp_project.save_novel_content("剧本文本")
+
+    await tmp_project.build_scenes_from_graph()
+
+    scene = await tmp_project.sqlite_store.get_scene("主任办公室")
+    assert scene.environment_prompt == boilerplate
+
+
+@pytest.mark.asyncio
 async def test_graph_rebuild_waits_only_for_scene_graph_query(
     tmp_project,
     monkeypatch,
@@ -340,6 +444,35 @@ async def test_scene_round_trip_and_update_with_structured_scene_axes(tmp_path):
 
         listed = await store.list_scenes()
         assert [scene.name for scene in listed] == ["故宫_下雪"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_main_repair_works_without_graph_cache(tmp_path):
+    """The lightweight character list must be able to repair legacy rows."""
+
+    from novelvideo.api.routes.characters import _repair_duplicate_main_characters
+    from novelvideo.models import NovelCharacter
+    from novelvideo.sqlite_store import SQLiteStore
+
+    store = SQLiteStore(
+        "admin/demo",
+        output_dir=str(tmp_path / "output"),
+        state_dir=str(tmp_path / "state"),
+    )
+    try:
+        await store.add_character(NovelCharacter(name="甲", is_main=True))
+        await store.add_character(NovelCharacter(name="乙", is_main=True))
+        store._characters.clear()
+
+        rows = await store.list_characters()
+        repaired = await _repair_duplicate_main_characters(store, rows)
+
+        assert [row.name for row in repaired if row.is_main] == ["甲"]
+        persisted = {row.name: row for row in await store.list_characters()}
+        assert persisted["甲"].is_main is True
+        assert persisted["乙"].is_main is False
     finally:
         await store.close()
 
@@ -570,6 +703,111 @@ async def test_episode_and_beats(tmp_project):
     dicts = await store.get_beats_as_dicts(1)
     assert len(dicts) == 3
     assert dicts[0]["narration_segment"] == "第0个节拍的旁白"
+
+
+@pytest.mark.asyncio
+async def test_count_beats_by_episode_groups_in_one_query(tmp_project):
+    """分集列表的镜头数走一次分组查询，未拆镜的集不出现在结果里。
+
+    这个方法存在的意义就是替掉「前端逐集拉完整 beats 再取 len()」。
+    """
+    from novelvideo.cognee.pipeline import NovelEpisode, NovelVisualBeat
+
+    store = tmp_project
+    await store._ensure_db()
+    await store.add_episodes([NovelEpisode(number=n, title=f"第{n}集") for n in (1, 2, 3)])
+
+    await store.add_visual_beats(
+        [
+            NovelVisualBeat(beat_number=i, episode_number=1, narration="", visual_description="")
+            for i in range(3)
+        ]
+        + [
+            NovelVisualBeat(beat_number=i, episode_number=3, narration="", visual_description="")
+            for i in range(5)
+        ]
+    )
+
+    counts = await store.count_beats_by_episode()
+
+    assert counts == {1: 3, 3: 5}
+    # 第 2 集还没拆镜——缺席而不是 0，路由层用 .get(number, 0) 补齐。
+    assert 2 not in counts
+
+
+@pytest.mark.asyncio
+async def test_count_beats_by_episode_on_empty_project(tmp_project):
+    store = tmp_project
+    await store._ensure_db()
+
+    assert await store.count_beats_by_episode() == {}
+
+
+@pytest.mark.asyncio
+async def test_list_beat_asset_refs_returns_reference_columns_in_order(tmp_project):
+    """窄列读回来的六个字段要和完整 beat 对得上，包括 scene_ref 的解码。
+
+    资产反向索引拿它替掉 ``list_visual_beats()``。字段名和 ``NovelVisualBeat``
+    一致（含 ``scene_ref`` 属性），扫描代码才能对两种形状一视同仁——这个测试就是
+    钉住这条等价性。
+    """
+    from novelvideo.models import SceneRef
+    from novelvideo.cognee.pipeline import NovelVisualBeat
+
+    store = tmp_project
+    await store._ensure_db()
+    await store.add_visual_beats(
+        [
+            NovelVisualBeat(
+                beat_number=2,
+                episode_number=1,
+                narration="旁白",
+                visual_description="[[红酒杯]] 摆在桌上",
+                detected_identities_json='["苏清晏_少女"]',
+                detected_props_json='["红酒杯"]',
+                scene_ref_json=SceneRef(scene_id="书房", variant_id="").model_dump_json(),
+            ),
+            NovelVisualBeat(
+                beat_number=1,
+                episode_number=1,
+                narration="旁白",
+                visual_description="空镜",
+            ),
+        ]
+    )
+
+    rows = await store.list_beat_asset_refs()
+
+    assert [(r.episode_number, r.beat_number) for r in rows] == [(1, 1), (1, 2)]
+
+    first, second = rows
+    # 没有场景/身份/道具的 beat 读出来是空值而不是 None，扫描直接 json.loads。
+    assert first.detected_identities_json == "[]"
+    assert first.detected_props_json == "[]"
+    assert first.scene_ref_json == ""
+    assert first.scene_id == ""
+
+    assert second.detected_identities_json == '["苏清晏_少女"]'
+    assert second.detected_props_json == '["红酒杯"]'
+    assert second.visual_description == "[[红酒杯]] 摆在桌上"
+    assert second.scene_id == "书房"
+
+    # 和完整读法逐字段等价——两条路径不能对同一行给出不同答案。
+    full = {(b.episode_number, b.beat_number): b for b in await store.list_visual_beats()}
+    for row in rows:
+        beat = full[(row.episode_number, row.beat_number)]
+        assert row.visual_description == beat.visual_description
+        assert row.detected_identities_json == beat.detected_identities_json
+        assert row.detected_props_json == beat.detected_props_json
+        assert row.scene_id == beat.scene_id
+
+
+@pytest.mark.asyncio
+async def test_list_beat_asset_refs_on_empty_project(tmp_project):
+    store = tmp_project
+    await store._ensure_db()
+
+    assert await store.list_beat_asset_refs() == []
 
 
 @pytest.mark.asyncio

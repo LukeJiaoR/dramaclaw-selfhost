@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import shutil
+import asyncio
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Query
 
 from novelvideo.api.asset_metadata import newest_updated_at, tree_updated_at, utc_iso
 from novelvideo.api.auth import get_api_user
 from novelvideo.api.deps import (
+    may_run_asset_repair,
     make_sqlite_store,
     make_sqlite_store_for_context,
     make_static_url_for_context,
@@ -23,7 +25,12 @@ from novelvideo.sqlite_store import SQLiteStore
 from novelvideo.ports import get_task_backend
 from novelvideo.task_scopes import prop_reference_asset_scope
 from novelvideo.task_identity import project_task_state_key
-from novelvideo.utils.path_resolver import compute_prop_reference_path
+from novelvideo.utils.asset_names import move_asset_dir, path_safe_asset_name
+from novelvideo.utils.path_resolver import (
+    canonical_prop_reference_path,
+    compute_prop_reference_path,
+)
+from novelvideo.utils.static_urls import project_static_url
 
 router = APIRouter()
 
@@ -44,6 +51,26 @@ def _asset_url(ctx, project_dir: Path, abs_path: str | Path) -> str:
     return make_static_url_for_context(ctx, rel_path, local_path=path)
 
 
+def _convention_asset_url(
+    ctx,
+    project_dir: Path,
+    path: str | Path,
+    *,
+    project_id: str,
+    version: str = "",
+) -> str:
+    """Project-static URL for a canonical slot, without an OSSFS probe."""
+
+    asset_path = Path(path)
+    try:
+        rel_path = asset_path.relative_to(project_dir).as_posix()
+    except ValueError:
+        return ""
+    asset_project = str(getattr(ctx, "project_id", "") or project_id).strip()
+    url = project_static_url(asset_project, rel_path)
+    return f"{url}?v={quote(version, safe='')}" if version else url
+
+
 def _prop_payload(
     prop: NovelProp,
     *,
@@ -51,8 +78,15 @@ def _prop_payload(
     project_dir: Path,
     scope: str = "global",
     source_episode: int | None = None,
+    probe_files: bool = True,
+    project_id: str = "",
 ) -> dict[str, Any]:
-    reference_path = compute_prop_reference_path(project_dir, prop.name)
+    canonical_reference = canonical_prop_reference_path(project_dir, prop.name)
+    reference_path = (
+        compute_prop_reference_path(project_dir, prop.name)
+        if probe_files
+        else str(canonical_reference)
+    )
     payload = {
         "name": prop.name,
         "aliases": prop.aliases,
@@ -61,14 +95,26 @@ def _prop_payload(
         "description": prop.description,
         "owner": prop.owner,
         "notes": prop.notes,
-        "updated_at": newest_updated_at(
-            getattr(prop, "updated_at", ""),
-            tree_updated_at(project_dir / "assets" / "props" / prop.name),
+        "updated_at": (
+            newest_updated_at(
+                getattr(prop, "updated_at", ""),
+                tree_updated_at(project_dir / "assets" / "props" / prop.name),
+            )
+            if probe_files
+            else getattr(prop, "updated_at", "")
         ),
         "scope": scope,
         "reference_path": reference_path,
         "reference_url": (
-            _asset_url(ctx, project_dir, reference_path) if reference_path else ""
+            (_asset_url(ctx, project_dir, reference_path) if reference_path else "")
+            if probe_files
+            else _convention_asset_url(
+                ctx,
+                project_dir,
+                canonical_reference,
+                project_id=project_id,
+                version=getattr(prop, "updated_at", "") or "",
+            )
         ),
     }
     if source_episode is not None:
@@ -121,41 +167,62 @@ async def _local_episode_prop_payloads(
 
 
 def _rename_prop_asset_dir(project_dir: Path, old_name: str, new_name: str) -> None:
-    old_dir = project_dir / "assets" / "props" / old_name
-    new_dir = project_dir / "assets" / "props" / new_name
-    if not old_dir.exists():
-        return
-    if new_dir.exists():
-        raise ValueError(f"Target asset directory already exists: {new_dir}")
-    new_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(old_dir), str(new_dir))
+    # 见 ``move_asset_dir``：old_name 可能是库里没消毒过的脏值，直接拼路径会爬出资产根。
+    move_asset_dir(project_dir / "assets" / "props", old_name, new_name)
 
 
 async def _require_prop(store: SQLiteStore, name: str) -> NovelProp | None:
     return await store.get_prop(name)
 
 
+async def _heal_path_unsafe_prop_names(store: SQLiteStore, project_dir: Path) -> dict[str, str]:
+    """修好库里名字带斜杠的存量道具，原名转成别名。
+
+    和场景同一个毛病：``{name}`` 路由匹配不到带斜杠的名字，那一排接口全 404。
+    详见 :mod:`novelvideo.utils.asset_names`。
+
+    调用方要先过 ``may_run_asset_repair``：这是一次写操作，不该由只读协作者触发。
+    """
+
+    def move_assets(old_name: str, new_name: str) -> None:
+        _rename_prop_asset_dir(project_dir, old_name, new_name)
+
+    return await store.repair_path_unsafe_asset_names("prop", move_assets)
+
+
 @router.get("/projects/{project}/props")
 async def list_props(
     project: str,
     scope: Annotated[str, Query(pattern="^(global|local|all)$")] = "global",
+    summary: bool = False,
     user: dict = Depends(get_api_user),
 ):
     resolved = await resolve_project_scope(project, user, required_role="viewer")
     store = (
-        await make_sqlite_store_for_context(resolved.ctx)
+        await make_sqlite_store_for_context(resolved.ctx, load_graph_state=False)
         if resolved.ctx
         else await make_sqlite_store(resolved.username, resolved.project_name)
     )
     project_dir = resolved.project_dir
+    if may_run_asset_repair(resolved.ctx):
+        await _heal_path_unsafe_prop_names(store, project_dir)
     props = await store.list_props()
     global_names = {prop.name for prop in props}
     data: list[dict[str, Any]] = []
     if scope in {"global", "all"}:
-        data.extend(
-            _prop_payload(prop, ctx=resolved.ctx, project_dir=project_dir)
-            for prop in props
+        global_payloads = await asyncio.to_thread(
+            lambda: [
+                _prop_payload(
+                    prop,
+                    ctx=resolved.ctx,
+                    project_dir=project_dir,
+                    probe_files=not summary,
+                    project_id=project,
+                )
+                for prop in props
+            ]
         )
+        data.extend(global_payloads)
     if scope in {"local", "all"}:
         data.extend(await _local_episode_prop_payloads(store=store, global_prop_names=global_names))
     return {
@@ -177,7 +244,8 @@ async def create_prop(
         else await make_sqlite_store(resolved.username, resolved.project_name)
     )
     project_dir = resolved.project_dir
-    name = body.name.strip()
+    # 在查重之前消毒，否则两个只差斜杠的名字会双双通过查重、后写的静默覆盖先写的。
+    name = path_safe_asset_name(str(body.name or "").strip())
     if not name:
         return {"ok": False, "error": "Prop name is required"}
     existing = await store.get_prop(name)
@@ -219,7 +287,9 @@ async def update_prop(
         return {"ok": False, "error": f"Prop '{name}' not found"}
 
     updates = body.model_dump(exclude_unset=True, exclude_none=True)
-    requested_name = str(updates.pop("name", "") or "").strip()
+    # 在挪目录之前消毒：store.rename_prop 里也会消毒，但目录迁移先于它执行，
+    # 不在这里统一就会出现「库里 a_b、盘上 a/b」的错位。
+    requested_name = path_safe_asset_name(str(updates.pop("name", "") or "").strip())
     if requested_name and requested_name != prop.name:
         if await store.get_prop(requested_name) is not None:
             return {"ok": False, "error": f"Prop '{requested_name}' already exists"}

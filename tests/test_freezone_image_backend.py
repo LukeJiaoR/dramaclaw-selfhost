@@ -52,6 +52,7 @@ from novelvideo.shared.billing_errors import (
     BillingRuleNotConfiguredError,
     InsufficientCreditsError,
 )
+from novelvideo.stage_asset_tasks import resolve_scene_360_image_model
 from novelvideo.task_backend.limits import ProjectUserTaskLimitExceeded
 from novelvideo.task_state import get_task_manager
 
@@ -131,6 +132,29 @@ class _FakeContextBeatStore:
                 "detected_props": ["账单"],
             }
         ]
+
+
+class _FakeAssetRevisionStore:
+    def __init__(self) -> None:
+        self.characters: list[str] = []
+        self.scenes: list[str] = []
+        self.props: list[str] = []
+        self.closed = False
+
+    async def touch_character_asset(self, name: str) -> bool:
+        self.characters.append(name)
+        return True
+
+    async def touch_scene_asset(self, name: str) -> bool:
+        self.scenes.append(name)
+        return True
+
+    async def touch_prop_asset(self, name: str) -> bool:
+        self.props.append(name)
+        return True
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def _patch_freezone_project(
@@ -1055,8 +1079,19 @@ async def test_freezone_audio_generation_enqueues_two_feature_billings(
     tmp_path: Path,
 ) -> None:
     from novelvideo.config import INDEXTTS2_RECORD_MODEL
+    from novelvideo.project_config import set_narrator_reference_audio_in_state_dir
+    from novelvideo.seedance2_i2v.voice_clone import file_sha256
 
     _patch_freezone_project(monkeypatch, tmp_path)
+    ctx = _project_ctx(tmp_path)
+    narrator = ctx.output_dir / "assets" / "narrator" / "voice.wav"
+    narrator.parent.mkdir(parents=True, exist_ok=True)
+    narrator.write_bytes(b"narrator-voice")
+    set_narrator_reference_audio_in_state_dir(
+        ctx.state_dir,
+        relative_path=narrator.relative_to(ctx.output_dir).as_posix(),
+        sha256=file_sha256(narrator),
+    )
     captured: list[dict] = []
 
     async def fake_enqueue_project_task(_ctx: ProjectContext, **kwargs):
@@ -1213,9 +1248,16 @@ def test_freezone_ai_staging_prop_endpoint_returns_ai_prop(
             },
         }
 
-    monkeypatch.setattr(
-        freezone_routes, "_run_ai_staging_prop", fake_run_ai_staging_prop
-    )
+    monkeypatch.setattr(freezone_routes, "_run_ai_staging_prop", fake_run_ai_staging_prop)
+    # 该路由自 OI-54 S2 起在请求路径上解析出网身份，而这个裸 app 不经
+    # `ensure_bootstrap()`，端口注册表是空的（`get_authz_port()` 刻意没有
+    # `PortNotRegistered` 回落——回落就等于「端口没注册就跳过身份绑定」）。
+    # 用真的 CE 单机降级实现顶上：`LocalAuthz` 产 `kind="local"` → 非组织 →
+    # 什么都不绑，本测试既有断言一字不改。seam 照 `test_p0g4c_video_egress.py:803`。
+    import novelvideo.ports as ports
+    from novelvideo.ports.local import LocalAuthz
+
+    monkeypatch.setattr(ports, "get_authz_port", lambda: LocalAuthz())
     app = FastAPI()
     app.include_router(freezone_routes.router, prefix="/api/v1")
     app.dependency_overrides[freezone_routes.get_api_user] = lambda: {
@@ -1880,6 +1922,111 @@ async def test_freezone_push_can_commit_beat_audio(
     target = project_dir / "audio" / "ep001" / "beat_02.mp3"
     assert target.read_bytes() == b"candidate-audio"
     assert result["data"]["target_path"] == str(target)
+
+
+@pytest.mark.parametrize(
+    ("target", "revision_bucket", "entity_name"),
+    [
+        ({"kind": "portrait", "character": "秦"}, "characters", "秦"),
+        ({"kind": "scene_master", "scene_id": "兰州拉面馆"}, "scenes", "兰州拉面馆"),
+        ({"kind": "prop_ref", "prop_id": "账单"}, "props", "账单"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_freezone_push_advances_canonical_summary_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: dict,
+    revision_bucket: str,
+    entity_name: str,
+) -> None:
+    """Freezone push and skill auto-commit share this publication boundary."""
+
+    project_dir, _output_dir = _patch_freezone_project(monkeypatch, tmp_path)
+    source = project_dir / "freezone" / "_outputs" / "candidate.png"
+    _write_image(source)
+    store = _FakeAssetRevisionStore()
+
+    from novelvideo.api import deps
+
+    scope_calls: list[bool] = []
+
+    async def fake_make_store(_ctx, *, load_graph_state=True):
+        scope_calls.append(load_graph_state)
+        return store
+
+    monkeypatch.setattr(
+        deps,
+        "make_sqlite_store_for_context",
+        fake_make_store,
+    )
+    result = await freezone_routes.freezone_push(
+        project="proj_freezone",
+        body=PushRequest(
+            source_url="freezone/_outputs/candidate.png",
+            target=target,
+        ),
+        user={"username": "admin", "id": "owner_1"},
+    )
+
+    assert Path(result["data"]["target_path"]).is_file()
+    assert result["data"]["target_url"]
+    assert getattr(store, revision_bucket) == [entity_name]
+    assert scope_calls == [False]
+    assert store.closed is True
+
+
+@pytest.mark.asyncio
+async def test_skill_auto_commit_advances_canonical_summary_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_dir, _output_dir = _patch_freezone_project(monkeypatch, tmp_path)
+    source = project_dir / "freezone" / "_outputs" / "candidate.png"
+    _write_image(source)
+    store = _FakeAssetRevisionStore()
+
+    from novelvideo.api import deps
+
+    scope_calls: list[bool] = []
+
+    async def fake_make_store(_ctx, *, load_graph_state=True):
+        scope_calls.append(load_graph_state)
+        return store
+
+    monkeypatch.setattr(
+        deps,
+        "make_sqlite_store_for_context",
+        fake_make_store,
+    )
+
+    finalized = await freezone_routes._finalize_skill_run_outputs(
+        project="proj_freezone",
+        project_dir=project_dir,
+        ctx=_project_ctx(tmp_path),
+        metadata={
+            "run_id": "run_auto_commit",
+            "skill_id": "skill_demo",
+            "skill_node_id": "skill_node",
+            "canvas_id": "canvas_demo",
+            "status": "running",
+        },
+        outputs=[
+            {
+                "role": "scene_master",
+                "image_url": "freezone/_outputs/candidate.png",
+                "pushable": True,
+                "auto_commit": True,
+                "slot_target": {"kind": "scene_master", "scene_id": "兰州拉面馆"},
+            }
+        ],
+        user={"username": "admin", "id": "owner_1"},
+    )
+
+    assert finalized[0]["committed"] is True
+    assert store.scenes == ["兰州拉面馆"]
+    assert scope_calls == [False]
+    assert store.closed is True
 
 
 def test_resolve_outpaint_aspect_ratio_supports_original(tmp_path: Path) -> None:
@@ -2801,6 +2948,169 @@ async def test_put_canvas_lock_busy_returns_503(
 
 
 @pytest.mark.asyncio
+async def test_put_canvas_lease_lost_returns_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TCP-EU-C4 · 丢租约走的是同一个错误面（B2 §3.3.3）。
+
+    `CanvasLeaseLost` 继承 `CanvasLockBusy`，所以上面那条用例本来就会自动接住它。
+    照它的形状再写一条 lease 版本，是为了证明「路由零改动」不是巧合：
+    错误面契约（503 ＋ `canvas_lock_busy` ＋ `Retry-After: 1`）对两种失败逐字相同。
+    丢租约判 503 而不是 409：那是并发条件，不是 revision 条件 —— 客户端重试时
+    `_check_revision` 才**权威地**决定这次是 200 还是 409（B2 §3.3.3）。
+    """
+    from novelvideo.ports.canvas_mutex import CanvasLeaseLost
+
+    _patch_freezone_project(monkeypatch, tmp_path)
+
+    def fake_save_canvas(*_args, **_kwargs):
+        raise CanvasLeaseLost("default")
+
+    monkeypatch.setattr(freezone_routes.canvas_store, "save_canvas", fake_save_canvas)
+
+    with pytest.raises(freezone_routes.HTTPException) as exc:
+        await freezone_routes.put_canvas(
+            project="proj_freezone",
+            canvas_id="default",
+            body=CanvasPayload(nodes=[], edges=[]),
+            user={"username": "admin", "id": "owner_1"},
+        )
+
+    assert exc.value.status_code == 503
+    assert exc.value.headers == {"Retry-After": "1"}
+    assert exc.value.detail == {"code": "canvas_lock_busy", "canvas_id": "default"}
+
+
+def _write_canvas_edited_by(
+    tmp_path: Path,
+    canvas_id: str,
+    *,
+    updated_by: str,
+    age_seconds: float,
+) -> Path:
+    from datetime import datetime, timedelta, timezone
+
+    updated_at = (
+        datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = _canvas_state_dir(tmp_path) / "freezone" / "canvases" / f"{canvas_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "canvas_id": canvas_id,
+                "revision": 3,
+                "nodes": [],
+                "edges": [],
+                "updated_by": updated_by,
+                "updated_at": updated_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.asyncio
+async def test_get_canvas_reports_another_actor_editing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TCP-EU-C4 步 6 · O2「另一个会话正在编辑」（B2 §3.9 O2 / §6.4 步 6）。"""
+    _patch_freezone_project(monkeypatch, tmp_path)
+    _write_canvas_edited_by(tmp_path, "beat_1", updated_by="bob", age_seconds=2)
+
+    result = await freezone_routes.get_canvas(
+        project="proj_freezone",
+        canvas_id="beat_1",
+        user={"username": "admin", "id": "owner_1"},
+    )
+
+    assert result["editing_by"] == "bob"
+    # 契约不变（B2-6）：提示字段挂在 `data` 之外，画布载荷形状一个字节都没动。
+    assert "editing_by" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_get_canvas_omits_editing_by_for_the_viewers_own_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_freezone_project(monkeypatch, tmp_path)
+    _write_canvas_edited_by(tmp_path, "beat_1", updated_by="owner_1", age_seconds=2)
+
+    result = await freezone_routes.get_canvas(
+        project="proj_freezone",
+        canvas_id="beat_1",
+        user={"username": "admin", "id": "owner_1"},
+    )
+
+    assert "editing_by" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_canvas_editing_by_disappears_after_the_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from novelvideo.freezone import canvas_store as canvas_store_module
+
+    _patch_freezone_project(monkeypatch, tmp_path)
+    _write_canvas_edited_by(
+        tmp_path,
+        "beat_1",
+        updated_by="bob",
+        age_seconds=canvas_store_module.CANVAS_EDITING_HINT_WINDOW_SECONDS + 5,
+    )
+
+    result = await freezone_routes.get_canvas(
+        project="proj_freezone",
+        canvas_id="beat_1",
+        user={"username": "admin", "id": "owner_1"},
+    )
+
+    assert "editing_by" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_canvas_editing_by_adds_no_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """步 6 的硬要求：读路径**不许新增数据库往返**（B2 §6.4 步 6）。
+
+    判据落成「读路径一次都不碰画布互斥端口」—— 端口是这条路径上唯一可能通往
+    Postgres 的东西（EE 的实现走租约表，`TCP-P40`）。
+    """
+    from novelvideo.ports import registry as ports_registry
+
+    _patch_freezone_project(monkeypatch, tmp_path)
+    _write_canvas_edited_by(tmp_path, "beat_1", updated_by="bob", age_seconds=2)
+
+    class _ExplodingMutex:
+        def __getattr__(self, name):
+            raise AssertionError(f"read path must not touch the canvas mutex port: {name}")
+
+    previous = ports_registry._PORTS.get("canvas_write_mutex")
+    ports_registry.register_port("canvas_write_mutex", _ExplodingMutex())
+    try:
+        result = await freezone_routes.get_canvas(
+            project="proj_freezone",
+            canvas_id="beat_1",
+            user={"username": "admin", "id": "owner_1"},
+        )
+    finally:
+        if previous is None:
+            ports_registry._PORTS.pop("canvas_write_mutex", None)
+        else:
+            ports_registry.register_port("canvas_write_mutex", previous)
+
+    assert result["editing_by"] == "bob"
+
+
+@pytest.mark.asyncio
 async def test_get_canvas_does_not_fallback_to_output_canvas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3107,11 +3417,177 @@ def test_camera_prompt_contains_camera_body_lens_focal_and_aperture() -> None:
     assert "f/4" in prompt
 
 
-def test_image_style_templates_builtin_count_is_30() -> None:
+def test_image_style_templates_are_short_drama_styles() -> None:
+    """端点吐出来的必须就是随包那份清单,一条不多一条不少、顺序也一致。
+
+    原来在这里抄了一份 24 个 id 的列表,每加一批风格就要照抄一遍,而它想验的其实是
+    「路由拿的是内置清单」。改成直接比对清单文件:既不随风格数漂移,又比数量更严。
+    数量另设下限,防止清单被截断成空壳还悄悄通过。
+    """
+    shipped = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "novelvideo"
+            / "freezone"
+            / "style_templates.json"
+        ).read_text(encoding="utf-8")
+    )
+    expected_ids = [item["id"] for item in shipped["templates"]]
+
     data = freezone_routes._get_freezone_image_style_templates()
 
-    assert len(data) == 30
-    assert any(item["id"] == "three_oclock_2300" for item in data)
+    assert [item["id"] for item in data] == expected_ids
+    assert len(expected_ids) >= 24
+
+
+def test_image_style_templates_have_assets_and_prompts() -> None:
+    # 图片已迁 OSS(STYLE_GALLERY_ASSET_BASE),不随仓库发布,所以 CI 里这个目录
+    # 不存在,只能校验路径形状。本地跑过 scripts/build_style_gallery.py 的人目录
+    # 才在,那时顺带校验清单与图片对得上 —— 加风格时漏转图片就在这里拦下。
+    gallery_root = Path(__file__).resolve().parents[1] / "frontend" / "public" / "style-gallery"
+    check_files_exist = gallery_root.is_dir()
+
+    for item in freezone_routes._get_freezone_image_style_templates():
+        assert item["label"], item["id"]
+        # 类目是受控词表,不是自由文本 —— 图墙的筛选 tab 直接按它铺,多一个错别字
+        # 就多一个只有一张卡的 tab。加风格时如果确实要新类目,在这里显式登记。
+        assert item["category"] in {
+            "古装",
+            "都市",
+            "年代",
+            "生活",
+            "科幻",
+            "类型",
+            "写意",
+            # 第二批素材:以画法/媒介立类。
+            "动画",
+            "绘画",
+            "神话",
+        }, item["id"]
+        # 下限只为拦住「提示词被截成空壳/占位符」——不是质量分。第二批里 大友克洋(97)
+        # 与 埃及壁画(102) 素材本身就短,原来的 120 会把两条合法风格判死。
+        assert len(item["style_prompt"]) >= 90, item["id"]
+        assert "author" not in item, item["id"]
+        assert len(item["samples"]) == 4, item["id"]
+        for rel in [item["cover"], *item["samples"]]:
+            assert not rel.startswith("/"), rel
+            if check_files_exist:
+                assert (gallery_root / rel).is_file(), rel
+
+
+@pytest.mark.asyncio
+async def test_image_style_templates_route_keeps_data_a_bare_list(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`data` 必须是裸列表 —— 这是跨仓库的前端契约，不是实现细节。
+
+    这个端点同时服务多个仓库的前端，它们的 `apiCall` 只拆一层 `{ok, data}`、不校验
+    `data` 的形状。把 `data` 换成 `{asset_base, version, templates}` 对象曾经让所有
+    没跟进的前端一句 `templates.find(...)` 抛 `is not a function`，冒泡到根错误边界
+    变成整页「页面加载失败」。清单元信息只能挂在信封同级。
+    """
+    _patch_freezone_project(monkeypatch, tmp_path)
+    monkeypatch.setenv("STYLE_GALLERY_ASSET_BASE", "https://cdn.example.com/style")
+
+    app = FastAPI()
+    app.include_router(freezone_routes.router, prefix="/api/v1")
+
+    async def fake_user():
+        return {"id": "owner_1", "username": "admin"}
+
+    app.dependency_overrides[freezone_routes.get_api_user] = fake_user
+
+    response = TestClient(app).get(
+        "/api/v1/projects/58/freezone/image/style-templates"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert isinstance(payload["data"], list), "data 必须是裸列表，元信息挂信封同级"
+    assert payload["data"] == freezone_routes._get_freezone_image_style_templates()
+    assert payload["asset_base"] == "https://cdn.example.com/style"
+    assert payload["version"]
+
+
+def test_nineties_style_prompt_keeps_second_line() -> None:
+    data = freezone_routes._get_freezone_image_style_templates()
+    nineties = next(item for item in data if item["id"] == "nineties")
+
+    assert "\n" in nineties["style_prompt"]
+    assert "构图平实自然" in nineties["style_prompt"]
+
+
+def test_build_style_prompt_uses_chinese_block_without_author() -> None:
+    from novelvideo.api.schemas import FreezoneImageStyleConfig
+
+    block = freezone_routes._build_style_prompt(
+        FreezoneImageStyleConfig(template_id="golden_age")
+    )
+
+    assert block.startswith("风格模板:\n- 黄金时代\n- ")
+    assert "美式复古好莱坞黄金时代风格" in block
+    assert "builtin" not in block
+
+
+def test_unknown_style_template_is_ignored_instead_of_rejected() -> None:
+    from novelvideo.api.schemas import FreezoneImageStyleConfig
+
+    config = FreezoneImageStyleConfig(template_id="three_oclock_2300")
+
+    assert freezone_routes._resolve_freezone_image_style_template(config) is None
+    assert freezone_routes._build_style_prompt(config) == ""
+
+
+def test_unknown_style_template_does_not_break_prompt_merge() -> None:
+    from novelvideo.api.schemas import FreezoneImageStyleConfig
+
+    merged = freezone_routes._merge_prompt_with_style_and_camera(
+        "一个女人站在窗前",
+        FreezoneImageStyleConfig(template_id="obsolete_style"),
+        None,
+    )
+
+    assert merged == "一个女人站在窗前"
+
+
+def test_style_asset_base_defaults_to_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("STYLE_GALLERY_ASSET_BASE", raising=False)
+
+    assert freezone_routes._get_freezone_image_style_asset_base() == ""
+
+
+def test_style_manifest_version_is_exposed_for_troubleshooting() -> None:
+    """图片和提示词各自可换代,接口带上清单版本才好定位是哪份在生效。
+
+    版本号跟着清单文件走,别在这里写死 —— 否则每改一版清单都要顺手改测试。
+    """
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "novelvideo"
+            / "freezone"
+            / "style_templates.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert (
+        freezone_routes._get_freezone_image_style_manifest_version()
+        == manifest["version"]
+    )
+    assert manifest["version"]
+
+
+def test_style_asset_base_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STYLE_GALLERY_ASSET_BASE", "  https://cdn.example.com/styles/  ")
+
+    assert (
+        freezone_routes._get_freezone_image_style_asset_base()
+        == "https://cdn.example.com/styles/"
+    )
 
 
 @pytest.mark.asyncio
@@ -3436,7 +3912,12 @@ async def test_freezone_celery_text_runner_records_project_node_history(
     ctx = _project_ctx(tmp_path)
     project_dir = ctx.output_dir
 
-    async def fake_translate_freezone_text(*, text: str, node_type: str):
+    # 普通任务不传组织身份；组织任务才由分发层注入 egress_context。
+    async def fake_translate_freezone_text(
+        *,
+        text: str,
+        node_type: str,
+    ):
         assert text == "你好"
         assert node_type == "text"
         return "hello", "zh", "en"
@@ -3489,6 +3970,7 @@ async def test_freezone_celery_text_generate_runner_records_project_node_history
     ctx = _project_ctx(tmp_path)
     project_dir = ctx.output_dir
 
+    # 普通任务不传组织身份；组织任务才由分发层注入 egress_context。
     async def fake_generate_freezone_text(*, prompt: str):
         assert prompt == "写一段雨夜重逢"
         return "DC-freezone-text-writer-LLM", "雨夜里，他们在旧站台重逢。"
@@ -4114,8 +4596,22 @@ async def test_scene_360_endpoint_keeps_image_size_below_the_cap(
             queue="node.node_a.world",
         )
 
+    async def fake_resolve_catalog_request(*_args, **_kwargs):
+        return (
+            {},
+            {},
+            {
+                "catalogId": "cat-77",
+                "providerId": "newapi",
+                "apiModel": "google/gemini-2.5-flash-image-preview",
+            },
+        )
+
+    monkeypatch.setattr(freezone_routes, "_resolve_freezone_project", fake_resolve_freezone_project)
     monkeypatch.setattr(
-        freezone_routes, "_resolve_freezone_project", fake_resolve_freezone_project
+        freezone_routes,
+        "_resolve_catalog_request",
+        fake_resolve_catalog_request,
     )
     monkeypatch.setattr(
         freezone_routes,
@@ -4247,8 +4743,47 @@ async def test_scene_360_takes_model_and_billing_identity_from_the_catalog(
     )
 
     assert captured["payload"]["params"]["model"] == "real-pano-model"
+    assert captured["payload"]["scene_360_model_authority"] == {
+        "kind": "catalog",
+        "catalog_id": "cat-real",
+        "provider": "newapi",
+        "model": "real-pano-model",
+    }
     assert captured["payload"]["billing"]["catalog_id"] == "cat-real"
     assert captured["payload"]["billing"]["pricing_model"] == "real-pano-model"
+
+
+@pytest.mark.asyncio
+async def test_scene_360_rejects_client_model_without_catalog_authority_before_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+    _patch_scene_360_enqueue(monkeypatch, tmp_path, captured)
+
+    async def fake_resolve_catalog_request(*_args, **_kwargs):
+        return {}, {}, None
+
+    monkeypatch.setattr(
+        freezone_routes, "_resolve_catalog_request", fake_resolve_catalog_request
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await freezone_routes.freezone_scene_360(
+            project="proj_freezone",
+            body=freezone_routes.FreezoneScene360Request(
+                reference_url=(
+                    "/api/v1/projects/proj_freezone/media/assets/scenes/小区/master.png"
+                ),
+                model="attacker-controlled-model",
+                catalog_id="forged-catalog",
+            ),
+            user={"username": "admin"},
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "scene 360 image model" in str(exc_info.value.detail)
+    assert not captured
 
 
 @pytest.mark.asyncio
@@ -5684,6 +6219,15 @@ async def test_skill_run_standalone_frame_from_context_queues_candidate_without_
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from novelvideo.ports.registry import register_port
+    from novelvideo.task_backend.projection import build_projection
+
+    class InstalledProjector:
+        async def build(self, store, config, *, task_type):
+            assert store is None
+            return await build_projection(store, config, task_type=task_type)
+
+    register_port("task_projection", InstalledProjector())
     project_dir, _output_dir = _patch_freezone_project(monkeypatch, tmp_path)
     _write_canvas_with_node(
         tmp_path,
@@ -5763,6 +6307,11 @@ async def test_skill_run_standalone_frame_from_context_queues_candidate_without_
     assert captured["task_type"] == "mainline_frame_from_context"
     assert captured["episode"] == 0
     assert "beat_num" not in captured
+    assert captured["payload"]["projection"] == {
+        "projection_version": 1,
+        "task_type": "mainline_frame_from_context",
+        "fields": {},
+    }
     config = captured["payload"]["config"]
     assert config["standalone_beat_context"] is True
     assert config["selected_panel_indices"] == [0]
@@ -8127,7 +8676,7 @@ async def test_freezone_upscale_resolves_original_ratio_before_model_call(
         image_size="2K",
         quality="low",
         model="HuiMeng GPT Image 2",
-        style=freezone_routes.FreezoneImageStyleConfig(template_id="three_oclock_2300"),
+        style=freezone_routes.FreezoneImageStyleConfig(template_id="golden_age"),
         camera=freezone_routes.FreezoneImageCameraConfig(
             camera_body="Panavision DXL2",
             lens="Arri Signature Prime",
@@ -8148,7 +8697,7 @@ async def test_freezone_upscale_resolves_original_ratio_before_model_call(
     assert captured["billing"]["feature_key"] == "freezone.image_edit"
     assert captured["billing"]["operation"] == "upscale"
     assert captured["billing"]["pricing_kind"] == "image"
-    assert "新古典插画" in captured["prompt"]
+    assert "黄金时代" in captured["prompt"]
     assert "Panavision DXL2" in captured["prompt"]
     assert "Arri Signature Prime" in captured["prompt"]
 
@@ -9354,3 +9903,146 @@ async def test_reverse_prompt_uses_shared_freezone_vision_model(
         captured["timeout_seconds"]
         == image_node.FREEZONE_IMAGE_REVERSE_PROMPT_TIMEOUT_SECONDS
     )
+
+
+@pytest.mark.asyncio
+async def test_freezone_video_generation_rejects_small_reference_image_before_billing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """参考图小于 300px 在入队前就 400，不预扣积分、不送厂商（3060 2026-08-26 实例）。"""
+
+    async def unexpected_enqueue(*_args, **_kwargs):
+        raise AssertionError("image validation must happen before enqueue")
+
+    monkeypatch.setattr(
+        freezone_routes,
+        "get_task_backend",
+        lambda: SimpleNamespace(enqueue_project_task=unexpected_enqueue),
+    )
+    small = tmp_path / "logo.png"
+    Image.new("RGB", (338, 191), (255, 255, 255)).save(small, format="PNG")
+    ok = tmp_path / "frame.png"
+    Image.new("RGB", (1280, 720), (255, 255, 255)).save(ok, format="PNG")
+
+    with pytest.raises(HTTPException) as exc:
+        await freezone_routes._start_or_enqueue_freezone_video_gen(
+            ctx=_project_ctx(tmp_path),
+            username="admin",
+            project="demo",
+            project_dir=tmp_path / "project",
+            output_dir=str(tmp_path / "output"),
+            job_id="job_small_image",
+            prompt="参考图生成",
+            reference_items=[
+                {"type": "image", "path": str(ok), "role": "图片1"},
+                {"type": "image", "path": str(small), "role": "图片2"},
+            ],
+            aspect_ratio="16:9",
+            resolution="720p",
+            duration_seconds=6,
+            generate_audio=False,
+            human_review=False,
+            scene_optimize=None,
+            backend="newapi_seedance-2.0",
+            gen_mode="allReference",
+            capabilities={},
+        )
+
+    assert exc.value.status_code == 400
+    detail = str(exc.value.detail)
+    assert "logo.png" in detail
+    assert "338x191" in detail
+    assert "300" in detail
+
+
+@pytest.mark.asyncio
+async def test_freezone_video_generation_skips_dimension_gate_for_non_seedance_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """300~6000px 是火山 Seedance 的规则，别的模型不能拿它凭空 400。"""
+    captured: dict[str, object] = {}
+
+    async def fake_enqueue_project_task(_ctx: ProjectContext, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            task_state=SimpleNamespace(task_id="task_video"),
+            backend="celery",
+            queue="node.node_a.video",
+        )
+
+    monkeypatch.setattr(
+        freezone_routes,
+        "get_task_backend",
+        lambda: SimpleNamespace(enqueue_project_task=fake_enqueue_project_task),
+    )
+    small = tmp_path / "logo.png"
+    Image.new("RGB", (338, 191), (255, 255, 255)).save(small, format="PNG")
+
+    result = await freezone_routes._start_or_enqueue_freezone_video_gen(
+        ctx=_project_ctx(tmp_path),
+        username="admin",
+        project="demo",
+        project_dir=tmp_path / "project",
+        output_dir=str(tmp_path / "output"),
+        job_id="job_other_model",
+        prompt="参考图生成",
+        reference_items=[{"type": "image", "path": str(small), "role": "图片1"}],
+        aspect_ratio="16:9",
+        resolution="720p",
+        duration_seconds=6,
+        generate_audio=False,
+        human_review=False,
+        scene_optimize=None,
+        backend="newapi_happyhorse-1.0",
+        gen_mode="allReference",
+        capabilities={},
+    )
+
+    assert result["data"]["task_type"] == "freezone_video_gen"
+    assert captured["task_type"] == "freezone_video_gen"
+
+
+@pytest.mark.asyncio
+async def test_freezone_video_generation_reports_duplicate_last_frame_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """关键帧路由会把尾帧同时放进 reference_items 和 last_frame_path，预检要去重。"""
+
+    async def unexpected_enqueue(*_args, **_kwargs):
+        raise AssertionError("image validation must happen before enqueue")
+
+    monkeypatch.setattr(
+        freezone_routes,
+        "get_task_backend",
+        lambda: SimpleNamespace(enqueue_project_task=unexpected_enqueue),
+    )
+    small = tmp_path / "last.png"
+    Image.new("RGB", (338, 191), (255, 255, 255)).save(small, format="PNG")
+
+    with pytest.raises(HTTPException) as exc:
+        await freezone_routes._start_or_enqueue_freezone_video_gen(
+            ctx=_project_ctx(tmp_path),
+            username="admin",
+            project="demo",
+            project_dir=tmp_path / "project",
+            output_dir=str(tmp_path / "output"),
+            job_id="job_dup_last_frame",
+            prompt="首尾帧生成",
+            reference_items=[{"type": "image", "path": str(small), "role": "尾帧"}],
+            aspect_ratio="16:9",
+            resolution="720p",
+            duration_seconds=6,
+            generate_audio=False,
+            human_review=False,
+            scene_optimize=None,
+            backend="newapi_seedance-2.0",
+            last_frame_path=str(small),
+            gen_mode="keyframe",
+            capabilities={},
+        )
+
+    assert exc.value.status_code == 400
+    assert str(exc.value.detail).count("last.png (338x191)") == 1

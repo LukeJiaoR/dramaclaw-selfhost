@@ -198,7 +198,9 @@ async def generate_rewrite(
         if normalized == raw_content:
             normalized = ""
         await store.save_adapted_content(episode_num, normalized)
-        await store.update_episode(episode_num, beat_source_text=normalized)
+        # Column-level: rewriting the working text must not re-serialise the
+        # scene and prop menus that planning may have written meanwhile.
+        await store.patch_episode(episode_num, beat_source_text=normalized)
     except Exception as exc:
         if reservation_id:
             try:

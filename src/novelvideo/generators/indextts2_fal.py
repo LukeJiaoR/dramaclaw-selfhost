@@ -4,14 +4,27 @@ from __future__ import annotations
 
 import os
 import subprocess
+import hashlib
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from novelvideo.ports import get_usage_meter
-from novelvideo.shared.billing_errors import is_insufficient_credits_error
-from novelvideo.generators.tts_generator import TTSResult
+from novelvideo.ports import get_usage_meter, update_current_model_call_log
+from novelvideo.shared.billing_errors import is_fatal_billing_error
+from novelvideo.egress_context import (
+    TrustedEgressContext,
+    ambient_organization_egress_context,
+)
+from novelvideo.generators.tts_generator import (
+    TTSResult,
+    claim_audio_operation,
+    complete_audio_operation,
+    mark_audio_operation_unknown,
+    reject_audio_operation,
+    resolve_audio_gateway_credential,
+)
+from novelvideo.ports.model_credentials import ModelCredentialError
 
 
 async def _reserve_tts_model_call(model: str, *, source: str) -> str:
@@ -29,8 +42,6 @@ async def _refund_tts_model_call(
     error: str,
     provider_request_id: str = "",
 ) -> None:
-    if not reservation_id:
-        return
     try:
         metadata: dict[str, Any] = {"source": source, "error": error[:200]}
         if provider_request_id:
@@ -108,6 +119,7 @@ class IndexTTS2FalClient:
         endpoint: str | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        egress_context: TrustedEgressContext | None = None,
     ):
         from novelvideo.config import (
             FAL_API_KEY,
@@ -118,22 +130,43 @@ class IndexTTS2FalClient:
             get_effective_newapi_gateway_config,
         )
 
-        self.provider = (provider if provider is not None else INDEXTTS2_PROVIDER).strip().lower()
+        if egress_context is None:
+            egress_context = ambient_organization_egress_context()
+        self.egress_context = egress_context
+        organization_mode = (
+            type(egress_context) is TrustedEgressContext
+            and egress_context.is_organization
+        )
+        self.provider = (
+            (provider if provider is not None else INDEXTTS2_PROVIDER).strip().lower()
+        )
         if self.provider not in {"newapi", "fal"}:
             self.provider = "newapi"
         if self.provider == "newapi":
-            gateway = get_effective_newapi_gateway_config()
-            self.api_key = api_key if api_key is not None else gateway.api_key
-            self.endpoint = endpoint or gateway.base_url
+            if organization_mode:
+                self.api_key = ""
+                self.endpoint = ""
+            else:
+                gateway = get_effective_newapi_gateway_config()
+                self.api_key = api_key if api_key is not None else gateway.api_key
+                self.endpoint = endpoint or gateway.base_url
             self.model = model or INDEXTTS2_NEWAPI_MODEL
         else:
-            self.api_key = (
-                api_key if api_key is not None else (FAL_API_KEY or os.getenv("FAL_KEY", ""))
-            )
-            self.endpoint = endpoint or INDEXTTS2_FAL_ENDPOINT
+            if organization_mode:
+                self.api_key = ""
+                self.endpoint = ""
+            else:
+                self.api_key = (
+                    api_key
+                    if api_key is not None
+                    else (FAL_API_KEY or os.getenv("FAL_KEY", ""))
+                )
+                self.endpoint = endpoint or INDEXTTS2_FAL_ENDPOINT
             self.model = model or "IndexTTS2"
         self.timeout_seconds = float(
-            timeout_seconds if timeout_seconds is not None else INDEXTTS2_TIMEOUT_SECONDS
+            timeout_seconds
+            if timeout_seconds is not None
+            else INDEXTTS2_TIMEOUT_SECONDS
         )
         self._last_provider_request_id = ""
         self._last_provider_response_id = ""
@@ -147,8 +180,19 @@ class IndexTTS2FalClient:
         emotion_prompt: str = "",
     ) -> TTSResult:
         """Generate dialogue audio from a reference sample and save it to ``output_path``."""
-        if not self.api_key:
-            key_name = "DramaClawAPI API key" if self.provider == "newapi" else "FAL_KEY/FAL_API_KEY"
+        context = self.egress_context
+        if context is not None and (
+            type(context) is not TrustedEgressContext or not context.is_organization
+        ):
+            return TTSResult(success=False, error="ORG_EGRESS_DENIED")
+        if context is not None and self.provider != "newapi":
+            return TTSResult(success=False, error="ORG_EGRESS_DENIED")
+        if context is None and not self.api_key:
+            key_name = (
+                "DramaClawAPI API key"
+                if self.provider == "newapi"
+                else "FAL_KEY/FAL_API_KEY"
+            )
             return TTSResult(success=False, error=f"{key_name} not set")
         prompt = str(prompt or "").strip()
         if not prompt:
@@ -159,33 +203,94 @@ class IndexTTS2FalClient:
 
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        lease = None
+        request_credential = None
+        if context is not None:
+            lease = await claim_audio_operation(
+                context,
+                capability="audio.tts.gateway",
+                business_task_id=f"{context.task_type}:indextts2:{target.name}",
+                request={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "audio_url": audio_url,
+                    "emotion_prompt": str(emotion_prompt or "").strip(),
+                },
+            )
+            if lease.replay_error:
+                return TTSResult(success=False, error=lease.replay_error)
+            try:
+                request_credential = await resolve_audio_gateway_credential(context)
+            except ModelCredentialError as exc:
+                await reject_audio_operation(lease)
+                return TTSResult(success=False, error=exc.code)
         self._last_provider_request_id = ""
         self._last_provider_response_id = ""
+        self._last_provider_response_payload: dict[str, Any] = {}
         source = "indextts2_newapi" if self.provider == "newapi" else "indextts2_fal"
         reservation_id = ""
         try:
             reservation_id = await _reserve_tts_model_call(self.model, source=source)
+            await update_current_model_call_log(
+                request_payload={
+                    "model": self.model,
+                    "input": prompt,
+                    "metadata": {
+                        "audio_url": audio_url,
+                        "should_use_prompt_for_emotion": True,
+                        **(
+                            {"emotion_prompt": str(emotion_prompt).strip()}
+                            if str(emotion_prompt or "").strip()
+                            else {}
+                        ),
+                    },
+                },
+            )
         except Exception as exc:
-            if is_insufficient_credits_error(exc):
+            if lease is not None:
+                await reject_audio_operation(lease)
+            if is_fatal_billing_error(exc):
                 raise
-            detail = str(exc) or repr(exc) or exc.__class__.__name__
-            return TTSResult(success=False, error=f"{exc.__class__.__name__}: {detail}")
+            return TTSResult(
+                success=False,
+                error=f"{exc.__class__.__name__}: credit reservation failed",
+            )
 
-        if self.provider == "newapi":
-            result = await self._generate_via_newapi(
-                prompt=prompt,
-                audio_url=audio_url,
-                output_path=target,
-                emotion_prompt=emotion_prompt,
-            )
-        else:
-            result = await self._generate_via_fal(
-                prompt=prompt,
-                audio_url=audio_url,
-                output_path=target,
-                emotion_prompt=emotion_prompt,
-            )
+        try:
+            if self.provider == "newapi":
+                result = await self._generate_via_newapi(
+                    prompt=prompt,
+                    audio_url=audio_url,
+                    output_path=target,
+                    emotion_prompt=emotion_prompt,
+                    api_key=(
+                        request_credential.api_key if request_credential else None
+                    ),
+                    endpoint=(
+                        request_credential.base_url if request_credential else None
+                    ),
+                )
+            else:
+                result = await self._generate_via_fal(
+                    prompt=prompt,
+                    audio_url=audio_url,
+                    output_path=target,
+                    emotion_prompt=emotion_prompt,
+                )
+        except BaseException:
+            if lease is not None:
+                await mark_audio_operation_unknown(lease)
+            raise
         if result.success:
+            await update_current_model_call_log(
+                response_payload=self._last_provider_response_payload,
+            )
+            if lease is not None:
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                await complete_audio_operation(
+                    lease,
+                    result_ref=f"audio:sha256:{digest}",
+                )
             await _confirm_tts_model_call(
                 model=self.model,
                 reservation_id=reservation_id,
@@ -193,6 +298,12 @@ class IndexTTS2FalClient:
                 response_id=self._last_provider_response_id,
             )
         else:
+            await update_current_model_call_log(
+                response_payload=self._last_provider_response_payload,
+                error_message="tts_generation_failed",
+            )
+            if lease is not None:
+                await mark_audio_operation_unknown(lease)
             await _refund_tts_model_call(
                 reservation_id,
                 source=source,
@@ -230,14 +341,18 @@ class IndexTTS2FalClient:
                 response.raise_for_status()
                 result_url = _extract_audio_url(response.json())
                 if not result_url:
-                    return TTSResult(success=False, error="IndexTTS2 response missing audio URL")
+                    return TTSResult(
+                        success=False, error="IndexTTS2 response missing audio URL"
+                    )
 
                 audio_response = await client.get(result_url)
                 audio_response.raise_for_status()
                 output_path.write_bytes(audio_response.content)
 
             if not output_path.exists() or output_path.stat().st_size <= 0:
-                return TTSResult(success=False, error="IndexTTS2 audio file was not created")
+                return TTSResult(
+                    success=False, error="IndexTTS2 audio file was not created"
+                )
 
             return TTSResult(
                 success=True,
@@ -245,10 +360,11 @@ class IndexTTS2FalClient:
                 duration_seconds=await _audio_duration_seconds(output_path),
             )
         except Exception as exc:
-            if is_insufficient_credits_error(exc):
+            if is_fatal_billing_error(exc):
                 raise
-            detail = str(exc) or repr(exc) or exc.__class__.__name__
-            return TTSResult(success=False, error=f"{exc.__class__.__name__}: {detail}")
+            return TTSResult(
+                success=False, error=f"{exc.__class__.__name__}: Fal audio failed"
+            )
 
     async def _generate_via_newapi(
         self,
@@ -257,10 +373,13 @@ class IndexTTS2FalClient:
         audio_url: str,
         output_path: Path,
         emotion_prompt: str = "",
+        api_key: str | None = None,
+        endpoint: str | None = None,
     ) -> TTSResult:
-        endpoint = str(self.endpoint or "").rstrip("/")
-        if not endpoint.endswith("/audio/speech"):
-            endpoint = f"{endpoint}/audio/speech"
+        request_endpoint = str(endpoint or self.endpoint or "").rstrip("/")
+        if not request_endpoint.endswith("/audio/speech"):
+            request_endpoint = f"{request_endpoint}/audio/speech"
+        request_api_key = api_key if api_key is not None else self.api_key
 
         metadata: dict[str, Any] = {
             "audio_url": audio_url,
@@ -279,9 +398,9 @@ class IndexTTS2FalClient:
                 timeout=self.timeout_seconds, follow_redirects=True
             ) as client:
                 response = await client.post(
-                    endpoint,
+                    request_endpoint,
                     headers={
-                        "Authorization": f"Bearer {self.api_key}",
+                        "Authorization": f"Bearer {request_api_key}",
                         "Content-Type": "application/json",
                     },
                     json=body,
@@ -296,11 +415,16 @@ class IndexTTS2FalClient:
                 content_type = response.headers.get("content-type", "")
                 if "application/json" in content_type.lower():
                     payload = response.json()
+                    self._last_provider_response_payload = payload
                     self._last_provider_request_id = (
                         self._last_provider_request_id
-                        or str(payload.get("request_id") or payload.get("requestId") or "").strip()
+                        or str(
+                            payload.get("request_id") or payload.get("requestId") or ""
+                        ).strip()
                     )
-                    self._last_provider_response_id = str(payload.get("id") or "").strip()
+                    self._last_provider_response_id = str(
+                        payload.get("id") or ""
+                    ).strip()
                     result_url = _extract_audio_url(payload)
                     if not result_url:
                         return TTSResult(
@@ -311,10 +435,16 @@ class IndexTTS2FalClient:
                     audio_response.raise_for_status()
                     output_path.write_bytes(audio_response.content)
                 else:
+                    self._last_provider_response_payload = {
+                        "content_type": content_type,
+                        "content_length": len(response.content),
+                    }
                     output_path.write_bytes(response.content)
 
             if not output_path.exists() or output_path.stat().st_size <= 0:
-                return TTSResult(success=False, error="IndexTTS2 audio file was not created")
+                return TTSResult(
+                    success=False, error="IndexTTS2 audio file was not created"
+                )
 
             return TTSResult(
                 success=True,
@@ -322,7 +452,8 @@ class IndexTTS2FalClient:
                 duration_seconds=await _audio_duration_seconds(output_path),
             )
         except Exception as exc:
-            if is_insufficient_credits_error(exc):
+            if is_fatal_billing_error(exc):
                 raise
-            detail = str(exc) or repr(exc) or exc.__class__.__name__
-            return TTSResult(success=False, error=f"{exc.__class__.__name__}: {detail}")
+            return TTSResult(
+                success=False, error=f"{exc.__class__.__name__}: NewAPI audio failed"
+            )

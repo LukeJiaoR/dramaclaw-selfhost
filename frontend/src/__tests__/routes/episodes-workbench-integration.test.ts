@@ -30,6 +30,19 @@ describe("episodes workbench integration", () => {
     expect(routeSource).toContain("episode.list.planProps");
   });
 
+  it("blocks list-card identity planning until character extraction is ready", () => {
+    expect(routeSource).toContain("useTaskActivity(TASK_TYPES.BUILD_CHARACTERS");
+    expect(routeSource).toContain("identityCharactersRequired");
+    expect(routeSource).toContain("identityCharactersBuilding");
+    expect(routeSource).toContain("identityDisabledReason={identityDisabledReason}");
+  });
+
+  it("blocks list-card scene planning while scene extraction is running", () => {
+    expect(routeSource).toContain("useTaskActivity(TASK_TYPES.BUILD_SCENES");
+    expect(routeSource).toContain("sceneCatalogBuilding");
+    expect(routeSource).toContain("sceneDisabledReason={sceneDisabledReason}");
+  });
+
   it("shows feature credit cost on list-card identity planning actions", () => {
     expect(routeSource).toContain('useGenerationCreditCost("feature", "mainline.identity_planner")');
     expect(routeSource).toContain(

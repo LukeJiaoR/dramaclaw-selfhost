@@ -22,7 +22,13 @@ from novelvideo.config import (
 from novelvideo.models import CharacterIdentity
 from novelvideo.shared.env_guard import preserve_st_env
 from novelvideo.cognee.ladybug_access import ladybug_graph_access
+from novelvideo.knowledge_pipeline import is_structured_pipeline
 from novelvideo.sqlite_store import load_episode_planning_content
+from novelvideo.utils.source_language import (
+    AssetLanguage,
+    asset_language_instruction,
+    detect_asset_language,
+)
 
 if TYPE_CHECKING:
     from novelvideo.cognee import CogneeStore
@@ -40,12 +46,21 @@ def _normalize_age_group_value(v: str) -> str:
     if v in ("child", "youth", "middle", "elder"):
         return v
     mapping = {
-        "儿童": "child", "幼儿": "child", "幼年": "child",
-        "童年": "child", "孩童": "child",
-        "少年": "youth", "teenager": "youth",
-        "青年": "youth", "young": "youth", "adult": "youth",
-        "中年": "middle", "中老年": "middle",
-        "老年": "elder", "老人": "elder", "old": "elder",
+        "儿童": "child",
+        "幼儿": "child",
+        "幼年": "child",
+        "童年": "child",
+        "孩童": "child",
+        "少年": "youth",
+        "teenager": "youth",
+        "青年": "youth",
+        "young": "youth",
+        "adult": "youth",
+        "中年": "middle",
+        "中老年": "middle",
+        "老年": "elder",
+        "老人": "elder",
+        "old": "elder",
     }
     return mapping.get(v, "")
 
@@ -60,8 +75,11 @@ def _merge_age_group_values(existing: str, incoming: str) -> str:
 
 class IdentityRequirement(BaseModel):
     """AI 分析出的单个身份需求。"""
+
     character_name: str = Field(description="角色名（使用主名称）")
-    visual_state: str = Field(description="故事时期或造型分支名称，如 '战神时期'、'皇后宫装'、'皇后便装'、'嫡女时期'")
+    visual_state: str = Field(
+        description="故事时期或造型分支名称，如 '战神时期'、'皇后宫装'、'皇后便装'、'嫡女时期'"
+    )
     age_group: str = Field(
         default="",
         description="该身份对应的年龄段，取值: child/youth/middle/elder。年龄变体必须填写；普通同龄换装留空字符串",
@@ -76,6 +94,7 @@ class IdentityRequirement(BaseModel):
 
 class DefaultIdentityRequirement(BaseModel):
     """Pass A：每个角色的现实主线默认身份。"""
+
     character_name: str = Field(description="角色名（使用主名称）")
     visual_state: str = Field(description="本集现实主线中的默认视觉形态名称")
     age_group: str = Field(
@@ -92,17 +111,17 @@ class DefaultIdentityRequirement(BaseModel):
 
 class EpisodeDefaultIdentities(BaseModel):
     """Pass A 的输出：每个出场角色的默认身份。"""
+
     defaults: list[DefaultIdentityRequirement] = Field(
-        default_factory=list,
-        description="每个出场角色的现实主线默认身份（每人一个）"
+        default_factory=list, description="每个出场角色的现实主线默认身份（每人一个）"
     )
 
 
 class EpisodeIdentityRequirements(BaseModel):
     """Pass B 的输出：其他非默认身份。"""
+
     requirements: list[IdentityRequirement] = Field(
-        default_factory=list,
-        description="本集需要的其他非默认身份列表（不含默认身份）"
+        default_factory=list, description="本集需要的其他非默认身份列表（不含默认身份）"
     )
 
 
@@ -131,9 +150,16 @@ def _appearance_corruption_reason(value: object, field_name: str) -> str | None:
         return "包含结构化输出字段名"
     if lowered == "/* empty */":
         return "包含模型空值哨兵"
-    if "```" in text or "<tool" in lowered or "</tool" in lowered or "@returns" in lowered:
+    if (
+        "```" in text
+        or "<tool" in lowered
+        or "</tool" in lowered
+        or "@returns" in lowered
+    ):
         return "包含工具调用框架"
-    if field_name in {"face_description", "body_type"} and ("\n" in text or "\r" in text):
+    if field_name in {"face_description", "body_type"} and (
+        "\n" in text or "\r" in text
+    ):
         return "短描述包含多行内容"
     if _APPEARANCE_REASONING_RE.search(text):
         return "包含模型推理文本"
@@ -142,6 +168,7 @@ def _appearance_corruption_reason(value: object, field_name: str) -> str | None:
 
 class AppearanceDescription(BaseModel):
     """AI 生成的身份外观描述。"""
+
     appearance_details: str = Field(
         description="外观描述（服装、配饰、发型、整体造型状态，50-80字，不含动作表情）"
     )
@@ -158,7 +185,9 @@ class AppearanceDescription(BaseModel):
         description="仅当身份涉及年龄变化时填写体型描述（如'矮小圆润的幼童体型'、'佝偻消瘦的老人体型'），普通换装不填",
     )
 
-    @field_validator("appearance_details", "face_description", "body_type", mode="before")
+    @field_validator(
+        "appearance_details", "face_description", "body_type", mode="before"
+    )
     @classmethod
     def strip_description(cls, value: object) -> object:
         if value is None:
@@ -207,6 +236,7 @@ class AppearanceDescription(BaseModel):
 
 class EpisodeCastList(BaseModel):
     """AI 从原文中筛选出的出场角色列表。"""
+
     character_names: list[str] = Field(
         description="本集中实际出场的角色名列表（使用主名称）"
     )
@@ -226,7 +256,6 @@ APPEARANCE_GENERATION_PROMPT = """# 你是专业的影视服装造型师
 - body_type: **仅当身份涉及年龄变化**时填写体型描述
   - 包括：身高、体型、体态特征
   - 普通换装身份（同年龄段）不填此项
-- 使用中文
 - 具体、可视化，适合影视美术部门制作参考
 
 ## 示例
@@ -295,8 +324,6 @@ OTHER_IDENTITY_PROMPT = """# 你是影视视觉身份分析师
 """
 
 
-
-
 # =============================================================================
 # IdentityPlanner
 # =============================================================================
@@ -315,6 +342,9 @@ class IdentityPlanner:
 
     def __init__(self, cognee_store: "CogneeStore"):
         self.cognee_store = cognee_store
+        # Reads and writes that need no graph go to the SQLite store directly.
+        self.store = getattr(cognee_store, "sqlite_store", cognee_store)
+        self._structured = is_structured_pipeline(getattr(cognee_store, "state_dir", None))
         self.auto_promoted_characters: list[str] = []
 
     @staticmethod
@@ -324,7 +354,7 @@ class IdentityPlanner:
         normalized_state = str(visual_state or "").strip()
         prefix = normalized_char + "_"
         if normalized_char and normalized_state.startswith(prefix):
-            return normalized_state[len(prefix):].strip()
+            return normalized_state[len(prefix) :].strip()
         return normalized_state
 
     @staticmethod
@@ -358,7 +388,11 @@ class IdentityPlanner:
         """使用 AI 输出的 age_group，并做最小必要的一致性校验。"""
         normalized_age_group = _normalize_age_group_value(age_group)
         inferred_age_group = self._infer_age_group_from_visual_state(visual_state)
-        if inferred_age_group and normalized_age_group and inferred_age_group != normalized_age_group:
+        if (
+            inferred_age_group
+            and normalized_age_group
+            and inferred_age_group != normalized_age_group
+        ):
             raise ValueError(
                 f"身份 `{visual_state}` 的 age_group 冲突: AI={normalized_age_group}, 名称推断={inferred_age_group}"
             )
@@ -374,7 +408,11 @@ class IdentityPlanner:
 
     @staticmethod
     def _identity_model(model_env: str, default_model: str = "gemini-3.5-flash"):
-        return get_newapi_text_pydantic_model(model_env, default_model)
+        return get_newapi_text_pydantic_model(
+            model_env,
+            default_model,
+            capability="text.generate.agent",
+        )
 
     @staticmethod
     def _identity_model_settings() -> dict:
@@ -394,17 +432,23 @@ class IdentityPlanner:
         content_text = await load_episode_planning_content(self.cognee_store, episode)
         if not content_text or not content_text.strip():
             return 0, 0
+        output_language = detect_asset_language(content_text)
 
         # 预筛出场角色（只调一次，后续复用）
         all_chars = self.cognee_store.get_all_characters()
         all_names = [c.name for c in all_chars]
-        cast_names, graph_context = await self._filter_cast(all_names, content_text, episode, on_log)
+        cast_names, graph_context = await self._filter_cast(
+            all_names, content_text, episode, on_log
+        )
         if not cast_names:
-            raise ValueError("Pass 0 未能稳定识别本集出场角色，已中止规划以避免污染已有身份结果")
+            raise ValueError(
+                "Pass 0 未能稳定识别本集出场角色，已中止规划以避免污染已有身份结果"
+            )
 
         # Pass A: 默认身份分析 + resolve
         default_requirements = await self._analyze_default_identities(
-            episode, on_log,
+            episode,
+            on_log,
             cast_names=cast_names,
             content_text=content_text,
             graph_context=graph_context,
@@ -425,17 +469,26 @@ class IdentityPlanner:
                     for d in default_requirements.defaults
                 ]
             )
-            default_new, resolved_ids, resolved_identity_map = await self._resolve_requirements(
-                episode.number, default_as_requirements, on_log
+            default_new, resolved_ids, resolved_identity_map = (
+                await self._resolve_requirements(
+                    episode.number,
+                    default_as_requirements,
+                    on_log,
+                    output_language=output_language,
+                )
             )
             new_count += default_new
             for d in default_requirements.defaults:
-                char_name = self.cognee_store.resolve_name(d.character_name) or d.character_name
+                char_name = (
+                    self.cognee_store.resolve_name(d.character_name) or d.character_name
+                )
                 normalized_visual_state = self._normalize_visual_state_for_char(
                     char_name,
                     d.visual_state,
                 )
-                identity_id = resolved_identity_map.get((char_name, normalized_visual_state))
+                identity_id = resolved_identity_map.get(
+                    (char_name, normalized_visual_state)
+                )
                 if identity_id:
                     identity_default_map[char_name] = identity_id
                     if on_log:
@@ -460,13 +513,13 @@ class IdentityPlanner:
                     + ", ".join(missing_default_chars)
                 )
             raise ValueError(
-                "Pass A 默认身份覆盖不完整: "
-                + ", ".join(missing_default_chars)
+                "Pass A 默认身份覆盖不完整: " + ", ".join(missing_default_chars)
             )
 
         # Pass B: 其他非默认身份分析 + resolve
         special_requirements = await self._analyze_special_identities(
-            episode, on_log,
+            episode,
+            on_log,
             cast_names=cast_names,
             content_text=content_text,
             graph_context=graph_context,
@@ -474,7 +527,10 @@ class IdentityPlanner:
         )
         if special_requirements.requirements:
             special_new, special_ids, _ = await self._resolve_requirements(
-                episode.number, special_requirements, on_log
+                episode.number,
+                special_requirements,
+                on_log,
+                output_language=output_language,
             )
             new_count += special_new
             resolved_seen = set(resolved_ids)
@@ -486,10 +542,10 @@ class IdentityPlanner:
 
         # 保存
         if resolved_ids:
-            char_names = list(dict.fromkeys(
-                iid.split("_", 1)[0] for iid in resolved_ids
-            ))
-            await self.cognee_store.update_episode(
+            char_names = list(
+                dict.fromkeys(iid.split("_", 1)[0] for iid in resolved_ids)
+            )
+            await self._write_episode_identities(
                 episode.number,
                 identity_ids=resolved_ids,
                 character_names=char_names,
@@ -515,20 +571,98 @@ class IdentityPlanner:
         for i, episode in enumerate(sorted_eps):
             if on_progress:
                 on_progress(
-                    (i + 1) / len(sorted_eps),
-                    f"规划第 {episode.number} 集身份..."
+                    (i + 1) / len(sorted_eps), f"规划第 {episode.number} 集身份..."
                 )
             try:
-                new_count, resolved_count = await self.plan_single_episode(episode, on_log)
+                new_count, resolved_count = await self.plan_single_episode(
+                    episode, on_log
+                )
                 results[episode.number] = new_count
                 if on_log:
-                    on_log(f"[EP{episode.number:03d}] 完成, 新建 {new_count} / 复用 {resolved_count - new_count} 个身份")
+                    on_log(
+                        f"[EP{episode.number:03d}] 完成, 新建 {new_count} / 复用 {resolved_count - new_count} 个身份"
+                    )
             except Exception as e:
                 results[episode.number] = -1
                 if on_log:
                     on_log(f"[EP{episode.number:03d}] 失败: {e}")
 
         return results
+
+    async def _write_episode_identities(self, episode_number: int, **fields) -> None:
+        """Persist this episode's identities with a column-level write.
+
+        Identity planning runs alongside scene and prop planning for the same
+        episode, so a whole-row write here would re-serialise — and lose — a
+        menu written meanwhile.
+        """
+        await self.store.patch_episode(episode_number, **fields)
+
+    def _alias_context_from_sqlite(self, all_names: list[str]) -> str:
+        """Build alias context from the character table instead of the graph.
+
+        Structured builds record every alias they could prove from the source
+        text, so the same "陛下 → 萧玦" resolution the graph query provided is
+        already on disk and needs no search to retrieve.
+        """
+        lines: list[str] = []
+        for name in all_names:
+            character = self.store.get_character(self.store.resolve_name(name))
+            if character is None:
+                continue
+            if character.aliases:
+                lines.append(
+                    f"{character.name}：别名/称谓 {'、'.join(character.aliases)}"
+                )
+            else:
+                lines.append(f"{character.name}：无已知别名")
+        return "\n".join(lines)
+
+    async def _graph_alias_context(
+        self, episode: "NovelEpisode", on_log: Optional[Callable] = None
+    ) -> str:
+        """Legacy-only: read alias context from the Cognee graph.
+
+        Failure is non-fatal, as it always was here: the cast filter still runs
+        on the episode text alone, just without alias hints.
+        """
+
+        with preserve_st_env():
+            import cognee
+            from cognee.api.v1.search import SearchType
+
+        try:
+            async with ladybug_graph_access(
+                self.cognee_store.state_dir,
+                read_only=True,
+            ):
+                with self.cognee_store.embedding_model_scope():
+                    graph_results = await cognee.search(
+                        query_text=(
+                            f"第{episode.number}集出场的人物角色，"
+                            "以及他们的别名、称谓和关系"
+                        ),
+                        query_type=SearchType.GRAPH_COMPLETION,
+                        datasets=[self.cognee_store.dataset_name],
+                        only_context=True,
+                        top_k=20,
+                    )
+        except Exception as exc:
+            if on_log:
+                on_log(f"[EP{episode.number:03d}] 图谱上下文获取失败（非致命）: {exc}")
+            return ""
+
+        if not graph_results:
+            return ""
+        parts = []
+        for item in graph_results:
+            if hasattr(item, "search_result"):
+                parts.append(str(item.search_result))
+            elif isinstance(item, dict):
+                parts.append(str(item.get("search_result", item)))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
 
     async def _filter_cast(
         self,
@@ -546,48 +680,24 @@ class IdentityPlanner:
         """
         graph_context = ""
         try:
-            with preserve_st_env():
-                import cognee
-                from cognee.api.v1.search import SearchType
+            if self._structured:
+                # structured_v1 has no graph. Alias resolution comes from the
+                # SQLite alias index and the evidence recorded when characters
+                # were built, both of which are derived from the source text
+                # rather than from a vector search over it.
+                graph_context = self._alias_context_from_sqlite(all_names)
+            else:
+                graph_context = await self._graph_alias_context(episode, on_log)
 
-            # 获取与本集相关的图谱上下文（人物关系、别名、背景信息）
-            try:
-                async with ladybug_graph_access(
-                    self.cognee_store.state_dir,
-                    read_only=True,
-                ):
-                    with self.cognee_store.embedding_model_scope():
-                        graph_results = await cognee.search(
-                            query_text=f"第{episode.number}集出场的人物角色，以及他们的别名、称谓和关系",
-                            query_type=SearchType.GRAPH_COMPLETION,
-                            datasets=[self.cognee_store.dataset_name],
-                            only_context=True,
-                            top_k=20,
-                        )
-                if graph_results:
-                    parts = []
-                    for item in graph_results:
-                        if hasattr(item, 'search_result'):
-                            parts.append(str(item.search_result))
-                        elif isinstance(item, dict):
-                            parts.append(str(item.get('search_result', item)))
-                        else:
-                            parts.append(str(item))
-                    graph_context = "\n".join(parts)
-            except Exception as e:
-                if on_log:
-                    on_log(f"[EP{episode.number:03d}] 图谱上下文获取失败（非致命）: {e}")
-
-            # 用 AI 结构化输出筛选出场角色（结合图谱上下文）
             graph_section = ""
             if graph_context:
                 graph_section = f"""
 
-以下是知识图谱中的人物关系信息（包含别名和称谓解析，如"陛下"→某角色名）：
+以下是已知的人物关系与别名信息（包含称谓解析，如"陛下"→某角色名）：
 ---
 {graph_context[:4000]}
 ---
-利用上述图谱信息，将原文中的称谓/别名解析为角色主名。
+利用上述信息，将原文中的称谓/别名解析为角色主名。
 """
 
             cast_agent = Agent(
@@ -607,7 +717,9 @@ class IdentityPlanner:
             cast = cast_result.output
             filtered = self._normalize_cast_names(cast.character_names)
             if on_log:
-                on_log(f"[EP{episode.number:03d}] 图谱+AI 筛选出场角色: {', '.join(filtered)}")
+                on_log(
+                    f"[EP{episode.number:03d}] 图谱+AI 筛选出场角色: {', '.join(filtered)}"
+                )
             return filtered, graph_context
         except Exception as e:
             if on_log:
@@ -678,7 +790,10 @@ class IdentityPlanner:
         seen_char_to_item: dict[str, DefaultIdentityRequirement] = {}
 
         for item in defaults:
-            char_name = (self.cognee_store.resolve_name(item.character_name) or item.character_name).strip()
+            char_name = (
+                self.cognee_store.resolve_name(item.character_name)
+                or item.character_name
+            ).strip()
             visual_state = self._normalize_visual_state_for_char(
                 char_name,
                 str(item.visual_state or "").strip(),
@@ -694,7 +809,9 @@ class IdentityPlanner:
                 )
             if existing_item:
                 try:
-                    merged_age_group = _merge_age_group_values(existing_item.age_group, item.age_group)
+                    merged_age_group = _merge_age_group_values(
+                        existing_item.age_group, item.age_group
+                    )
                 except ValueError:
                     if on_log:
                         on_log(
@@ -712,7 +829,11 @@ class IdentityPlanner:
                 reason=item.reason,
             )
 
-        missing_chars = [char_name for char_name in canonical_cast_names if char_name not in seen_char_to_item]
+        missing_chars = [
+            char_name
+            for char_name in canonical_cast_names
+            if char_name not in seen_char_to_item
+        ]
         if missing_chars:
             raise ValueError("Pass A 默认身份覆盖不完整: " + ", ".join(missing_chars))
         return list(seen_char_to_item.values())
@@ -737,7 +858,10 @@ class IdentityPlanner:
 
         seen_pairs: dict[tuple[str, str], IdentityRequirement] = {}
         for item in requirements:
-            char_name = (self.cognee_store.resolve_name(item.character_name) or item.character_name).strip()
+            char_name = (
+                self.cognee_store.resolve_name(item.character_name)
+                or item.character_name
+            ).strip()
             visual_state = self._normalize_visual_state_for_char(
                 char_name,
                 str(item.visual_state or "").strip(),
@@ -752,7 +876,9 @@ class IdentityPlanner:
             existing_item = seen_pairs.get(pair)
             if existing_item:
                 try:
-                    merged_age_group = _merge_age_group_values(existing_item.age_group, item.age_group)
+                    merged_age_group = _merge_age_group_values(
+                        existing_item.age_group, item.age_group
+                    )
                 except ValueError:
                     if on_log:
                         on_log(
@@ -814,9 +940,12 @@ class IdentityPlanner:
   - 如果只是同龄造型分支，可留空
 """
         try:
+            language_instruction = asset_language_instruction(
+                detect_asset_language(content_text)
+            )
             agent = Agent(
                 self._identity_model("IDENTITY_PLANNER_ANALYSIS_MODEL"),
-                system_prompt=DEFAULT_IDENTITY_PROMPT,
+                system_prompt=f"{DEFAULT_IDENTITY_PROMPT}\n{language_instruction}",
                 model_settings=self._identity_model_settings(),
                 output_type=EpisodeDefaultIdentities,
             )
@@ -829,7 +958,9 @@ class IdentityPlanner:
             if on_log:
                 for d in result.output.defaults:
                     age_suffix = f", age_group={d.age_group}" if d.age_group else ""
-                    on_log(f"  [Pass A] {d.character_name} -> {d.visual_state}{age_suffix} ({d.reason})")
+                    on_log(
+                        f"  [Pass A] {d.character_name} -> {d.visual_state}{age_suffix} ({d.reason})"
+                    )
             return result.output
         except Exception as e:
             if on_log:
@@ -892,9 +1023,12 @@ class IdentityPlanner:
 - 如果没有其他身份需求，返回空列表
 """
         try:
+            language_instruction = asset_language_instruction(
+                detect_asset_language(content_text)
+            )
             agent = Agent(
                 self._identity_model("IDENTITY_PLANNER_ANALYSIS_MODEL"),
-                system_prompt=OTHER_IDENTITY_PROMPT,
+                system_prompt=f"{OTHER_IDENTITY_PROMPT}\n{language_instruction}",
                 model_settings=self._identity_model_settings(),
                 output_type=EpisodeIdentityRequirements,
             )
@@ -908,7 +1042,9 @@ class IdentityPlanner:
             for req in result.output.requirements:
                 if on_log:
                     age_suffix = f", age_group={req.age_group}" if req.age_group else ""
-                    on_log(f"  [Pass B] {req.character_name} -> {req.visual_state}{age_suffix} ({req.reason})")
+                    on_log(
+                        f"  [Pass B] {req.character_name} -> {req.visual_state}{age_suffix} ({req.reason})"
+                    )
             return result.output
         except Exception as e:
             if on_log:
@@ -948,6 +1084,7 @@ class IdentityPlanner:
         inferred_fish_voice: str,
         reason: str,
         on_log: Optional[Callable] = None,
+        output_language: AssetLanguage | None = None,
     ) -> dict[str, str]:
         appearance_result = await self._generate_appearance(
             char.name,
@@ -955,6 +1092,7 @@ class IdentityPlanner:
             resolved_age_group,
             reason,
             on_log,
+            output_language=output_language,
         )
 
         if isinstance(appearance_result, str):
@@ -965,7 +1103,9 @@ class IdentityPlanner:
         else:
             appearance = appearance_result.appearance_details
             face_description = appearance_result.face_description or ""
-            appearance_age_group = _normalize_age_group_value(appearance_result.age_group)
+            appearance_age_group = _normalize_age_group_value(
+                appearance_result.age_group
+            )
             if (
                 resolved_age_group
                 and appearance_age_group
@@ -988,7 +1128,11 @@ class IdentityPlanner:
         else:
             identity_body_type = ""
 
-        if voice_age_group and voice_age_group == char.age_group and not explicit_age_group:
+        if (
+            voice_age_group
+            and voice_age_group == char.age_group
+            and not explicit_age_group
+        ):
             if on_log:
                 on_log(
                     f"  ⚠ {char.name}_{visual_state}: age_group={voice_age_group} "
@@ -1026,6 +1170,7 @@ class IdentityPlanner:
         pending: bool,
         corrupted_fields: dict[str, str],
         on_log: Optional[Callable] = None,
+        output_language: AssetLanguage | None = None,
     ) -> bool:
         try:
             generated = await self._generate_identity_appearance_updates(
@@ -1036,6 +1181,7 @@ class IdentityPlanner:
                 inferred_fish_voice,
                 reason,
                 on_log,
+                output_language=output_language,
             )
         except Exception:
             if corrupted_fields:
@@ -1067,10 +1213,7 @@ class IdentityPlanner:
                 )
             return True
 
-        repair_updates = {
-            field: generated[field]
-            for field in corrupted_fields
-        }
+        repair_updates = {field: generated[field] for field in corrupted_fields}
         merged_age_group = str(identity.age_group or "").strip()
         merged = {
             "appearance_details": repair_updates.get(
@@ -1107,6 +1250,7 @@ class IdentityPlanner:
         episode_number: int,
         requirements: EpisodeIdentityRequirements,
         on_log: Optional[Callable] = None,
+        output_language: AssetLanguage | None = None,
     ) -> tuple[int, list[str], dict[tuple[str, str], str]]:
         """Phase 2: 匹配已有身份 → 创建缺失身份。
 
@@ -1131,8 +1275,8 @@ class IdentityPlanner:
             candidate_id = f"{char.name}_{vs}"
             explicit_age_group = self._infer_age_group_from_visual_state(vs)
             try:
-                resolved_age_group, inferred_fish_voice = self._seed_identity_structured_fields(
-                    char, vs, req.age_group
+                resolved_age_group, inferred_fish_voice = (
+                    self._seed_identity_structured_fields(char, vs, req.age_group)
                 )
             except ValueError as e:
                 if on_log:
@@ -1140,9 +1284,7 @@ class IdentityPlanner:
                 continue
 
             # 1. 精确匹配 identity_id
-            matched = self._find_matching_identity(
-                char, vs, candidate_id
-            )
+            matched = self._find_matching_identity(char, vs, candidate_id)
 
             if matched:
                 resolved_ids.append(matched.identity_id)
@@ -1165,13 +1307,16 @@ class IdentityPlanner:
                         pending=pending,
                         corrupted_fields=corrupted_fields,
                         on_log=on_log,
+                        output_language=output_language,
                     )
                 else:
                     updates = {}
                     existing_age_group = getattr(matched, "age_group", "")
                     if existing_age_group != resolved_age_group:
                         updates["age_group"] = resolved_age_group
-                    if inferred_fish_voice and not getattr(matched, "fish_voice_id", ""):
+                    if inferred_fish_voice and not getattr(
+                        matched, "fish_voice_id", ""
+                    ):
                         updates["fish_voice_id"] = inferred_fish_voice
                     if updates:
                         try:
@@ -1187,13 +1332,14 @@ class IdentityPlanner:
                                 )
                         except Exception as e:
                             if on_log:
-                                on_log(f"  回填结构字段失败({matched.identity_id}): {e}")
+                                on_log(
+                                    f"  回填结构字段失败({matched.identity_id}): {e}"
+                                )
                     if on_log:
-                        on_log(
-                            f"  复用: {matched.identity_id} (ep{episode_number})"
-                        )
+                        on_log(f"  复用: {matched.identity_id} (ep{episode_number})")
             else:
                 from novelvideo.utils.identity_resolver import compute_char_tag
+
                 identity = CharacterIdentity(
                     identity_id=candidate_id,
                     character_name=char.name,
@@ -1205,9 +1351,7 @@ class IdentityPlanner:
                 )
 
                 try:
-                    await self.cognee_store.add_character_identity(
-                        char.name, identity
-                    )
+                    await self.cognee_store.add_character_identity(char.name, identity)
                     new_count += 1
                     resolved_ids.append(candidate_id)
                     resolved_identity_map[(char.name, vs)] = candidate_id
@@ -1237,6 +1381,7 @@ class IdentityPlanner:
                         pending=True,
                         corrupted_fields={},
                         on_log=on_log,
+                        output_language=output_language,
                     )
                 except Exception as e:
                     if on_log:
@@ -1277,6 +1422,7 @@ class IdentityPlanner:
         planned_age_group: str,
         reason: str,
         on_log: Optional[Callable] = None,
+        output_language: AssetLanguage | None = None,
     ) -> AppearanceDescription:
         """用 AI 生成身份的服装造型描述（含可选面部描述）。"""
         # 获取角色已有造型作为参考（不发送 face_prompt 避免触发安全过滤）
@@ -1307,7 +1453,9 @@ class IdentityPlanner:
 
         planned_age_info = ""
         if planned_age_group:
-            planned_age_info = f"该身份在前一规划阶段已确定年龄段: {planned_age_group}\n"
+            planned_age_info = (
+                f"该身份在前一规划阶段已确定年龄段: {planned_age_group}\n"
+            )
 
         task = f"""为虚构影视角色「{character_name}」的「{visual_state}」造型设计服装方案。
 
@@ -1325,9 +1473,15 @@ class IdentityPlanner:
 """
 
         try:
+            language = output_language or detect_asset_language(
+                "\n".join((character_name, visual_state, reason))
+            )
+            language_instruction = asset_language_instruction(language)
             appearance_agent = Agent(
                 self._identity_model("IDENTITY_PLANNER_APPEARANCE_MODEL"),
-                system_prompt=APPEARANCE_GENERATION_PROMPT,
+                system_prompt=(
+                    f"{APPEARANCE_GENERATION_PROMPT}\n{language_instruction}"
+                ),
                 model_settings=self._identity_model_settings(),
                 output_type=AppearanceDescription,
                 retries={"output": 2},

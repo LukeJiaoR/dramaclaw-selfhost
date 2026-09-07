@@ -16,7 +16,11 @@ from novelvideo.generators import tts_generator, video_composer, video_generator
 from novelvideo.generators.tts_generator import EdgeTTSGenerator, MockTTSGenerator
 from novelvideo.generators.video_composer import SceneAsset, VideoComposer
 from novelvideo.generators.video_generator import MockVideoGenerator
-from novelvideo.task_backend.cancel import TaskCancelled, TaskTimedOut, raise_if_envelope_cancel_requested
+from novelvideo.task_backend.cancel import (
+    TaskCancelled,
+    TaskTimedOut,
+    raise_if_envelope_cancel_requested,
+)
 from novelvideo.task_backend.limits import global_lane_concurrency
 from novelvideo.task_backend.registry import register_project_task_runner
 from novelvideo.task_backend.subprocesses import (
@@ -26,11 +30,11 @@ from novelvideo.task_backend.subprocesses import (
 )
 from novelvideo.task_state import TaskStateManager
 
-
 pytestmark = pytest.mark.m07
 
-
-def _ctx(tmp_path: Path, project_id: str = "proj_l014", requester: str = "editor_1") -> ProjectContext:
+def _ctx(
+    tmp_path: Path, project_id: str = "proj_l014", requester: str = "editor_1"
+) -> ProjectContext:
     return ProjectContext(
         project_id=project_id,
         project_name=project_id,
@@ -55,11 +59,15 @@ def _task_ports(monkeypatch):
     monkeypatch.setattr(registry, "_PORTS", dict(registry._PORTS))
     registry.register_port("cancellation_store", InMemoryCancellationStore())
     monkeypatch.setattr("novelvideo.task_state._task_manager", manager)
-    monkeypatch.setattr("novelvideo.ports.local.tasks.get_task_manager", lambda: manager)
+    monkeypatch.setattr(
+        "novelvideo.ports.local.tasks.get_task_manager", lambda: manager
+    )
     return manager
 
 
-async def _wait_for_status(manager, ctx, task_type: str, status: str, *, episode: int = 1, timeout: float = 3.0):
+async def _wait_for_status(
+    manager, ctx, task_type: str, status: str, *, episode: int = 1, timeout: float = 3.0
+):
     deadline = time.monotonic() + timeout
     observed = None
     while time.monotonic() < deadline:
@@ -108,7 +116,9 @@ async def _wait_until_dead(pid: int, *, timeout: float = 3.0) -> bool:
     return not _pid_alive(pid)
 
 
-async def _wait_lane_idle(backend: InlineTaskBackend, lane: str, *, timeout: float = 3.0) -> None:
+async def _wait_lane_idle(
+    backend: InlineTaskBackend, lane: str, *, timeout: float = 3.0
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if backend.lane_snapshot()[lane]["active"] == 0:
@@ -121,8 +131,7 @@ def _spawn_tree_script(tmp_path: Path) -> tuple[Path, Path]:
     pidfile = tmp_path / "process-tree.pid"
     script = tmp_path / "spawn_tree.py"
     script.write_text(
-        textwrap.dedent(
-            f"""
+        textwrap.dedent(f"""
             import pathlib
             import subprocess
             import sys
@@ -132,17 +141,18 @@ def _spawn_tree_script(tmp_path: Path) -> tuple[Path, Path]:
             pathlib.Path({str(pidfile)!r}).write_text(str(child.pid), encoding="utf-8")
             child.wait()
             time.sleep(30)
-            """
-        ),
+            """),
         encoding="utf-8",
     )
     return script, pidfile
 
 
 @pytest.mark.asyncio
-async def test_gate1_cooperative_cancel_releases_lane_without_outer_task_cancel(_task_ports, tmp_path):
+async def test_gate1_cooperative_cancel_releases_lane_without_outer_task_cancel(
+    _task_ports, signed_inline_backend, tmp_path
+):
     ctx = _ctx(tmp_path)
-    backend = InlineTaskBackend()
+    backend = signed_inline_backend()
     started = threading.Event()
     observed_cancel = threading.Event()
     finished = threading.Event()
@@ -180,9 +190,11 @@ async def test_gate1_cooperative_cancel_releases_lane_without_outer_task_cancel(
 
 
 @pytest.mark.asyncio
-async def test_gate2_cancel_kills_registered_process_group_and_unregisters_handle(_task_ports, tmp_path):
+async def test_gate2_cancel_kills_registered_process_group_and_unregisters_handle(
+    _task_ports, signed_inline_backend, tmp_path
+):
     ctx = _ctx(tmp_path)
-    backend = InlineTaskBackend()
+    backend = signed_inline_backend()
     script, pidfile = _spawn_tree_script(tmp_path)
     started = threading.Event()
     task_type = "l014_gate2_cancel_kills_process_group"
@@ -222,17 +234,22 @@ async def test_gate2_cancel_kills_registered_process_group_and_unregisters_handl
     # Unregistration happens asynchronously in the runner thread after proc.communicate(),
     # so poll for the handle to drain rather than asserting a single instant.
     deadline = time.monotonic() + 3
-    while time.monotonic() < deadline and active_subprocess_count(queued.task_state.task_id) != 0:
+    while (
+        time.monotonic() < deadline
+        and active_subprocess_count(queued.task_state.task_id) != 0
+    ):
         await asyncio.sleep(0.02)
     assert active_subprocess_count(queued.task_state.task_id) == 0
     await _wait_lane_idle(backend, "ffmpeg")
 
 
 @pytest.mark.asyncio
-async def test_gate2_deadline_kills_process_group_and_marks_failed(monkeypatch, _task_ports, tmp_path):
+async def test_gate2_deadline_kills_process_group_and_marks_failed(
+    monkeypatch, _task_ports, signed_inline_backend, tmp_path
+):
     monkeypatch.setenv("ST_PROJECT_TASK_TIMEOUT_S", "1")
     ctx = _ctx(tmp_path)
-    backend = InlineTaskBackend()
+    backend = signed_inline_backend()
     script, pidfile = _spawn_tree_script(tmp_path)
     task_type = "l014_gate2_deadline_kills_process_group"
 
@@ -271,7 +288,9 @@ async def test_gate2_deadline_kills_process_group_and_marks_failed(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_gate2_external_kill_reclassifies_running_subprocess_as_cancelled(tmp_path):
+async def test_gate2_external_kill_reclassifies_running_subprocess_as_cancelled(
+    tmp_path,
+):
     script = tmp_path / "sleep.py"
     script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
     task_id = "l014_external_kill_cancel"
@@ -292,7 +311,9 @@ async def test_gate2_external_kill_reclassifies_running_subprocess_as_cancelled(
                 timeout=30,
                 poll_seconds=5,
             )
-        except BaseException as exc:  # noqa: BLE001 - test records control-flow exception type
+        except (
+            BaseException
+        ) as exc:  # noqa: BLE001 - test records control-flow exception type
             result["exc"] = exc
 
     thread = threading.Thread(target=run_subprocess)
@@ -311,7 +332,9 @@ async def test_gate2_external_kill_reclassifies_running_subprocess_as_cancelled(
 
 
 @pytest.mark.asyncio
-async def test_gate2_control_signals_are_not_swallowed_by_generator_fallbacks(monkeypatch, tmp_path):
+async def test_gate2_control_signals_are_not_swallowed_by_generator_fallbacks(
+    monkeypatch, tmp_path
+):
     def raise_cancelled(*args, **kwargs):
         raise TaskCancelled()
 
@@ -343,7 +366,9 @@ async def test_gate2_control_signals_are_not_swallowed_by_generator_fallbacks(mo
 
 
 @pytest.mark.asyncio
-async def test_gate2_timeout_signals_are_not_swallowed_by_generator_fallbacks(monkeypatch, tmp_path):
+async def test_gate2_timeout_signals_are_not_swallowed_by_generator_fallbacks(
+    monkeypatch, tmp_path
+):
     def raise_timeout(*args, **kwargs):
         raise TaskTimedOut(timeout_seconds=1)
 
@@ -378,12 +403,13 @@ async def test_gate2_timeout_signals_are_not_swallowed_by_generator_fallbacks(mo
 async def test_gate3_world_lane_saturation_does_not_starve_default_lane(
     monkeypatch,
     _task_ports,
+    signed_inline_backend,
     tmp_path,
 ):
     monkeypatch.setenv("ST_CE_GLOBAL_MAX_ACTIVE_WORLD_TASKS", "1")
     monkeypatch.setenv("ST_CE_GLOBAL_MAX_ACTIVE_DEFAULT_TASKS", "1")
     ctx = _ctx(tmp_path)
-    backend = InlineTaskBackend()
+    backend = signed_inline_backend()
     world_release = threading.Event()
     default_done = threading.Event()
 
@@ -424,13 +450,14 @@ async def test_gate3_world_lane_saturation_does_not_starve_default_lane(
 async def test_gate3_same_lane_overflow_is_explicitly_queued_and_cancelable(
     monkeypatch,
     _task_ports,
+    signed_inline_backend,
     tmp_path,
 ):
     monkeypatch.setenv("ST_CE_GLOBAL_MAX_ACTIVE_WORLD_TASKS", "1")
     monkeypatch.setenv("ST_PROJECT_MAX_ACTIVE_WORLD_TASKS", "5")
     monkeypatch.setenv("ST_PROJECT_USER_MAX_ACTIVE_WORLD_TASKS", "5")
     ctx = _ctx(tmp_path)
-    backend = InlineTaskBackend()
+    backend = signed_inline_backend()
     release = threading.Event()
     started = []
 
@@ -461,7 +488,11 @@ async def test_gate3_same_lane_overflow_is_explicitly_queued_and_cancelable(
     pending = _task_ports.get_task_for_project(ctx, "l014_gate3_world_queued", 1)
     assert pending is not None
     assert pending.status == "queued"
-    assert backend.lane_snapshot()["world"] == {"active": 1, "queued": 1, "concurrency": 1}
+    assert backend.lane_snapshot()["world"] == {
+        "active": 1,
+        "queued": 1,
+        "concurrency": 1,
+    }
 
     await backend.cancel_project_task(ctx, queued.task_state)
 
@@ -475,6 +506,7 @@ async def test_gate3_same_lane_overflow_is_explicitly_queued_and_cancelable(
 async def test_gate3_global_lane_queue_overflow_raises_typed_limit_exception(
     monkeypatch,
     _task_ports,
+    signed_inline_backend,
     tmp_path,
 ):
     monkeypatch.setenv("ST_CE_GLOBAL_MAX_ACTIVE_WORLD_TASKS", "1")
@@ -482,7 +514,7 @@ async def test_gate3_global_lane_queue_overflow_raises_typed_limit_exception(
     monkeypatch.setenv("ST_PROJECT_MAX_ACTIVE_WORLD_TASKS", "5")
     monkeypatch.setenv("ST_PROJECT_USER_MAX_ACTIVE_WORLD_TASKS", "5")
     ctx = _ctx(tmp_path)
-    backend = InlineTaskBackend()
+    backend = signed_inline_backend()
     release = threading.Event()
 
     def runner(envelope, run_ctx):
@@ -501,7 +533,9 @@ async def test_gate3_global_lane_queue_overflow_raises_typed_limit_exception(
         episode=1,
         queue_kind="world",
     )
-    await _wait_for_status(_task_ports, ctx, "l014_gate3_world_running_overflow", "running")
+    await _wait_for_status(
+        _task_ports, ctx, "l014_gate3_world_running_overflow", "running"
+    )
     await backend.enqueue_project_task(
         ctx,
         task_type="l014_gate3_world_queued_overflow",
@@ -524,7 +558,9 @@ async def test_gate3_global_lane_queue_overflow_raises_typed_limit_exception(
     assert exc.queue_kind == "world"
     assert exc.limit == 1
     assert exc.queued == 1
-    rejected = _task_ports.get_task_for_project(ctx, "l014_gate3_world_rejected_overflow", 1)
+    rejected = _task_ports.get_task_for_project(
+        ctx, "l014_gate3_world_rejected_overflow", 1
+    )
     assert rejected is not None
     assert rejected.status == "failed"
     release.set()
@@ -562,7 +598,9 @@ def test_gate3_global_lane_queue_limit_exception_maps_to_http_429():
 
 
 @pytest.mark.asyncio
-async def test_gate3_lane_scheduler_uses_independent_global_concurrency_config(monkeypatch):
+async def test_gate3_lane_scheduler_uses_independent_global_concurrency_config(
+    monkeypatch,
+):
     monkeypatch.setenv("ST_PROJECT_MAX_ACTIVE_WORLD_TASKS", "5")
     monkeypatch.setenv("ST_CE_GLOBAL_MAX_ACTIVE_WORLD_TASKS", "1")
 
@@ -573,12 +611,13 @@ async def test_gate3_lane_scheduler_uses_independent_global_concurrency_config(m
 async def test_gate3_multi_project_lane_dispatch_is_project_fair_fifo(
     monkeypatch,
     _task_ports,
+    signed_inline_backend,
     tmp_path,
 ):
     monkeypatch.setenv("ST_CE_GLOBAL_MAX_ACTIVE_WORLD_TASKS", "1")
     monkeypatch.setenv("ST_PROJECT_MAX_ACTIVE_WORLD_TASKS", "5")
     monkeypatch.setenv("ST_PROJECT_USER_MAX_ACTIVE_WORLD_TASKS", "5")
-    backend = InlineTaskBackend()
+    backend = signed_inline_backend()
     ctx_a = _ctx(tmp_path, "proj_l014_a", requester="editor_a")
     ctx_b = _ctx(tmp_path, "proj_l014_b", requester="editor_b")
     release_first = threading.Event()

@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { PanoViewerManifest } from "@/features/viewer-kit/pano/panoManifest";
 import type { DirectorStageManifest } from "@/features/viewer-kit/three-d/directorManifest";
 import type { ThreeDSceneSnapshot } from "@/features/viewer-kit/three-d/engine/viewerApp";
-import { api } from "@/lib/api";
+import { api, uploadApi } from "@/lib/api";
 import { jsonWithBackendError } from "@/lib/api-errors";
 import { p } from "@/lib/api-path";
 import { queryKeys } from "@/lib/query-keys";
@@ -51,9 +51,32 @@ export function useScenes(project: string) {
     queryKey: queryKeys.scenes(project),
     queryFn: ({ signal }) =>
       api
-        .get(p`api/v1/projects/${project}/scenes`, { signal })
+        .get(p`api/v1/projects/${project}/scenes`, {
+          signal,
+          searchParams: { summary: "true" },
+        })
         .json<OkResponse<SceneAsset[]>>(),
     enabled: !!project,
+  });
+}
+
+/** Full file/manifests payload for only the scene group currently on screen. */
+export function useSceneDetails(project: string, names: string[]) {
+  const signature = JSON.stringify(
+    [...new Set(names.map((name) => name.trim()).filter(Boolean))].sort(),
+  );
+  const requestedNames = JSON.parse(signature) as string[];
+  return useQuery({
+    queryKey: queryKeys.sceneDetails(project, signature),
+    queryFn: ({ signal }) => {
+      const searchParams = new URLSearchParams();
+      searchParams.set("summary", "false");
+      for (const name of requestedNames) searchParams.append("names", name);
+      return api
+        .get(p`api/v1/projects/${project}/scenes`, { signal, searchParams })
+        .json<OkResponse<SceneAsset[]>>();
+    },
+    enabled: !!project && requestedNames.length > 0,
   });
 }
 
@@ -238,7 +261,7 @@ export function useUploadSceneMaster(project: string, name: string) {
     mutationFn: async (file: File) => {
       const formData = new FormData();
       formData.append("file", file);
-      return api
+      return uploadApi
         .post(p`api/v1/projects/${project}/scenes/${name}/master/upload`, {
           body: formData,
         })
@@ -289,7 +312,7 @@ export function useUploadScenePano(project: string, name: string) {
     mutationFn: async (file: File) => {
       const formData = new FormData();
       formData.append("file", file);
-      return api
+      return uploadApi
         .post(p`api/v1/projects/${project}/scenes/${name}/pano/upload`, {
           body: formData,
         })
@@ -305,7 +328,7 @@ export function useUploadSceneCustomPackage(project: string, name: string) {
     mutationFn: async (file: File) => {
       const formData = new FormData();
       formData.append("file", file);
-      return api
+      return uploadApi
         .post(p`api/v1/projects/${project}/scenes/${name}/custom/upload`, {
           body: formData,
         })

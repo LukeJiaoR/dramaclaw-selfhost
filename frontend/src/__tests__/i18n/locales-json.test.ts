@@ -31,6 +31,13 @@ describe("locale translation files", () => {
     expect([...enKeys].filter((key) => !zhKeys.has(key)).sort()).toEqual([]);
   });
 
+  it("defines the Niu Lai accessory name and selection feedback", () => {
+    const zh = JSON.parse(readFileSync("public/locales/zh/translation.json", "utf8"));
+
+    expect(zh.myBuddy.debug.accessories.niulai).toBe("牛来");
+    expect(zh.myBuddy.debug.accessoryFeedback.niulai).toBe("妈妈！");
+  });
+
   it("uses the requested custom prompt label for Seedance2 guidance in Chinese", () => {
     const content = readFileSync("public/locales/zh/translation.json", "utf8");
     const translations = JSON.parse(content);
@@ -52,6 +59,15 @@ describe("locale translation files", () => {
     expect(translations.common.projectDefaultQueueFull).toBe(
       "当前项目默认队列已满",
     );
+  });
+
+  it("defines organization, platform, and node queue limit toasts in Chinese", () => {
+    const content = readFileSync("public/locales/zh/translation.json", "utf8");
+    const translations = JSON.parse(content);
+
+    expect(translations.common.organizationDefaultQueueFull).toBe("当前组织默认队列已满");
+    expect(translations.common.platformDefaultQueueFull).toBe("平台默认队列已满");
+    expect(translations.common.nodeDefaultQueueFull).toBe("当前节点默认队列已满");
   });
 
   it("defines project queue kind labels in Chinese", () => {

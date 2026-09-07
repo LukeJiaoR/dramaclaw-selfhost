@@ -107,6 +107,11 @@ class _RewriteRouteStore:
         assert ep_num == self.episode.number
         self.adapted_content = content
 
+    async def patch_episode(self, episode_number: int, **updates) -> None:
+        # The real store offers both; the rewrite route takes the
+        # column-level one so it cannot roll back planned menus.
+        await self.update_episode(episode_number, **updates)
+
     async def update_episode(self, episode_number: int, **updates) -> None:
         self.episode_updates.append((episode_number, updates))
         for key, value in updates.items():
@@ -310,9 +315,12 @@ async def test_content_rewriter_uses_newapi_text_model(monkeypatch) -> None:
                 },
             )()
 
-    def fake_newapi_model(model_env: str, default_model: str):
+    def fake_newapi_model(
+        model_env: str, default_model: str, *, capability: str = "text.generate"
+    ):
         calls["model_env"] = model_env
         calls["default_model"] = default_model
+        calls["capability"] = capability
         return "newapi-model"
 
     def fake_newapi_settings():
@@ -346,6 +354,7 @@ async def test_content_rewriter_uses_newapi_text_model(monkeypatch) -> None:
     assert calls["model"] == "newapi-model"
     assert calls["model_env"] == "CONTENT_REWRITER_MODEL"
     assert calls["default_model"] == "gpt-5.4-mini"
+    assert calls["capability"] == "text.generate"
     assert calls["structured_settings_called"] is True
 
 

@@ -16,6 +16,7 @@ from uuid import UUID
 
 # 重要：必须先导入 config，在 cognee 被导入之前设置环境变量
 from .config import init_cognee  # noqa: F401
+from novelvideo.i18n_message import MessageLike, lmsg
 from novelvideo.config import get_newapi_structured_output_litellm_kwargs
 from .concurrency import cognee_pipeline_concurrency
 from .ladybug_access import cognee_project_context, ladybug_graph_access
@@ -35,7 +36,10 @@ from novelvideo.graph_preview import (
     delete_graph_preview,
     write_graph_preview,
 )
-from novelvideo.official_defaults import DEFAULT_COGNEE_LLM_MODEL
+from novelvideo.knowledge_pipeline import (
+    KnowledgePipelineUnsupported,
+    is_structured_pipeline,
+)
 from novelvideo.novel_source import require_imported_novel
 from novelvideo.project_config import ensure_cognee_embedding_binding_in_state_dir
 from novelvideo.sqlite_store import SQLiteStore
@@ -50,6 +54,7 @@ from novelvideo.utils.path_resolver import (  # noqa: F401
 )
 
 from novelvideo.models import (
+    BeatAssetRefRow,
     CharacterIdentity,
     NovelCharacter,
     NovelEpisode,
@@ -59,8 +64,6 @@ from novelvideo.models import (
     SceneMenuItem,
     NovelProp,
     PropMenuItem,
-    build_scene_menu,
-    build_prop_menu,
     complete_detected_refs_from_visual_description,
     normalize_detected_identities,
     normalize_detected_props,
@@ -144,17 +147,18 @@ class CogneeStore:
 
             self.project_dir = ensure_project_dirs(project_name)["base"]
 
-        if sqlite_state_dir:
-            default_state_dir = Path(sqlite_state_dir)
+        if state_dir:
+            resolved_state_dir = Path(state_dir)
+        elif sqlite_state_dir:
+            resolved_state_dir = Path(sqlite_state_dir)
         elif "/" in project_name:
             from novelvideo.utils.project_paths import ProjectPaths
 
             parts = project_name.split("/", 1)
             paths = ProjectPaths(parts[0], parts[1])
-            paths.bootstrap_from_legacy_output()
-            default_state_dir = paths.state_dir
+            resolved_state_dir = paths.state_dir
         else:
-            default_state_dir = Path(self.project_dir)
+            resolved_state_dir = Path(self.project_dir)
 
         if (
             state_dir
@@ -165,11 +169,6 @@ class CogneeStore:
                 "CogneeStore state_dir must match injected SQLiteStore state_dir: "
                 f"state_dir={state_dir}, sqlite_store.state_dir={sqlite_state_dir}"
             )
-        if state_dir:
-            resolved_state_dir = Path(state_dir)
-        else:
-            resolved_state_dir = default_state_dir
-
         resolved_state_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir = str(resolved_state_dir)
         self.db_path = str(resolved_state_dir / "data.db")
@@ -290,7 +289,36 @@ class CogneeStore:
         """统一别名查找键，降低空格/大小写差异导致的失配。"""
         return " ".join((value or "").replace("\u3000", " ").strip().lower().split())
 
+    @property
+    def _cognee_enabled(self) -> bool:
+        """Whether this project may touch Cognee, embeddings or the graph.
+
+        Resolved lazily from the project's recorded track so that stores built
+        without ``initialize()`` (legacy tests, ad-hoc scripts) are gated too.
+        ``initialize()`` overwrites the cached value once it has decided.
+        """
+        cached = self.__dict__.get("_cognee_enabled_flag")
+        if cached is None:
+            cached = not is_structured_pipeline(self.__dict__.get("state_dir"))
+            self.__dict__["_cognee_enabled_flag"] = cached
+        return cached
+
+    def _require_cognee(self, operation: str) -> None:
+        """Fail loudly instead of silently falling back to the Cognee path.
+
+        A fallback here would bind a structured project to an embedding model,
+        which is the one outcome the second track exists to prevent.
+        """
+        if not self._cognee_enabled:
+            raise KnowledgePipelineUnsupported(
+                f"{operation} is unavailable for structured_v1 projects"
+            )
+
     def embedding_model_scope(self):
+        # Guarded as well as the public graph methods: entering the scope is how
+        # an embedding binding gets created, so a caller reaching past the public
+        # API must not be able to bind a structured project by accident.
+        self._require_cognee("embedding model scope")
         model = getattr(self, "cognee_embedding_model", None)
         dimensions = getattr(self, "cognee_embedding_dimensions", None)
         if not model or dimensions is None:
@@ -400,9 +428,27 @@ class CogneeStore:
         operation: Callable[[], Awaitable[Any]],
         log: Callable[[str], None],
     ) -> Any:
-        """Run a Cognee pipeline stage once, retrying one transient failure."""
+        """Run a Cognee pipeline stage once, retrying one transient failure.
+
+        The retry is skipped under organization egress. A second attempt runs
+        in the same request scope, so every submit it makes is a fresh
+        occurrence with its own operation key — the durable ledger cannot tell
+        it from new work and the organization pays twice for the batches that
+        had already succeeded. Failing closed matches what this codebase
+        already does with every other retry knob it can reach under
+        organization egress (model_gateway_runtime.py:53-57 forces zero output
+        retries, cognee/config.py:807 forces max_retries=0).
+        """
+        from novelvideo.model_gateway_runtime import current_model_gateway_context
+
+        gateway_context = current_model_gateway_context()
+        attempts = (
+            1
+            if gateway_context is not None and gateway_context.is_organization
+            else 2
+        )
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(attempts):
             try:
                 async with cognee_pipeline_concurrency():
                     with self.embedding_model_scope():
@@ -411,7 +457,7 @@ class CogneeStore:
                 return result
             except Exception as exc:
                 last_error = exc
-                if attempt == 0:
+                if attempt + 1 < attempts:
                     log(f"{stage_name}失败，准备重试(1/1): {exc}")
                     await asyncio.sleep(0)
                     continue
@@ -431,7 +477,25 @@ class CogneeStore:
         return await store._ensure_db()
 
     async def initialize(self):
-        """初始化 SQLite 数据库和 Cognee 配置。"""
+        """初始化 SQLite 数据库和 Cognee 配置。
+
+        structured_v1 项目降级为纯 SQLite 门面而不是抛异常：生产中有大量
+        runner 和 API 依赖（肖像、参考图、剧本、分镜、视频、Freezone 等）只把
+        本类当 SQLite 门面使用，完全不需要图谱。在这里硬失败会让这些路径在
+        新项目上全线 500。图谱能力本身由 ``_require_cognee`` 单独把守。
+        """
+        # 必须先判定 track，再决定是否绑定 embedding：
+        # ensure_cognee_embedding_binding_in_state_dir() 会为缺字段的项目回填
+        # 绑定并写回 project_config.json，一旦调用就再也退不回去了。
+        if is_structured_pipeline(self.state_dir):
+            self.__dict__["_cognee_enabled_flag"] = False
+            await self._ensure_db()
+            console.print(
+                f"[dim]存储层已初始化 (structured_v1, 无图谱, db: {self.db_path})[/dim]"
+            )
+            return
+
+        self.__dict__["_cognee_enabled_flag"] = True
         embedding_binding = ensure_cognee_embedding_binding_in_state_dir(self.state_dir)
         self.cognee_embedding_model = embedding_binding.internal_model
         self.cognee_embedding_dimensions = embedding_binding.dimensions
@@ -523,6 +587,7 @@ class CogneeStore:
         on_log: Optional[Callable[[str], None]] = None,
     ) -> dict:
         """快速导入，并独占当前项目的 Cognee/Ladybug 图谱。"""
+        self._require_cognee("Cognee graph ingest")
         async with ladybug_graph_access(self.state_dir, read_only=False):
             return await self._ingest_novel_fast_locked(
                 novel_path,
@@ -542,11 +607,11 @@ class CogneeStore:
     ) -> dict:
         """在项目图谱锁内构建 Cognee 图谱，不提取角色/剧集。"""
 
-        def report(progress: float, task: str):
+        def report(progress: float, task: MessageLike):
             if on_progress:
                 on_progress(progress, task)
 
-        def log(message: str):
+        def log(message: MessageLike):
             if on_log:
                 on_log(message)
             console.print(f"[dim]{message}[/dim]")
@@ -556,12 +621,27 @@ class CogneeStore:
 
         from .config import init_cognee
 
-        report(INGEST_PROGRESS_MILESTONES["read"], "读取并校验原文...")
-        log(f"读取文件: {novel_path}")
+        report(
+            INGEST_PROGRESS_MILESTONES["read"],
+            lmsg("tasks.progress.ingest.reading", "读取并校验原文..."),
+        )
+        log(
+            lmsg(
+                "tasks.log.ingest.readingFile",
+                f"读取文件: {novel_path}",
+                path=str(novel_path),
+            )
+        )
         content = load_novel_text(novel_path)
         if not content.strip():
             raise ValueError("小说内容为空，无法导入")
-        log(f"文件读取完成: {len(content)} 字符")
+        log(
+            lmsg(
+                "tasks.log.ingest.readComplete",
+                f"文件读取完成: {len(content)} 字符",
+                charCount=len(content),
+            )
+        )
         self._novel_content = content
 
         if str(spine_template or "").strip() == "drama":
@@ -654,6 +734,7 @@ class CogneeStore:
         }
 
     async def materialize_graph_preview(self, max_nodes: int = 48) -> dict:
+        self._require_cognee("graph preview")
         async with ladybug_graph_access(self.state_dir, read_only=True):
             snapshot = await self.get_graph_snapshot(max_nodes=max_nodes)
             if not snapshot.get("nodes"):
@@ -670,6 +751,7 @@ class CogneeStore:
         oversized or vector-shaped values before returning them to the browser.
         """
 
+        self._require_cognee("graph snapshot")
         max_nodes = max(20, min(int(max_nodes), 80))
         max_edges = min(max_nodes * 3, 160)
         raw_nodes, raw_edges = await self._get_dataset_graph_data(
@@ -915,13 +997,14 @@ class CogneeStore:
         图谱构建只负责发现缺失的基础角色。已有角色可能已经有用户编辑、
         身份图、声线和资产配置，不能被一次图谱重扫覆盖。
         """
+        self._require_cognee("graph character build")
         from .pipeline import extract_characters_from_graph
 
-        def report(progress: float, task: str):
+        def report(progress: float, task: MessageLike):
             if on_progress:
                 on_progress(progress, task)
 
-        def log(message: str):
+        def log(message: MessageLike):
             if on_log:
                 on_log(message)
             console.print(f"[dim]{message}[/dim]")
@@ -990,19 +1073,25 @@ class CogneeStore:
         """规划剧集（分阶段架构第三步）。"""
         from .pipeline import extract_episodes_with_characters
 
-        def report(progress: float, task: str):
+        def report(progress: float, task: MessageLike):
             if on_progress:
                 on_progress(progress, task)
 
-        def log(message: str):
+        def log(message: MessageLike):
             if on_log:
                 on_log(message)
             console.print(f"[dim]{message}[/dim]")
 
         # 获取原文内容
-        log("从文件加载原文...")
+        log(lmsg("tasks.log.source.loading", "从文件加载原文..."))
         novel_content = require_imported_novel(self.project_dir)
-        log(f"原文加载完成: {len(novel_content)} 字符")
+        log(
+            lmsg(
+                "tasks.log.source.loaded",
+                f"原文加载完成: {len(novel_content)} 字符",
+                charCount=len(novel_content),
+            )
+        )
 
         # 获取已确认的角色列表
         character_names = list(self._characters.keys())
@@ -1045,114 +1134,20 @@ class CogneeStore:
         on_progress: Optional[Callable[[float, str], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
     ) -> List[NovelEpisode]:
-        """从小说章节结构创建剧集（章节映射模式）。"""
-        from novelvideo.cognee.chapter_detector import ChapterDetector
+        """从小说章节结构创建剧集（章节映射模式）。
 
-        def report(progress: float, task: str):
-            if on_progress:
-                on_progress(progress, task)
-
-        def log(message: str):
-            if on_log:
-                on_log(message)
-            console.print(f"[dim]{message}[/dim]")
-
-        # 获取小说原文
-        if novel_text is None:
-            log("从文件加载原文...")
-            novel_text = require_imported_novel(self.project_dir)
-            log(f"原文加载完成: {len(novel_text)} 字符")
-
-        # 清理剧集内容
-        await self.clear_episode_contents()
-
-        # P1: 检测章节
-        report(0.1, "检测章节结构...")
-        log("检测章节结构...")
-        detector = ChapterDetector()
-        chapters = detector.detect(novel_text)
-
-        if not chapters:
-            raise ValueError("未检测到章节标记，请使用 AI 规划模式")
-
-        log(f"检测到 {len(chapters)} 个章节")
-
-        episodes = []
-        chapter_contents = {}  # 收集章节内容，最后统一写入
-        total = len(chapters)
-
-        for i, chapter in enumerate(chapters):
-            progress = 0.1 + (i / total) * 0.7
-            report(progress, f"处理第 {chapter.number} 章...")
-
-            # 收集章节内容（稍后写入，避免与 _delete_old_episodes 冲突）
-            chapter_contents[chapter.number] = chapter.content
-
-            if generate_metadata:
-                log(f"为第 {chapter.number} 章生成元数据...")
-                metadata = await self._generate_episode_metadata(chapter.number, chapter.content)
-            else:
-                summary = chapter.content[:200].strip()
-                if len(chapter.content) > 200:
-                    summary += "..."
-                metadata = {
-                    "title": f"第{chapter.number}集",
-                    "summary": summary,
-                    "conflict": "",
-                    "cliffhanger": "",
-                    "key_events": [],
-                    "characters": [],
-                }
-
-            episode = NovelEpisode(
-                number=chapter.number,
-                title=metadata.get("title", f"第{chapter.number}集"),
-                chapter_start=chapter.number,
-                chapter_end=chapter.number,
-                content_summary=metadata.get("summary", ""),
-                main_conflict=metadata.get("conflict", ""),
-                cliffhanger=metadata.get("cliffhanger", ""),
-                key_events=metadata.get("key_events", []),
-                character_names=metadata.get("characters", []),
-            )
-            episodes.append(episode)
-
-        # P2: 合并剧集（保留已有的已规划资产字段）
-        report(0.82, "合并剧集数据...")
-        log("合并剧集数据（保留身份、场景、道具和颜色）...")
-        new_numbers = {ep.number for ep in episodes}
-        for ep in episodes:
-            old = self._episodes.get(ep.number)
-            if old:
-                ep.identity_ids = old.identity_ids
-                ep.scene_menu = old.scene_menu
-                ep.prop_menu = old.prop_menu
-                ep.sketch_colors_json = old.sketch_colors_json
-
-        # 删除不再存在的旧剧集
-        old_numbers = set(self._episodes.keys())
-        removed = old_numbers - new_numbers
-        if removed:
-            await self.sqlite_store.delete_episodes_by_numbers(removed)
-            log(f"已删除 {len(removed)} 个旧剧集")
-        self._episodes.clear()
-
-        # P3: 保存新剧集
-        report(0.88, "保存到数据库...")
-        log("保存剧集到数据库...")
-        await self.add_episodes(episodes)
-
-        # P3.5: 保存章节原文内容
-        for ep_num, content in chapter_contents.items():
-            await self.save_episode_content(ep_num, content)
-
-        # P4: 更新内存缓存
-        for ep in episodes:
-            self._episodes[ep.number] = ep
-
-        report(1.0, "章节映射完成")
-        log(f"章节映射完成: {len(episodes)} 集")
-
+        Chapter mapping reads the source text and writes SQLite; it never
+        touches the graph, so the implementation lives on SQLiteStore where
+        both tracks can reach it. This stays as a delegate so legacy callers
+        and the in-memory episode cache behave exactly as before.
+        """
+        episodes = await self.sqlite_store.build_episodes_from_chapters(
+            novel_text=novel_text,
+            generate_metadata=generate_metadata,
+            on_progress=on_progress,
+            on_log=on_log,
+        )
+        self._sync_sqlite_caches()
         return episodes
 
     async def build_episodes_from_events(
@@ -1165,20 +1160,26 @@ class CogneeStore:
         from novelvideo.cognee.chapter_detector import ChapterDetector
         from novelvideo.cognee.event_extractor import EventExtractor
 
-        def report(progress: float, task: str):
+        def report(progress: float, task: MessageLike):
             if on_progress:
                 on_progress(progress, task)
 
-        def log(message: str):
+        def log(message: MessageLike):
             if on_log:
                 on_log(message)
             console.print(f"[dim]{message}[/dim]")
 
         # 1. 加载原文并检测章节
-        log("从文件加载原文...")
+        log(lmsg("tasks.log.source.loading", "从文件加载原文..."))
         novel_text = require_imported_novel(self.project_dir)
 
-        log(f"原文加载完成: {len(novel_text)} 字符")
+        log(
+            lmsg(
+                "tasks.log.source.loaded",
+                f"原文加载完成: {len(novel_text)} 字符",
+                charCount=len(novel_text),
+            )
+        )
 
         # 清理剧集内容
         await self.clear_episode_contents()
@@ -1280,7 +1281,7 @@ class CogneeStore:
         import json
         import litellm
 
-        def log(msg: str):
+        def log(msg: MessageLike):
             if on_log:
                 on_log(msg)
 
@@ -1345,55 +1346,6 @@ class CogneeStore:
                 assignments[ep_num].append(event.event_id)
             return assignments
 
-    async def _generate_episode_metadata(self, episode_num: int, content: str) -> dict:
-        """使用 LLM 生成剧集元数据。"""
-        try:
-            import litellm
-
-            truncated = content[:8000] if len(content) > 8000 else content
-
-            prompt = f"""请分析以下章节内容，提取关键信息。
-
-章节内容：
-{truncated}
-
-请用 JSON 格式返回以下信息：
-{{
-    "title": "一个吸引人的标题（10字以内）",
-    "summary": "内容摘要（50-100字）",
-    "conflict": "主要冲突或矛盾",
-    "cliffhanger": "结尾悬念（如果有）",
-    "key_events": ["关键事件1", "关键事件2"],
-    "characters": ["出场角色1", "出场角色2"]
-}}
-
-只返回 JSON，不要有其他内容。"""
-
-            response = await litellm.acompletion(
-                model=os.environ.get("LLM_MODEL", "").strip()
-                or DEFAULT_COGNEE_LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                response_format={"type": "json_object"},
-                **get_newapi_structured_output_litellm_kwargs(),
-            )
-
-            import json
-
-            result = json.loads(response.choices[0].message.content)
-            return result
-
-        except Exception as e:
-            console.print(f"[yellow]元数据生成失败: {e}，使用默认值[/yellow]")
-            return {
-                "title": f"第{episode_num}集",
-                "summary": content[:200] + "..." if len(content) > 200 else content,
-                "conflict": "",
-                "cliffhanger": "",
-                "key_events": [],
-                "characters": [],
-            }
-
     async def add_episodes(self, episodes: List[NovelEpisode]) -> None:
         """批量添加剧集到 SQLite。"""
         await self.sqlite_store.add_episodes(episodes)
@@ -1413,7 +1365,7 @@ class CogneeStore:
     ) -> dict:
         """导入小说文本 + 提取角色 + 规划剧集。"""
 
-        def report(progress: float, task: str):
+        def report(progress: float, task: MessageLike):
             if on_progress:
                 on_progress(progress, task)
 
@@ -1475,66 +1427,18 @@ class CogneeStore:
                 return candidate
         return None
 
-    def _normalize_prop_menu_items(self, prop_menu: Iterable[Any] | None) -> list[PropMenuItem]:
-        """将 episode prop_menu 规范化为资产库标准 prop_id。"""
-        normalized_items = build_prop_menu(prop_menu=list(prop_menu or []))
-        canonical_items: list[PropMenuItem] = []
-        for item in normalized_items:
-            prop_id = str(item.prop_id or "").strip()
-            if not prop_id:
-                continue
-            cached = self.get_cached_prop(prop_id)
-            canonical_id = cached.name if cached else prop_id
-            canonical_items.append(
-                PropMenuItem(
-                    prop_id=canonical_id,
-                    prop_type=(getattr(cached, "prop_type", "") if cached else item.prop_type)
-                    or "object",
-                    visual_prompt=(
-                        getattr(cached, "visual_prompt", "")
-                        or getattr(cached, "description", "")
-                        or item.visual_prompt
-                    ),
-                    description=(
-                        getattr(cached, "visual_prompt", "")
-                        or getattr(cached, "description", "")
-                        or item.description
-                    ),
-                    owner_identity_id=item.owner_identity_id or getattr(cached, "owner", ""),
-                )
-            )
-        return build_prop_menu(prop_menu=canonical_items)
 
     async def _normalize_scene_menu_items(
         self, scene_menu: Iterable[Any] | None
     ) -> list[SceneMenuItem]:
-        """将 episode scene_menu 规范化为资产库标准 scene_id。"""
-        normalized_items = build_scene_menu(scene_menu=list(scene_menu or []))
-        canonical_items: list[SceneMenuItem] = []
-        all_scenes = await self.sqlite_store.list_scenes()
-        for item in normalized_items:
-            scene_id = str(item.scene_id or "").strip()
-            if not scene_id:
-                continue
-            canonical_id = scene_id
-            lookup = self._normalize_alias_lookup(scene_id)
-            for candidate in all_scenes:
-                if self._normalize_alias_lookup(candidate.name) == lookup:
-                    canonical_id = candidate.name
-                    break
-                aliases = getattr(candidate, "aliases", []) or []
-                if any(self._normalize_alias_lookup(alias) == lookup for alias in aliases):
-                    canonical_id = candidate.name
-                    break
-            canonical_items.append(
-                SceneMenuItem(
-                    scene_id=canonical_id,
-                    base_scene_id=str(getattr(item, "base_scene_id", "") or "").strip(),
-                    variant_id=str(getattr(item, "variant_id", "") or "").strip(),
-                    time_of_day=str(getattr(item, "time_of_day", "") or "").strip(),
-                )
-            )
-        return build_scene_menu(scene_menu=canonical_items)
+        """Delegate to the shared normalizer owned by SQLiteStore."""
+        return await self.sqlite_store._normalize_scene_menu_items(scene_menu)
+
+    def _normalize_prop_menu_items(
+        self, prop_menu: Iterable[Any] | None
+    ) -> list[PropMenuItem]:
+        """Delegate to the shared normalizer owned by SQLiteStore."""
+        return self.sqlite_store._normalize_prop_menu_items(prop_menu)
 
     def get_character(self, name: str) -> Optional[NovelCharacter]:
         """获取角色（支持别名）。"""
@@ -1560,6 +1464,7 @@ class CogneeStore:
 
     async def search(self, query: str, mode: str = "graph", top_k: int = 10) -> str:
         """语义检索。"""
+        self._require_cognee("graph search")
         async with ladybug_graph_access(self.state_dir, read_only=True):
             with preserve_st_env():
                 from cognee.modules.data.exceptions.exceptions import DatasetNotFoundError
@@ -1723,7 +1628,10 @@ class CogneeStore:
                     ids = [new_id if x == old_id else x for x in ids]
                 else:
                     ids = [x for x in ids if x != old_id]
-                await self.update_episode(ep.number, identity_ids=ids)
+                # Column-level: renaming or deleting an identity can happen
+                # while planning is running, and a whole-row write here would
+                # discard whatever menu landed in between.
+                await self.patch_episode(ep.number, identity_ids=ids)
 
     async def delete_identity_image(
         self,
@@ -1782,6 +1690,19 @@ class CogneeStore:
         """添加单个剧集。"""
         await self.add_episodes([episode])
         self._episodes[episode.number] = episode
+
+    async def patch_episode(self, episode_number: int, **fields) -> None:
+        """Column-level update, delegated to SQLiteStore.
+
+        The facade offers this so its own methods — the identity cascade among
+        them — can write a single column without re-serialising the row, and so
+        the shared cache is refreshed the same way whichever store a caller
+        holds.
+        """
+        await self.sqlite_store.patch_episode(episode_number, **fields)
+        refreshed = await self.sqlite_store.get_episode_from_graph(episode_number)
+        if refreshed is not None:
+            self._episodes[episode_number] = refreshed
 
     async def update_episode(self, episode_number: int, **updates) -> None:
         """更新剧集属性。"""
@@ -1890,13 +1811,14 @@ class CogneeStore:
         这里只补缺失的基础场景；已有基础场景和派生 plate 都是资产事实，
         不能被一次图谱重扫清空或覆盖。
         """
+        self._require_cognee("graph scene build")
         from .pipeline import extract_scenes_from_graph
 
-        def report(progress: float, task: str):
+        def report(progress: float, task: MessageLike):
             if on_progress:
                 on_progress(progress, task)
 
-        def log(message: str):
+        def log(message: MessageLike):
             if on_log:
                 on_log(message)
             console.print(f"[dim]{message}[/dim]")
@@ -1922,19 +1844,43 @@ class CogneeStore:
         log(f"从图谱提取了 {len(scenes)} 个场景")
         report(0.8, "保存新增场景...")
         log("保存新增场景到数据库...")
+        from .pipeline import should_repair_scene_placeholder
+
         added: list[NovelScene] = []
         skipped = 0
+        repaired = 0
         for scene in scenes:
             existing = await self.sqlite_store.get_scene(scene.name)
             if existing:
+                # The contract validator used to reject valid single-line model
+                # output, so every scene built while that bug was live stored a
+                # generated placeholder instead. Those are not asset facts, and
+                # skipping them would leave existing projects on boilerplate
+                # forever. Only the prompt is rewritten: images, plates and any
+                # other stored field stay untouched, and a prompt a user wrote
+                # never carries the fingerprint.
+                if should_repair_scene_placeholder(
+                    existing.environment_prompt, scene.environment_prompt
+                ):
+                    await self.sqlite_store.update_scene(
+                        existing.name, environment_prompt=scene.environment_prompt
+                    )
+                    repaired += 1
+                    continue
                 skipped += 1
                 continue
             await self.sqlite_store.add_scene(scene)
             added.append(scene)
-        log(f"已新增 {len(added)} 个场景，跳过已有 {skipped} 个")
+        log(
+            f"已新增 {len(added)} 个场景，修复占位描述 {repaired} 个，"
+            f"跳过已有 {skipped} 个"
+        )
 
         report(1.0, "场景提取完成")
-        log(f"场景提取完成: 新增 {len(added)} 个，已有 {skipped} 个")
+        log(
+            f"场景提取完成: 新增 {len(added)} 个，修复 {repaired} 个，"
+            f"已有 {skipped} 个"
+        )
 
         return added
 
@@ -1948,13 +1894,14 @@ class CogneeStore:
         on_log: Optional[Callable[[str], None]] = None,
     ) -> List[NovelProp]:
         """从图谱构建道具（分阶段架构第二步）。"""
+        self._require_cognee("graph prop build")
         from .pipeline import extract_props_from_graph
 
-        def report(progress: float, task: str):
+        def report(progress: float, task: MessageLike):
             if on_progress:
                 on_progress(progress, task)
 
-        def log(message: str):
+        def log(message: MessageLike):
             if on_log:
                 on_log(message)
             console.print(f"[dim]{message}[/dim]")
@@ -2330,6 +2277,10 @@ class CogneeStore:
         """列出所有视觉节拍。"""
         return await self.sqlite_store.list_visual_beats()
 
+    async def list_beat_asset_refs(self) -> List[BeatAssetRefRow]:
+        """每个 beat 的资产引用字段（只取六列，不构造 Beat 对象）。"""
+        return await self.sqlite_store.list_beat_asset_refs()
+
     async def get_character_from_graph(self, name: str) -> Optional[NovelCharacter]:
         """从 SQLite 获取角色（兼容旧接口名）。"""
         return await self.sqlite_store.get_character_from_graph(name)
@@ -2337,6 +2288,10 @@ class CogneeStore:
     async def get_episode_from_graph(self, number: int) -> Optional[NovelEpisode]:
         """从 SQLite 获取剧集（兼容旧接口名）。"""
         return await self.sqlite_store.get_episode_from_graph(number)
+
+    async def count_beats_by_episode(self) -> Dict[int, int]:
+        """每集的 Beat 数（一次分组查询，不构造 Beat 对象）。"""
+        return await self.sqlite_store.count_beats_by_episode()
 
     async def get_beats_for_episode(self, number: int) -> List[NovelVisualBeat]:
         """获取指定剧集的所有 Beat。"""

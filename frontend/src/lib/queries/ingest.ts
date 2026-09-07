@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/lib/api";
+import { api, uploadApi } from "@/lib/api";
 import { jsonWithBackendError } from "@/lib/api-errors";
 import { p } from "@/lib/api-path";
 import { queryKeys } from "@/lib/query-keys";
@@ -12,13 +12,20 @@ import type { SpineTemplate } from "@/types/project";
 export interface FormatCheckIssue {
   code: string;
   line: number | null;
+  /** 后端产的中文原文，仅作 i18n 的 defaultValue，不要直接渲染。 */
   message: string;
+  /** 同上。 */
   fix: string;
+  /** 结构化插值参数，交给 localizeFormatCheck 拼本地化文案。 */
+  params?: Record<string, unknown>;
 }
 
 export interface FormatCheck {
   level: "ok" | "warning" | "blocking";
+  /** 后端产的中文原文，仅作 i18n 的 defaultValue，不要直接渲染。 */
   summary: string;
+  summary_code?: string;
+  summary_params?: Record<string, unknown>;
   issues?: FormatCheckIssue[];
   metrics?: Record<string, number>;
   scene_header_status?: "standard" | "repairable" | "missing";
@@ -82,7 +89,7 @@ export function useUploadNovel(project: string) {
       formData.append("file", file);
       formData.append("spine_template", spineTemplate);
       const response = await jsonWithBackendError<OkResponse<UploadResult> | ErrorResponse>(
-        api.post(p`api/v1/projects/${project}/ingest/upload`, { body: formData }),
+        uploadApi.post(p`api/v1/projects/${project}/ingest/upload`, { body: formData }),
       );
       if (!response.ok) {
         throw new Error(response.error);

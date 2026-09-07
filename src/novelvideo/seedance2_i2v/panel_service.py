@@ -9,8 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import anyio
+from anyio.lowlevel import RunVar
+
 from novelvideo.manual_shots import resolve_target_video_duration
-from novelvideo.project_config import load_project_config_file, set_narrator_reference_audio
+from novelvideo.project_config import set_narrator_reference_audio_in_state_dir
 from novelvideo.seedance2_i2v.assets import (
     Seedance2ResolvedAsset,
     apply_prompt_audio_selection,
@@ -20,10 +23,15 @@ from novelvideo.seedance2_i2v.assets import (
 )
 from novelvideo.seedance2_i2v.character_voice_storage import (
     VOICE_SAMPLE_EXTENSIONS,
+    narrator_voice_resource_key,
+    run_voice_media_operation,
+    seedance2_asset_resource_key,
     trim_voice_sample_content,
+    voice_resource_lock,
     voice_content_sha256,
 )
 from novelvideo.seedance2_i2v.models import (
+    SEEDANCE2_PROMPT_GUIDANCE_TEMPLATE_KEYS,
     Seedance2I2VMode,
     dump_seedance2_config,
     parse_seedance2_config,
@@ -31,11 +39,17 @@ from novelvideo.seedance2_i2v.models import (
 from novelvideo.seedance2_i2v.prompt import (
     build_seedance2_prompt_draft,
     compute_seedance2_prompt_inputs_hash,
+    detect_seedance2_prompt_language,
     generate_seedance2_prompt,
 )
 from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
-from novelvideo.utils.media_io import crop_image_to_path, get_audio_duration
+from novelvideo.utils.async_ops import metadata_io_limiter
+from novelvideo.utils.media_io import (
+    crop_image_to_path_sync as _crop_image_to_path_sync,
+    get_audio_duration,
+)
 from novelvideo.utils.path_resolver import PathResolver
+from novelvideo.utils.source_language import AssetLanguage
 
 
 SEEDANCE2_PROMPT_GUIDANCE_TEMPLATES: dict[str, str] = {
@@ -46,6 +60,18 @@ SEEDANCE2_PROMPT_GUIDANCE_TEMPLATES: dict[str, str] = {
     "风格": "风格：限定画面质感、时代感、色彩倾向和真实度，避免风格漂移。",
     "无字幕": "无字幕：避免生成任何文字或字幕，保持画面纯净。",
 }
+_SEEDANCE2_ASSET_CONCURRENCY = 2
+_seedance2_asset_limiter_var: RunVar[anyio.CapacityLimiter] = RunVar(
+    "seedance2_asset_limiter"
+)
+
+
+def _seedance2_asset_limiter() -> anyio.CapacityLimiter:
+    limiter = _seedance2_asset_limiter_var.get(None)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(_SEEDANCE2_ASSET_CONCURRENCY)
+        _seedance2_asset_limiter_var.set(limiter)
+    return limiter
 
 
 @dataclass(frozen=True)
@@ -72,6 +98,7 @@ class Seedance2VideoPanelState:
 async def save_seedance2_video_panel_config(
     *,
     store: Any,
+    state_dir: str | Path,
     episode: int,
     beat: dict[str, Any],
     mode: str | None = None,
@@ -87,6 +114,70 @@ async def save_seedance2_video_panel_config(
     project_dir: Path | None = None,
     next_beat: dict[str, Any] | None = None,
     prop_menu: list[Any] | None = None,
+) -> str:
+    beat_num = int(beat.get("beat_number") or 0)
+    root = _seedance2_panel_project_dir(
+        project_dir=project_dir,
+        store=store,
+        fallback=state_dir,
+    )
+    resource_key = seedance2_asset_resource_key(
+        project_dir=root,
+        episode=episode,
+        beat_number=beat_num,
+    )
+
+    async def finalize(saved_json: str) -> str:
+        await store.update_beat_asset(
+            episode_number=episode,
+            beat_number=beat_num,
+            seedance2_config_json=saved_json,
+        )
+        beat["seedance2_config_json"] = saved_json
+        return saved_json
+
+    async with voice_resource_lock(resource_key):
+        return await run_voice_media_operation(
+            _prepare_seedance2_video_panel_config,
+            state_dir=state_dir,
+            episode=episode,
+            beat=beat,
+            mode=mode,
+            duration=duration,
+            resolution=resolution,
+            ratio=ratio,
+            generate_audio=generate_audio,
+            return_last_frame=return_last_frame,
+            human_review=human_review,
+            prompt_guidance=prompt_guidance,
+            final_prompt=final_prompt,
+            text_overlay=text_overlay,
+            project_dir=project_dir,
+            next_beat=next_beat,
+            prop_menu=prop_menu,
+            worker_limiter=metadata_io_limiter(),
+            finalize=finalize,
+        )
+
+
+def _prepare_seedance2_video_panel_config(
+    *,
+    state_dir: str | Path,
+    episode: int,
+    beat: dict[str, Any],
+    mode: str | None,
+    duration: int | float | None,
+    resolution: str | None,
+    ratio: str | None,
+    generate_audio: bool | None,
+    return_last_frame: bool | None,
+    human_review: bool | None,
+    prompt_guidance: str | None,
+    final_prompt: str | None,
+    text_overlay: dict[str, Any] | None,
+    project_dir: Path | None,
+    next_beat: dict[str, Any] | None,
+    prop_menu: list[Any] | None,
 ) -> str:
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
     if mode is not None:
@@ -120,17 +211,12 @@ async def save_seedance2_video_panel_config(
             project_dir=project_dir,
             episode=episode,
             beat=beat,
+            state_dir=state_dir,
             next_beat=next_beat,
             prop_menu=prop_menu,
         )
 
     saved_json = dump_seedance2_config(config)
-    beat["seedance2_config_json"] = saved_json
-    await store.update_beat_asset(
-        episode_number=episode,
-        beat_number=int(beat.get("beat_number") or 0),
-        seedance2_config_json=saved_json,
-    )
     return saved_json
 
 
@@ -141,6 +227,45 @@ async def append_seedance2_prompt_guidance_template(
     beat: dict[str, Any],
     label: str,
     prompt_guidance: str | None = None,
+    project_dir: Path | None = None,
+) -> str:
+    beat_num = int(beat.get("beat_number") or 0)
+    root = _seedance2_panel_project_dir(
+        project_dir=project_dir,
+        store=store,
+    )
+    resource_key = seedance2_asset_resource_key(
+        project_dir=root,
+        episode=episode,
+        beat_number=beat_num,
+    )
+
+    async def finalize(saved_json: str) -> str:
+        if store is not None:
+            await store.update_beat_asset(
+                episode_number=episode,
+                beat_number=beat_num,
+                seedance2_config_json=saved_json,
+            )
+        beat["seedance2_config_json"] = saved_json
+        return saved_json
+
+    async with voice_resource_lock(resource_key):
+        return await run_voice_media_operation(
+            _prepare_seedance2_prompt_guidance_template,
+            beat=beat,
+            label=label,
+            prompt_guidance=prompt_guidance,
+            worker_limiter=metadata_io_limiter(),
+            finalize=finalize,
+        )
+
+
+def _prepare_seedance2_prompt_guidance_template(
+    *,
+    beat: dict[str, Any],
+    label: str,
+    prompt_guidance: str | None,
 ) -> str:
     template = SEEDANCE2_PROMPT_GUIDANCE_TEMPLATES.get(str(label or "").strip())
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
@@ -151,19 +276,13 @@ async def append_seedance2_prompt_guidance_template(
         config.prompt_guidance = "\n".join(parts)
 
     saved_json = dump_seedance2_config(config)
-    beat["seedance2_config_json"] = saved_json
-    if store is not None:
-        await store.update_beat_asset(
-            episode_number=episode,
-            beat_number=int(beat.get("beat_number") or 0),
-            seedance2_config_json=saved_json,
-        )
     return saved_json
 
 
 async def generate_seedance2_prompt_for_panel(
     *,
     store: Any,
+    state_dir: str | Path,
     episode: int,
     beat: dict[str, Any],
     project_dir: Path,
@@ -171,16 +290,28 @@ async def generate_seedance2_prompt_for_panel(
     composer=None,
     manual_prompt_reference: str | None = None,
     prompt_guidance: str | None = None,
+    prompt_guidance_template_keys: list[str] | None = None,
+    language: AssetLanguage | None = None,
     prop_menu: list[Any] | None = None,
 ) -> str:
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
     if prompt_guidance is not None:
         config.prompt_guidance = str(prompt_guidance or "").strip()
+    if prompt_guidance_template_keys is not None:
+        config.prompt_guidance_template_keys = list(
+            dict.fromkeys(
+                key
+                for value in prompt_guidance_template_keys
+                if (key := str(value or "").strip())
+                in SEEDANCE2_PROMPT_GUIDANCE_TEMPLATE_KEYS
+            )
+        )
     assets = build_seedance2_project_assets(
         project_output=Path(project_dir),
         episode=episode,
         beat=beat,
         mode=config.mode,
+        state_dir=state_dir,
         next_beat=next_beat,
         prop_menu=prop_menu,
     )
@@ -192,10 +323,12 @@ async def generate_seedance2_prompt_for_panel(
         else (config.final_prompt or initial_prompt or "")
     ).strip()
     prompt_beat = _beat_with_seedance2_initial_prompt(beat, initial_prompt)
+    output_language = language or detect_seedance2_prompt_language(prompt_beat)
     inputs_hash = _seedance2_prompt_inputs_hash(
         config=config,
         beat=prompt_beat,
         assets=assets,
+        language=output_language,
     )
     result = await generate_seedance2_prompt(
         mode=config.mode,
@@ -203,6 +336,7 @@ async def generate_seedance2_prompt_for_panel(
         assets=assets,
         text_overlay=config.text_overlay,
         prompt_guidance=config.prompt_guidance,
+        prompt_guidance_template_keys=config.prompt_guidance_template_keys,
         request_params={
             "duration": int(config.duration),
             "resolution": config.resolution,
@@ -210,6 +344,7 @@ async def generate_seedance2_prompt_for_panel(
         },
         manual_prompt_reference=reference_prompt,
         composer=composer,
+        language=output_language,
     )
     config.final_prompt = mark_seedance2_prompt_references_for_editor(result.prompt)
     config.prompt_source = "generated" if result.used_ai else "fallback"
@@ -238,6 +373,117 @@ async def save_seedance2_uploaded_asset(
     media_kind = _seedance2_uploaded_media_kind(filename, content_type)
     if not media_kind or not content:
         return None
+    beat_num = int(beat.get("beat_number") or 0)
+    resource_key = seedance2_asset_resource_key(
+        project_dir=project_dir,
+        episode=episode,
+        beat_number=beat_num,
+    )
+
+    async def finalize(prepared: tuple[Path, int, str] | None) -> Path | None:
+        if prepared is None:
+            return None
+        target, beat_num, saved_json = prepared
+        await store.update_beat_asset(
+            episode_number=episode,
+            beat_number=beat_num,
+            seedance2_config_json=saved_json,
+        )
+        beat["seedance2_config_json"] = saved_json
+        return target
+
+    async with voice_resource_lock(resource_key):
+        return await run_voice_media_operation(
+            _prepare_seedance2_uploaded_asset,
+            episode=episode,
+            beat=beat,
+            project_dir=project_dir,
+            filename=filename,
+            content=content,
+            content_type=content_type,
+            worker_limiter=_seedance2_asset_limiter(),
+            finalize=finalize,
+        )
+
+
+async def save_seedance2_uploaded_file(
+    *,
+    store: Any,
+    episode: int,
+    beat: dict[str, Any],
+    project_dir: Path,
+    filename: str,
+    upload_stream: Any,
+    content_type: str = "",
+) -> Path | None:
+    """Read and publish an upload in one bounded voice-worker transaction."""
+
+    beat_num = int(beat.get("beat_number") or 0)
+    resource_key = seedance2_asset_resource_key(
+        project_dir=project_dir,
+        episode=episode,
+        beat_number=beat_num,
+    )
+
+    async def finalize(prepared: tuple[Path, int, str] | None) -> Path | None:
+        if prepared is None:
+            return None
+        target, prepared_beat_num, saved_json = prepared
+        await store.update_beat_asset(
+            episode_number=episode,
+            beat_number=prepared_beat_num,
+            seedance2_config_json=saved_json,
+        )
+        beat["seedance2_config_json"] = saved_json
+        return target
+
+    async with voice_resource_lock(resource_key):
+        return await run_voice_media_operation(
+            _read_and_prepare_seedance2_uploaded_asset,
+            upload_stream=upload_stream,
+            episode=episode,
+            beat=beat,
+            project_dir=project_dir,
+            filename=filename,
+            content_type=content_type,
+            worker_limiter=_seedance2_asset_limiter(),
+            finalize=finalize,
+        )
+
+
+def _read_and_prepare_seedance2_uploaded_asset(
+    *,
+    upload_stream: Any,
+    episode: int,
+    beat: dict[str, Any],
+    project_dir: Path,
+    filename: str,
+    content_type: str,
+) -> tuple[Path, int, str] | None:
+    return _prepare_seedance2_uploaded_asset(
+        episode=episode,
+        beat=beat,
+        project_dir=project_dir,
+        filename=filename,
+        content=upload_stream.read(),
+        content_type=content_type,
+    )
+
+
+def _prepare_seedance2_uploaded_asset(
+    *,
+    episode: int,
+    beat: dict[str, Any],
+    project_dir: Path,
+    filename: str,
+    content: bytes,
+    content_type: str,
+) -> tuple[Path, int, str] | None:
+    """Publish an upload and prepare its metadata entirely in a voice worker."""
+
+    media_kind = _seedance2_uploaded_media_kind(filename, content_type)
+    if not media_kind or not content:
+        return None
 
     beat_num = int(beat.get("beat_number") or 0)
     upload_dir = (
@@ -249,7 +495,6 @@ async def save_seedance2_uploaded_asset(
     )
     upload_dir.mkdir(parents=True, exist_ok=True)
     target = _next_available_upload_path(upload_dir, filename)
-    target.write_bytes(bytes(content))
 
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
     path_value = str(target)
@@ -263,13 +508,8 @@ async def save_seedance2_uploaded_asset(
         )
 
     saved_json = dump_seedance2_config(config)
-    beat["seedance2_config_json"] = saved_json
-    await store.update_beat_asset(
-        episode_number=episode,
-        beat_number=beat_num,
-        seedance2_config_json=saved_json,
-    )
-    return target
+    target.write_bytes(bytes(content))
+    return target, beat_num, saved_json
 
 
 async def crop_seedance2_asset_to_reference(
@@ -282,19 +522,65 @@ async def crop_seedance2_asset_to_reference(
     source_path: str | Path,
     crop_data: dict[str, Any],
 ) -> Path | None:
+    beat_num = int(beat.get("beat_number") or 0)
+    resource_key = seedance2_asset_resource_key(
+        project_dir=project_dir,
+        episode=episode,
+        beat_number=beat_num,
+    )
+
+    async def finalize(
+        prepared: tuple[Path | None, str | None]
+    ) -> Path | None:
+        output_path, saved_json = prepared
+        if output_path is None:
+            return None
+        if saved_json is not None:
+            await store.update_beat_asset(
+                episode_number=episode,
+                beat_number=beat_num,
+                seedance2_config_json=saved_json,
+            )
+            beat["seedance2_config_json"] = saved_json
+        return output_path
+
+    async with voice_resource_lock(resource_key):
+        return await run_voice_media_operation(
+            _prepare_cropped_seedance2_asset,
+            episode=episode,
+            beat=beat,
+            project_dir=project_dir,
+            asset_key=asset_key,
+            source_path=source_path,
+            crop_data=crop_data,
+            worker_limiter=_seedance2_asset_limiter(),
+            finalize=finalize,
+        )
+
+
+def _prepare_cropped_seedance2_asset(
+    *,
+    episode: int,
+    beat: dict[str, Any],
+    project_dir: Path,
+    asset_key: str,
+    source_path: str | Path,
+    crop_data: dict[str, Any],
+) -> tuple[Path | None, str | None]:
     source = Path(source_path)
     if not source.exists():
-        return None
+        return None, None
     width = int(crop_data.get("width") or 0)
     height = int(crop_data.get("height") or 0)
     if width <= 0 or height <= 0:
-        return None
+        return None, None
 
     beat_num = int(beat.get("beat_number") or 0)
     target = str(crop_data.get("target") or "reference_image")
     if target in {"first_frame", "last_frame"}:
         paths = PathResolver(project_dir, episode)
         output_path = paths.video_input_frame(beat_num, slot=target)
+        saved_json = None
     else:
         output_path = (
             Path(project_dir)
@@ -303,7 +589,13 @@ async def crop_seedance2_asset_to_reference(
             / f"beat_{beat_num:02d}"
             / f"{_seedance2_safe_asset_key(str(asset_key or 'asset'))}.png"
         )
-    await crop_image_to_path(
+        config = parse_seedance2_config(beat.get("seedance2_config_json"))
+        config.reference_image_paths = _unique_paths(
+            list(config.reference_image_paths) + [str(output_path)]
+        )
+        saved_json = dump_seedance2_config(config)
+
+    _crop_image_to_path_sync(
         source,
         x=int(crop_data.get("x") or 0),
         y=int(crop_data.get("y") or 0),
@@ -312,24 +604,10 @@ async def crop_seedance2_asset_to_reference(
         output_path=output_path,
     )
     if validate_seedance2_reference_image(output_path):
-        return None
+        return None, None
     if target in {"first_frame", "last_frame"}:
         paths.write_video_input_frame_meta(beat_num, slot=target, source_path=source)
-        return output_path
-
-    config = parse_seedance2_config(beat.get("seedance2_config_json"))
-    output_value = str(output_path)
-    config.reference_image_paths = _unique_paths(
-        list(config.reference_image_paths) + [output_value]
-    )
-    saved_json = dump_seedance2_config(config)
-    beat["seedance2_config_json"] = saved_json
-    await store.update_beat_asset(
-        episode_number=episode,
-        beat_number=beat_num,
-        seedance2_config_json=saved_json,
-    )
-    return output_path
+    return output_path, saved_json
 
 
 def _project_relative_path(project_dir: Path, path: Path) -> str:
@@ -372,6 +650,58 @@ async def trim_seedance2_audio_to_reference(
     start_seconds: float = 0.0,
     duration_seconds: float = 4.0,
 ) -> Path | None:
+    beat_num = int(beat.get("beat_number") or 0)
+    if str(asset_key or "").strip() == "voice:narrator":
+        resource_key = narrator_voice_resource_key(
+            project_dir=project_dir,
+            state_dir=str(getattr(store, "state_dir", "") or ""),
+        )
+    else:
+        resource_key = seedance2_asset_resource_key(
+            project_dir=project_dir,
+            episode=episode,
+            beat_number=beat_num,
+        )
+
+    async def finalize(prepared: tuple[Path, int | None, str | None]) -> Path:
+        target, beat_num, saved_json = prepared
+        if beat_num is not None and saved_json is not None:
+            await store.update_beat_asset(
+                episode_number=episode,
+                beat_number=beat_num,
+                seedance2_config_json=saved_json,
+            )
+            beat["seedance2_config_json"] = saved_json
+        return target
+
+    async with voice_resource_lock(resource_key):
+        return await run_voice_media_operation(
+            _prepare_trimmed_seedance2_audio,
+            store=store,
+            episode=episode,
+            beat=beat,
+            project_dir=project_dir,
+            asset_key=asset_key,
+            source_path=source_path,
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
+            finalize=finalize,
+        )
+
+
+def _prepare_trimmed_seedance2_audio(
+    *,
+    store: Any,
+    episode: int,
+    beat: dict[str, Any],
+    project_dir: Path,
+    asset_key: str,
+    source_path: str | Path,
+    start_seconds: float,
+    duration_seconds: float,
+) -> tuple[Path, int | None, str | None]:
+    """Read, trim, publish, and prepare config in one bounded worker."""
+
     source = _resolve_project_audio_source(Path(project_dir), source_path)
     content, _filename = trim_voice_sample_content(
         source.read_bytes(),
@@ -381,18 +711,19 @@ async def trim_seedance2_audio_to_reference(
     )
 
     if str(asset_key or "").strip() == "voice:narrator":
+        state_dir = str(getattr(store, "state_dir", "") or "")
+        if not state_dir:
+            raise ValueError("项目 state_dir 未解析，无法保存解说声线")
         target = Path(project_dir) / "assets" / "narrator" / "voice.mp3"
         target.parent.mkdir(parents=True, exist_ok=True)
         _archive_narrator_voice_siblings(target)
         target.write_bytes(content)
-        username, project = _project_owner_from_output(Path(project_dir))
-        set_narrator_reference_audio(
-            username,
-            project,
+        set_narrator_reference_audio_in_state_dir(
+            state_dir,
             relative_path=_project_relative_path(Path(project_dir), target),
             sha256=voice_content_sha256(content),
         )
-        return target
+        return target, None, None
 
     beat_num = int(beat.get("beat_number") or 0)
     output_path = (
@@ -402,22 +733,16 @@ async def trim_seedance2_audio_to_reference(
         / f"beat_{beat_num:02d}"
         / f"{_seedance2_safe_asset_key(str(asset_key or 'audio'))}_trimmed.mp3"
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(content)
 
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
-    output_value = str(output_path)
     config.reference_audio_paths = _unique_paths(
-        list(config.reference_audio_paths) + [output_value]
+        list(config.reference_audio_paths) + [str(output_path)]
     )
     saved_json = dump_seedance2_config(config)
-    beat["seedance2_config_json"] = saved_json
-    await store.update_beat_asset(
-        episode_number=episode,
-        beat_number=beat_num,
-        seedance2_config_json=saved_json,
-    )
-    return output_path
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(content)
+    return output_path, beat_num, saved_json
 
 
 async def remove_seedance2_uploaded_asset(
@@ -427,22 +752,87 @@ async def remove_seedance2_uploaded_asset(
     beat: dict[str, Any],
     media_kind: str,
     path: str,
+    project_dir: Path | None = None,
 ) -> bool:
+    beat_num = int(beat.get("beat_number") or 0)
+    root = _seedance2_asset_project_dir(
+        project_dir=project_dir,
+        store=store,
+        asset_path=path,
+    )
+    resource_key = seedance2_asset_resource_key(
+        project_dir=root,
+        episode=episode,
+        beat_number=beat_num,
+    )
+
+    async def finalize(prepared: tuple[bool, str | None]) -> bool:
+        removed, saved_json = prepared
+        if not removed or saved_json is None:
+            return False
+        await store.update_beat_asset(
+            episode_number=episode,
+            beat_number=beat_num,
+            seedance2_config_json=saved_json,
+        )
+        beat["seedance2_config_json"] = saved_json
+        return True
+
+    async with voice_resource_lock(resource_key):
+        return await run_voice_media_operation(
+            _prepare_removed_seedance2_asset,
+            beat=beat,
+            media_kind=media_kind,
+            path=path,
+            worker_limiter=metadata_io_limiter(),
+            finalize=finalize,
+        )
+
+
+def _prepare_removed_seedance2_asset(
+    *, beat: dict[str, Any], media_kind: str, path: str
+) -> tuple[bool, str | None]:
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
     paths = config.reference_image_paths if media_kind == "images" else config.reference_audio_paths
     path_value = str(path)
     if path_value not in paths:
-        return False
+        return False, None
     paths[:] = [existing for existing in paths if existing != path_value]
     _seedance2_unlink_user_reference_file(path_value)
-    saved_json = dump_seedance2_config(config)
-    beat["seedance2_config_json"] = saved_json
-    await store.update_beat_asset(
-        episode_number=episode,
-        beat_number=int(beat.get("beat_number") or 0),
-        seedance2_config_json=saved_json,
-    )
-    return True
+    return True, dump_seedance2_config(config)
+
+
+def _seedance2_asset_project_dir(
+    *, project_dir: Path | None, store: Any, asset_path: str | Path
+) -> Path:
+    if project_dir is not None:
+        return Path(project_dir)
+    stored_project_dir = str(getattr(store, "project_dir", "") or "")
+    if stored_project_dir:
+        return Path(stored_project_dir)
+    candidate = Path(asset_path)
+    for parent in candidate.parents:
+        if parent.name in {"seedance2_uploads", "seedance2_crops"}:
+            return parent.parent
+    return candidate.parent
+
+
+def _seedance2_panel_project_dir(
+    *,
+    project_dir: Path | None,
+    store: Any,
+    fallback: str | Path | None = None,
+) -> Path:
+    """Resolve the canonical project root used by all per-beat asset writers."""
+
+    if project_dir is not None:
+        return Path(project_dir)
+    stored_project_dir = str(getattr(store, "project_dir", "") or "")
+    if stored_project_dir:
+        return Path(stored_project_dir)
+    if fallback is not None:
+        return Path(fallback)
+    return Path(".")
 
 
 def build_seedance2_video_panel_state(
@@ -450,9 +840,11 @@ def build_seedance2_video_panel_state(
     project_dir: Path,
     episode: int,
     beat: dict[str, Any],
+    state_dir: str | Path,
     next_beat: dict[str, Any] | None = None,
     characters: list[Any] | None = None,
     prop_menu: list[Any] | None = None,
+    language: AssetLanguage | None = None,
 ) -> Seedance2VideoPanelState:
     config = parse_seedance2_config(beat.get("seedance2_config_json"))
     duration_floor = _seedance2_duration_floor(
@@ -469,17 +861,20 @@ def build_seedance2_video_panel_state(
         next_beat=next_beat,
         characters=characters,
         prop_menu=prop_menu,
+        state_dir=state_dir,
     )
     _append_seedance2_user_reference_assets(assets, config)
     prompt_source = config.prompt_source or "saved"
     final_prompt = config.final_prompt
     initial_prompt = _seedance2_initial_prompt(beat)
+    output_language = language or detect_seedance2_prompt_language(beat)
     if not final_prompt and initial_prompt:
         final_prompt = _seedance2_default_prompt(
             beat=_beat_with_seedance2_initial_prompt(beat, initial_prompt),
             config=config,
             assets=assets,
             text_overlay=config.text_overlay,
+            language=output_language,
         )
         prompt_source = "fallback"
     assets = apply_prompt_audio_selection(assets, final_prompt)
@@ -487,6 +882,7 @@ def build_seedance2_video_panel_state(
         config=config,
         beat=beat,
         assets=assets,
+        language=output_language,
     )
     return Seedance2VideoPanelState(
         mode=config.mode.value,
@@ -528,54 +924,13 @@ def _unique_paths(values: list[str]) -> list[str]:
     return result
 
 
-def _project_owner_from_output(project_dir: Path) -> tuple[str, str]:
-    return str(project_dir.parent.name or "").strip(), str(project_dir.name or "").strip()
-
-
-def _is_narrated_project(project_dir: Path) -> bool:
-    username, project = _project_owner_from_output(project_dir)
-    config = load_project_config_file(username, project)
-    return str(config.get("spine_template") or "drama") == "narrated"
-
-
-def _existing_user_audio_paths(config: Any, project_dir: Path) -> list[str]:
-    result: list[str] = []
-    for value in list(config.reference_audio_paths):
-        path = Path(str(value or "").strip())
-        if not str(path):
-            continue
-        resolved = path if path.is_absolute() else project_dir / path
-        if resolved.exists():
-            result.append(str(value))
-    return result
-
-
-def _drop_auto_narration_audio_when_user_audio_selected(
-    *,
-    assets: list[Seedance2ResolvedAsset],
-    config: Any,
-    project_dir: Path,
-    beat: dict[str, Any],
-) -> list[Seedance2ResolvedAsset]:
-    if _is_narrated_project(project_dir):
-        return assets
-    if normalize_seedance2_audio_type(beat) != "narration":
-        return assets
-    if not _existing_user_audio_paths(config, project_dir):
-        return assets
-    return [
-        asset
-        for asset in assets
-        if not (asset.media_type == "audio" and str(asset.key).startswith("voice:"))
-    ]
-
-
 def _sync_seedance2_asset_paths(
     *,
     config: Any,
     project_dir: Path,
     episode: int,
     beat: dict[str, Any],
+    state_dir: str | Path,
     next_beat: dict[str, Any] | None = None,
     prop_menu: list[Any] | None = None,
 ) -> None:
@@ -584,6 +939,7 @@ def _sync_seedance2_asset_paths(
         episode=episode,
         beat=beat,
         mode=config.mode,
+        state_dir=state_dir,
         next_beat=next_beat,
         prop_menu=prop_menu,
     )
@@ -676,6 +1032,7 @@ def _seedance2_default_prompt(
     config: Any,
     assets: list[Seedance2ResolvedAsset],
     text_overlay: dict[str, Any],
+    language: str = "zh",
 ) -> str:
     return build_seedance2_prompt_draft(
         mode=config.mode,
@@ -683,6 +1040,8 @@ def _seedance2_default_prompt(
         assets=assets,
         text_overlay=text_overlay,
         prompt_guidance=config.prompt_guidance,
+        prompt_guidance_template_keys=config.prompt_guidance_template_keys,
+        language=language,
     )
 
 
@@ -762,6 +1121,7 @@ def _seedance2_prompt_inputs_hash(
     config: Any,
     beat: dict[str, Any],
     assets: list[Seedance2ResolvedAsset],
+    language: str = "zh",
 ) -> str:
     return compute_seedance2_prompt_inputs_hash(
         mode=config.mode,
@@ -769,6 +1129,8 @@ def _seedance2_prompt_inputs_hash(
         assets=assets,
         text_overlay=config.text_overlay,
         prompt_guidance=config.prompt_guidance,
+        prompt_guidance_template_keys=config.prompt_guidance_template_keys,
+        language=language,
     )
 
 

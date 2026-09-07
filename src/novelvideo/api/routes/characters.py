@@ -1,25 +1,34 @@
 """角色列表 & 肖像/身份图生成端点。"""
 
-import io
+import asyncio
 import logging
 import re
 import shutil
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated, AsyncIterator
 from urllib.parse import quote, urlencode
 
-from fastapi import APIRouter, Depends, UploadFile, File
+from fastapi import APIRouter, Depends, UploadFile, File, Query
 from fastapi.responses import JSONResponse
 
 logger = logging.getLogger("novelvideo.api.characters")
 
 from novelvideo.api.asset_metadata import newest_updated_at, tree_updated_at
 from novelvideo.api.auth import get_api_user
+from novelvideo.api.upload_workers import (
+    asset_resource_lock,
+    run_asset_upload_operation,
+)
 from novelvideo.api.deps import (
+    may_run_asset_repair,
     make_sqlite_store,
     make_sqlite_store_for_context,
     make_static_url_for_context,
     resolve_project_scope,
+    sqlite_store_for_context_scope,
+    sqlite_store_scope,
 )
 from novelvideo.project_context import ProjectContext
 from novelvideo.novel_source import has_imported_novel, novel_import_required_response
@@ -53,6 +62,7 @@ from novelvideo.project_config import (
     load_project_config_file,
     update_project_config_file,
 )
+from novelvideo.utils.asset_names import move_asset_dir, path_safe_asset_name
 from novelvideo.utils.path_resolver import (
     compute_portrait_path,
     compute_identity_path,
@@ -63,14 +73,20 @@ from novelvideo.utils.path_resolver import (
     canonical_identity_costume_path,
     canonical_identity_portrait_path,
 )
+from novelvideo.utils.static_urls import project_static_url
+from novelvideo.utils.async_ops import metadata_io_limiter
+from novelvideo.utils.upload_safety import create_staged_upload_file
 from novelvideo.seedance2_i2v.character_voice_storage import (
     AGE_GROUP_SLOTS as VOICE_AGE_GROUP_SLOTS,
     ALL_SLOTS as VOICE_SAMPLE_SLOTS,
     DEFAULT_SLOT as VOICE_DEFAULT_SLOT,
+    character_voice_resource_key,
     clear_character_voice_file,
     decode_recorded_audio_data_url,
     persist_character_voice_file,
+    run_voice_media_operation,
     trim_existing_character_voice_file,
+    voice_resource_lock,
 )
 from novelvideo.sqlite_store import SQLiteStore
 from novelvideo.voice_design import generate_voice_design_audio, optimize_voice_description
@@ -120,6 +136,48 @@ async def _resolve_character_project(
         resolved.output_dir,
         store,
     )
+
+
+@asynccontextmanager
+async def _character_project_scope(
+    project: str,
+    user: dict,
+    *,
+    required_role: str = "editor",
+    load_graph_state: bool = True,
+) -> "AsyncIterator[tuple[ProjectContext | None, str, str, Path, str, SQLiteStore]]":
+    """``_resolve_character_project`` 的作用域版：出了 ``async with`` 一定关连接。
+
+    裸版本把 store 直接返回给路由，而路由从头到尾没有一处 ``close()``——正常返回、
+    "角色不存在" 这类提前返回、以及中途抛错，三条路都不关。每个 SQLiteStore 背后是
+    一条 aiosqlite 连接加一个后台线程，指望 GC 回收既不及时也不保证。角色页一进去
+    就打列表、选中角色再打 identities，这两条正是资产页的常规加载路径，泄漏是按请
+    求数累积的。
+
+    元组形状与裸版本一致，改造路由只需要把赋值换成 ``async with``。
+    """
+    resolved = await resolve_project_scope(project, user, required_role=required_role)
+    store_scope = (
+        sqlite_store_for_context_scope(
+            resolved.ctx,
+            load_graph_state=load_graph_state,
+        )
+        if resolved.ctx
+        else sqlite_store_scope(
+            resolved.username,
+            resolved.project_name,
+            load_graph_state=load_graph_state,
+        )
+    )
+    async with store_scope as store:
+        yield (
+            resolved.ctx,
+            resolved.username,
+            resolved.project_name,
+            resolved.project_dir,
+            resolved.output_dir,
+            store,
+        )
 
 
 def _character_image_selection_payload(username: str, project: str) -> dict:
@@ -224,6 +282,77 @@ def _backup_character_asset(path: Path) -> Path | None:
     backup = path.with_name(f"{path.stem}_{ts}{path.suffix}")
     shutil.copy2(path, backup)
     return backup
+
+
+def _persist_uploaded_character_image(file: UploadFile, target: Path) -> None:
+    """Decode and atomically publish one uploaded character image."""
+
+    from PIL import Image
+
+    tmp_path: Path | None = None
+    converted = None
+    try:
+        try:
+            file.file.seek(0)
+        except (AttributeError, OSError):
+            pass
+        with Image.open(file.file) as source:
+            converted = source.convert("RGB")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = create_staged_upload_file(
+            target.parent,
+            prefix=f".{target.stem}_",
+            suffix=target.suffix,
+            destination=target,
+        )
+        converted.save(tmp_path, format="PNG")
+        _backup_character_asset(target)
+        tmp_path.replace(target)
+        tmp_path = None
+    finally:
+        if converted is not None:
+            converted.close()
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _persist_uploaded_character_voice(
+    file: UploadFile,
+    *,
+    project_dir: Path,
+    character_name: str,
+    slot: str,
+    filename: str,
+) -> tuple[str, str, str]:
+    try:
+        file.file.seek(0)
+    except (AttributeError, OSError):
+        pass
+    content = file.file.read()
+    return persist_character_voice_file(
+        project_dir=project_dir,
+        character_name=character_name,
+        slot=slot,
+        filename=filename,
+        content=content,
+    )
+
+
+def _persist_recorded_character_voice(
+    data_url: str,
+    *,
+    project_dir: Path,
+    character_name: str,
+    slot: str,
+) -> tuple[str, str, str]:
+    content, extension = decode_recorded_audio_data_url(data_url)
+    return persist_character_voice_file(
+        project_dir=project_dir,
+        character_name=character_name,
+        slot=slot,
+        filename=f"recorded{extension}",
+        content=content,
+    )
 
 
 def _resolve_character_asset_path(
@@ -411,6 +540,31 @@ def _voice_sample_url(
     return _asset_url(ctx, project_dir, project_dir / rel_path)
 
 
+def _convention_asset_url(
+    ctx: ProjectContext | None,
+    project_dir: Path,
+    path: str | Path,
+    *,
+    version: str = "",
+    project_id: str = "",
+) -> str:
+    """Build a canonical asset URL without probing OSSFS.
+
+    Asset slots are convention-based. List views can let the browser lazily
+    request the URL and fall back on image error; only selected-asset detail
+    needs authoritative file-existence checks.
+    """
+
+    asset_path = Path(path)
+    try:
+        rel_path = asset_path.relative_to(project_dir).as_posix()
+    except ValueError:
+        return ""
+    asset_project = str(getattr(ctx, "project_id", "") or project_id).strip()
+    url = project_static_url(asset_project, rel_path)
+    return f"{url}?v={quote(version, safe='')}" if version else url
+
+
 def _voice_slot_payload(
     *,
     ctx: ProjectContext,
@@ -459,14 +613,22 @@ def _voice_samples_payload(
     }
 
 
-def _character_voice_fields(ctx: ProjectContext, project_dir: Path, character) -> dict:
+def _character_voice_fields(
+    ctx: ProjectContext,
+    project_dir: Path,
+    character,
+    *,
+    probe_files: bool = True,
+) -> dict:
     rel_path = getattr(character, "reference_audio_path", "") or ""
     return {
         "reference_audio_path": rel_path,
-        "reference_audio_url": _voice_sample_url(
-            ctx=ctx,
-            project_dir=project_dir,
-            rel_path=rel_path,
+        "reference_audio_url": (
+            _voice_sample_url(ctx=ctx, project_dir=project_dir, rel_path=rel_path)
+            if probe_files
+            else _convention_asset_url(ctx, project_dir, project_dir / rel_path)
+            if rel_path
+            else ""
         ),
         "reference_audio_sha256": getattr(character, "reference_audio_sha256", "")
         or "",
@@ -551,31 +713,76 @@ async def _repair_duplicate_main_characters(
             seen_main = True
             repaired.append(character)
             continue
-        await store.update_character(character.name, is_main=False)
+        set_main = getattr(store, "set_character_main", None)
+        if set_main is not None:
+            if not await set_main(character.name, False):
+                raise RuntimeError(
+                    f"Failed to repair duplicate main character: {character.name}"
+                )
+        else:
+            # Store test doubles and older compatible facades retain the
+            # object-merge operation. Real SQLiteStore uses the cache-free,
+            # column-level branch above.
+            await store.update_character(character.name, is_main=False)
         character.is_main = False
         repaired.append(character)
     return repaired
 
 
+async def _heal_path_unsafe_character_names(
+    store: SQLiteStore, project_dir: Path
+) -> dict[str, str]:
+    """修好库里名字带斜杠的存量角色，原名转成别名。
+
+    ``NovelCharacter.sanitize_name`` 一直在挡新数据，但它是**读的时候**才生效：主键里
+    留着斜杠的老行读出来名字已经是干净的，``DELETE ... WHERE name = ?`` 却一行都删不掉。
+    和场景 / 道具同一个毛病，见 :mod:`novelvideo.utils.asset_names`。
+
+    调用方要先过 ``may_run_asset_repair``：这是一次写操作，不该由只读协作者触发。
+    """
+
+    def move_assets(old_name: str, new_name: str) -> None:
+        # 见 ``move_asset_dir``：old_name 是库里没消毒过的旧值，直接拼路径会爬出资产根。
+        move_asset_dir(project_dir / "assets" / "characters", old_name, new_name)
+
+    return await store.repair_path_unsafe_asset_names("character", move_assets)
+
+
 @router.get("/projects/{project}/characters")
 async def list_characters(
     project: str,
+    summary: bool = False,
+    names: Annotated[list[str] | None, Query()] = None,
     user: dict = Depends(get_api_user),
 ):
-    """获取项目角色列表。"""
-    ctx, _username, _project_name, project_dir, _output_dir, store = (
-        await _resolve_character_project(project, user, required_role="viewer")
-    )
+    """获取角色列表；资产工作台可显式使用 summary 跳过文件探测。"""
+    async with _character_project_scope(
+        project,
+        user,
+        required_role="viewer",
+        load_graph_state=False,
+    ) as (ctx, _username, _project_name, project_dir, _output_dir, store):
+        if may_run_asset_repair(ctx):
+            await _heal_path_unsafe_character_names(store, project_dir)
+        characters = await store.list_characters()
+        characters = await _repair_duplicate_main_characters(
+            store, characters
+        )
 
-    characters = await _repair_duplicate_main_characters(
-        store, store.get_all_characters()
-    )
+    requested_names = {
+        str(name or "").strip() for name in (names or []) if str(name or "").strip()
+    }
+    if requested_names:
+        characters = [c for c in characters if c.name in requested_names]
 
-    data = []
     asset_project = getattr(ctx, "project_id", "") or project
-    for c in characters:
-        abs_portrait = compute_portrait_path(project_dir, c.name)
-        item = {
+
+    def build_item(c) -> dict:
+        canonical_portrait = canonical_portrait_path(project_dir, c.name)
+        abs_portrait = str(canonical_portrait) if summary else compute_portrait_path(
+            project_dir, c.name
+        )
+        item: dict = {
             "name": c.name,
             "aliases": c.aliases if hasattr(c, "aliases") else [],
             "description": c.description if hasattr(c, "description") else "",
@@ -588,12 +795,38 @@ async def list_characters(
             "is_main": c.is_main if hasattr(c, "is_main") else False,
             "portrait_path": abs_portrait,
             "portrait_url": (
-                _asset_url(ctx, project_dir, abs_portrait) if abs_portrait else ""
+                _convention_asset_url(
+                    ctx,
+                    project_dir,
+                    canonical_portrait,
+                    version=getattr(c, "updated_at", "") or "",
+                    project_id=project,
+                )
+                if summary
+                else _asset_url(ctx, project_dir, abs_portrait)
+                if abs_portrait
+                else ""
             ),
-            "updated_at": newest_updated_at(
-                getattr(c, "updated_at", ""),
-                tree_updated_at(project_dir / "assets" / "characters" / c.name),
+            "updated_at": (
+                getattr(c, "updated_at", "")
+                if summary
+                else newest_updated_at(
+                    getattr(c, "updated_at", ""),
+                    tree_updated_at(
+                        project_dir / "assets" / "characters" / c.name
+                    ),
+                )
             ),
+            # 只出 id，不出身份详情。资产页要把 ``?type=identity&id=`` 深链解析到
+            # 拥有它的角色，此前是遍历每个角色各调一次 ``/characters/{name}/identities``
+            # ——角色有多少个就发多少个请求，只为建一张 id→角色名 的表。身份已经随
+            # ``get_all_characters()`` 在内存里了，这里带出来不多一次查询；而带的是
+            # 一串 id，载荷不会随身份的图片/描述增长。
+            "identity_ids": [
+                str(getattr(ident, "identity_id", "") or "")
+                for ident in (getattr(c, "identities", None) or [])
+                if str(getattr(ident, "identity_id", "") or "")
+            ],
         }
         item.update(
             _character_asset_links(
@@ -602,8 +835,16 @@ async def list_characters(
                 kind="portrait",
             )
         )
-        item.update(_character_voice_fields(ctx, project_dir, c))
-        data.append(item)
+        item.update(
+            _character_voice_fields(
+                ctx, project_dir, c, probe_files=not summary
+            )
+        )
+        return item
+
+    # Full details still perform authoritative filesystem checks. Keep those
+    # blocking OSSFS operations away from the API worker's event loop.
+    data = await asyncio.to_thread(lambda: [build_item(c) for c in characters])
 
     return {"ok": True, "data": data}
 
@@ -622,16 +863,21 @@ async def add_character(
 
     from novelvideo.models import NovelCharacter
 
+    # 在查重之前消毒，否则两个只差斜杠的名字会双双通过查重、后写的静默覆盖先写的。
+    name = path_safe_asset_name(str(body.name or "").strip(), kind="character")
+    if not name:
+        return {"ok": False, "error": "Character name is required"}
+
     # 检查角色是否已存在
-    existing = store.get_character(body.name)
+    existing = store.get_character(name)
     if existing is not None:
-        return {"ok": False, "error": f"Character '{body.name}' already exists"}
+        return {"ok": False, "error": f"Character '{name}' already exists"}
 
     if body.is_main:
-        await _unset_other_main_characters(store, body.name)
+        await _unset_other_main_characters(store, name)
 
     char = NovelCharacter(
-        name=body.name,
+        name=name,
         role=body.role,
         is_main=body.is_main,
         gender=body.gender,
@@ -817,11 +1063,15 @@ async def get_character_identities(
     user: dict = Depends(get_api_user),
 ):
     """获取角色全部身份及图片。"""
-    ctx, _username, _project_name, project_dir, _output_dir, store = (
-        await _resolve_character_project(project, user, required_role="viewer")
-    )
-
-    characters = store.get_all_characters()
+    # store 只用来取角色，取完就关：后面拼载荷读的是已经在内存里的模型对象和
+    # 文件系统，不再需要连接。"角色不存在" 的提前返回因此也发生在关闭之后。
+    async with _character_project_scope(
+        project,
+        user,
+        required_role="viewer",
+        load_graph_state=False,
+    ) as (ctx, _username, _project_name, project_dir, _output_dir, store):
+        characters = await store.list_characters()
 
     target = None
     for c in characters:
@@ -995,6 +1245,8 @@ async def restore_character_asset_history(
     backup = _backup_character_asset(target)
     shutil.copy2(source, target)
     await _sync_restored_identity_asset(store, name, identity, kind, target)
+    if kind == "portrait":
+        await store.touch_character_asset(name)
 
     return {
         "ok": True,
@@ -1027,7 +1279,10 @@ async def update_character(
     updates = body.model_dump(exclude_none=True)
     requested_name = None
     if "name" in updates:
-        requested_name = str(updates.pop("name") or "").strip()
+        # 消毒后再查重、再改名：斜杠会让这个角色的 {name} 接口整排 404。
+        requested_name = path_safe_asset_name(
+            str(updates.pop("name") or "").strip(), kind="character"
+        )
         if not requested_name:
             return {"ok": False, "error": "Character name cannot be empty"}
 
@@ -1125,21 +1380,10 @@ async def upload_character_voice_sample(
         return {"ok": False, "error": f"Unsupported voice slot: {slot}"}
 
     filename = file.filename or ""
-    content = await file.read()
-    try:
-        rel_path, sha256, updated_at = persist_character_voice_file(
-            project_dir=project_dir,
-            character_name=name,
-            slot=slot,
-            filename=filename,
-            content=content,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
 
-    return {
-        "ok": True,
-        "data": await _apply_character_voice_update(
+    async def finalize_voice_update(result):
+        rel_path, sha256, updated_at = result
+        return await _apply_character_voice_update(
             ctx=ctx,
             project_dir=project_dir,
             character=character,
@@ -1148,8 +1392,26 @@ async def upload_character_voice_sample(
             path=rel_path,
             sha256=sha256,
             updated_at=updated_at,
-        ),
-    }
+        )
+
+    try:
+        key = character_voice_resource_key(
+            project_dir=project_dir, character_name=name, slot=slot
+        )
+        async with voice_resource_lock(key):
+            data = await run_voice_media_operation(
+                _persist_uploaded_character_voice,
+                file,
+                project_dir=project_dir,
+                character_name=name,
+                slot=slot,
+                filename=filename,
+                finalize=finalize_voice_update,
+            )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    return {"ok": True, "data": data}
 
 
 @router.post("/projects/{project}/characters/{name}/voice-samples/{slot}/record")
@@ -1170,21 +1432,9 @@ async def record_character_voice_sample(
     if slot not in VOICE_SAMPLE_SLOTS:
         return {"ok": False, "error": f"Unsupported voice slot: {slot}"}
 
-    try:
-        content, extension = decode_recorded_audio_data_url(body.data_url)
-        rel_path, sha256, updated_at = persist_character_voice_file(
-            project_dir=project_dir,
-            character_name=name,
-            slot=slot,
-            filename=f"recorded{extension}",
-            content=content,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
-
-    return {
-        "ok": True,
-        "data": await _apply_character_voice_update(
+    async def finalize_voice_update(result):
+        rel_path, sha256, updated_at = result
+        return await _apply_character_voice_update(
             ctx=ctx,
             project_dir=project_dir,
             character=character,
@@ -1193,8 +1443,25 @@ async def record_character_voice_sample(
             path=rel_path,
             sha256=sha256,
             updated_at=updated_at,
-        ),
-    }
+        )
+
+    try:
+        key = character_voice_resource_key(
+            project_dir=project_dir, character_name=name, slot=slot
+        )
+        async with voice_resource_lock(key):
+            data = await run_voice_media_operation(
+                _persist_recorded_character_voice,
+                body.data_url,
+                project_dir=project_dir,
+                character_name=name,
+                slot=slot,
+                finalize=finalize_voice_update,
+            )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    return {"ok": True, "data": data}
 
 
 @router.post("/projects/{project}/characters/{name}/voice-samples/{slot}/generate")
@@ -1302,21 +1569,9 @@ async def trim_character_voice_sample(
     if slot not in VOICE_SAMPLE_SLOTS:
         return {"ok": False, "error": f"Unsupported voice slot: {slot}"}
 
-    try:
-        rel_path, sha256, updated_at = trim_existing_character_voice_file(
-            project_dir=project_dir,
-            character_name=name,
-            slot=slot,
-            source_path=body.source_path,
-            start_seconds=body.start_seconds,
-            duration_seconds=body.duration_seconds,
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
-
-    return {
-        "ok": True,
-        "data": await _apply_character_voice_update(
+    async def finalize_voice_update(result):
+        rel_path, sha256, updated_at = result
+        return await _apply_character_voice_update(
             ctx=ctx,
             project_dir=project_dir,
             character=character,
@@ -1325,8 +1580,27 @@ async def trim_character_voice_sample(
             path=rel_path,
             sha256=sha256,
             updated_at=updated_at,
-        ),
-    }
+        )
+
+    try:
+        key = character_voice_resource_key(
+            project_dir=project_dir, character_name=name, slot=slot
+        )
+        async with voice_resource_lock(key):
+            data = await run_voice_media_operation(
+                trim_existing_character_voice_file,
+                project_dir=project_dir,
+                character_name=name,
+                slot=slot,
+                source_path=body.source_path,
+                start_seconds=body.start_seconds,
+                duration_seconds=body.duration_seconds,
+                finalize=finalize_voice_update,
+            )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    return {"ok": True, "data": data}
 
 
 @router.post("/projects/{project}/characters/{name}/voice-samples/{slot}/delete")
@@ -1346,14 +1620,8 @@ async def delete_character_voice_sample(
     if slot not in VOICE_SAMPLE_SLOTS:
         return {"ok": False, "error": f"Unsupported voice slot: {slot}"}
 
-    clear_character_voice_file(
-        project_dir=project_dir,
-        character_name=name,
-        slot=slot,
-    )
-    return {
-        "ok": True,
-        "data": await _apply_character_voice_update(
+    async def finalize_voice_delete(_removed):
+        return await _apply_character_voice_update(
             ctx=ctx,
             project_dir=project_dir,
             character=character,
@@ -1362,8 +1630,21 @@ async def delete_character_voice_sample(
             path="",
             sha256="",
             updated_at="",
-        ),
-    }
+        )
+
+    key = character_voice_resource_key(
+        project_dir=project_dir, character_name=name, slot=slot
+    )
+    async with voice_resource_lock(key):
+        data = await run_voice_media_operation(
+            clear_character_voice_file,
+            project_dir=project_dir,
+            character_name=name,
+            slot=slot,
+            finalize=finalize_voice_delete,
+            worker_limiter=metadata_io_limiter(),
+        )
+    return {"ok": True, "data": data}
 
 
 @router.post("/projects/{project}/characters/{name}/identities")
@@ -1562,6 +1843,9 @@ async def generate_single_portrait(
     char_dir.mkdir(parents=True, exist_ok=True)
     final_path = char_dir / "portrait.png"
     shutil.copy(paths[0], final_path)
+    # Canonical URLs in the lightweight list are versioned by the SQLite row,
+    # so publishing a new file must advance that revision as part of the write.
+    await store.touch_character_asset(name)
 
     portrait_url = _asset_url(ctx, project_dir, final_path)
 
@@ -1585,22 +1869,18 @@ async def upload_portrait(
     if character is None:
         return {"ok": False, "error": f"Character '{name}' not found"}
 
-    from PIL import Image
-
-    content = await file.read()
-    img = Image.open(io.BytesIO(content)).convert("RGB")
-
     char_dir = project_dir / "assets" / "characters" / name
-    char_dir.mkdir(parents=True, exist_ok=True)
-
-    # 备份旧肖像
     portrait_path = char_dir / "portrait.png"
-    if portrait_path.exists():
-        ts = datetime.now().strftime("%Y%m%d%H%M%S")
-        backup = char_dir / f"portrait_{ts}.png"
-        shutil.copy(portrait_path, backup)
 
-    img.save(str(portrait_path), format="PNG")
+    async def touch_portrait(_result):
+        await store.touch_character_asset(name)
+
+    await run_asset_upload_operation(
+        _persist_uploaded_character_image,
+        file,
+        portrait_path,
+        finalize=touch_portrait,
+    )
 
     portrait_url = _asset_url(ctx, project_dir, portrait_path)
 
@@ -1625,17 +1905,9 @@ async def upload_identity_image(
     if character is None:
         return {"ok": False, "error": f"Character '{name}' not found"}
 
-    from PIL import Image
-
-    content = await file.read()
-    img = Image.open(io.BytesIO(content)).convert("RGB")
-
     identities_dir = project_dir / "assets" / "characters" / name / "identities"
-    identities_dir.mkdir(parents=True, exist_ok=True)
-
     img_path = identities_dir / f"{identity_name}.png"
-    _backup_character_asset(img_path)
-    img.save(str(img_path), format="PNG")
+    await run_asset_upload_operation(_persist_uploaded_character_image, file, img_path)
 
     image_url = _asset_url(ctx, project_dir, img_path)
 
@@ -1671,28 +1943,35 @@ async def upload_identity_costume(
     ctx, username, project_name, project_dir, _output_dir, store = (
         await _resolve_character_project(project, user)
     )
-    character = store.get_character(name)
-    if character is None:
-        return {"ok": False, "error": f"Character '{name}' not found"}
-    identity = _identity_by_id(character, identity_id)
-    if identity is None:
-        return {"ok": False, "error": f"Identity '{identity_id}' not found"}
+    lock_key = (
+        "character-costume",
+        str(project_dir.resolve()),
+        name,
+        identity_id,
+    )
+    async with asset_resource_lock(lock_key):
+        character = store.get_character(name)
+        if character is None:
+            return {"ok": False, "error": f"Character '{name}' not found"}
+        identity = _identity_by_id(character, identity_id)
+        if identity is None:
+            return {"ok": False, "error": f"Identity '{identity_id}' not found"}
 
-    from PIL import Image
+        safe_name = _safe_asset_name(identity.identity_name)
+        identities_dir = project_dir / "assets" / "characters" / name / "identities"
+        target = identities_dir / f"{safe_name}_costume.png"
 
-    content = await file.read()
-    img = Image.open(io.BytesIO(content)).convert("RGB")
-    safe_name = _safe_asset_name(identity.identity_name)
-    identities_dir = project_dir / "assets" / "characters" / name / "identities"
-    identities_dir.mkdir(parents=True, exist_ok=True)
-    target = identities_dir / f"{safe_name}_costume.png"
-    if target.exists():
-        backup = (
-            identities_dir / f"{safe_name}_costume_{datetime.now():%Y%m%d%H%M%S}.png"
+        async def update_costume_path(_result):
+            await store.update_character_identity(
+                name, identity_id, costume_image=str(target)
+            )
+
+        await run_asset_upload_operation(
+            _persist_uploaded_character_image,
+            file,
+            target,
+            finalize=update_costume_path,
         )
-        shutil.copy(target, backup)
-    img.save(str(target), format="PNG")
-    await store.update_character_identity(name, identity_id, costume_image=str(target))
     return {
         "ok": True,
         "data": {"costume_image_url": _asset_url(ctx, project_dir, target)},
@@ -1711,34 +1990,43 @@ async def delete_identity_costume(
     ctx, _username, _project_name, project_dir, _output_dir, store = (
         await _resolve_character_project(project, user)
     )
-    character = store.get_character(name)
-    if character is None:
-        return {"ok": False, "error": f"Character '{name}' not found"}
-    identity = _identity_by_id(character, identity_id)
-    if identity is None:
-        return {"ok": False, "error": f"Identity '{identity_id}' not found"}
+    lock_key = (
+        "character-costume",
+        str(project_dir.resolve()),
+        name,
+        identity_id,
+    )
+    async with asset_resource_lock(lock_key):
+        character = store.get_character(name)
+        if character is None:
+            return {"ok": False, "error": f"Character '{name}' not found"}
+        identity = _identity_by_id(character, identity_id)
+        if identity is None:
+            return {"ok": False, "error": f"Identity '{identity_id}' not found"}
 
-    candidate_paths: list[Path] = []
-    computed = compute_identity_costume_path(project_dir, name, identity.identity_name)
-    if computed:
-        candidate_paths.append(Path(computed))
-    saved = str(getattr(identity, "costume_image", "") or "").strip()
-    if saved:
-        candidate_paths.append(Path(saved))
+        candidate_paths: list[Path] = []
+        computed = compute_identity_costume_path(
+            project_dir, name, identity.identity_name
+        )
+        if computed:
+            candidate_paths.append(Path(computed))
+        saved = str(getattr(identity, "costume_image", "") or "").strip()
+        if saved:
+            candidate_paths.append(Path(saved))
 
-    deleted = False
-    seen: set[Path] = set()
-    for path in candidate_paths:
-        if path in seen:
-            continue
-        seen.add(path)
-        if path.exists():
-            path.unlink()
-            deleted = True
+        deleted = False
+        seen: set[Path] = set()
+        for path in candidate_paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            if path.exists():
+                path.unlink()
+                deleted = True
 
-    await store.update_character_identity(name, identity_id, costume_image="")
-    if hasattr(identity, "costume_image"):
-        setattr(identity, "costume_image", "")
+        await store.update_character_identity(name, identity_id, costume_image="")
+        if hasattr(identity, "costume_image"):
+            setattr(identity, "costume_image", "")
     return {"ok": True, "data": {"deleted": deleted}}
 
 
@@ -1762,22 +2050,21 @@ async def upload_identity_portrait(
     if identity is None:
         return {"ok": False, "error": f"Identity '{identity_id}' not found"}
 
-    from PIL import Image
-
-    content = await file.read()
-    img = Image.open(io.BytesIO(content)).convert("RGB")
     safe_name = _safe_asset_name(identity.identity_name)
     identities_dir = project_dir / "assets" / "characters" / name / "identities"
-    identities_dir.mkdir(parents=True, exist_ok=True)
     target = identities_dir / f"{name}_{safe_name}_portrait.png"
-    if target.exists():
-        backup = (
-            identities_dir
-            / f"{name}_{safe_name}_portrait_{datetime.now():%Y%m%d%H%M%S}.png"
+
+    async def update_portrait_path(_result):
+        await store.update_character_identity(
+            name, identity_id, portrait_image=str(target)
         )
-        shutil.copy(target, backup)
-    img.save(str(target), format="PNG")
-    await store.update_character_identity(name, identity_id, portrait_image=str(target))
+
+    await run_asset_upload_operation(
+        _persist_uploaded_character_image,
+        file,
+        target,
+        finalize=update_portrait_path,
+    )
     return {
         "ok": True,
         "data": {"portrait_image_url": _asset_url(ctx, project_dir, target)},
@@ -2001,7 +2288,11 @@ async def get_identity_attempts(
             if not p.name.endswith("_costume.png") and "_portrait" not in p.stem
         ]
     )
-    portrait_attempts = len(list(identities_dir.glob(f"*{safe_name}_portrait*.png")))
+    portrait_attempts = sum(
+        1
+        for path in identities_dir.glob(f"*{safe_name}_portrait*.png")
+        if path.is_file() and not path.name.startswith(".")
+    )
     return {
         "ok": True,
         "data": {

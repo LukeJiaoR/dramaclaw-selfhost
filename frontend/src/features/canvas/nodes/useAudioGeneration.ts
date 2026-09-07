@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
 import { useCallback, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import {
   fetchFreezoneJobResult,
@@ -16,6 +17,7 @@ import { joinUpstreamText } from '@/features/canvas/application/graphContentReso
 import { generationTaskDescriptor } from '@/features/canvas/application/resumeGeneration';
 import { useNodeGenerationTaskState } from '@/features/canvas/application/useNodeGenerationTaskState';
 import { useUpstreamContents } from '@/features/canvas/application/useUpstreamGraph';
+import { useModelTaskAccess } from '@/lib/model-task-access';
 import { readUrl } from '@/lib/url-params';
 import { useCanvasStore } from '@/stores/canvasStore';
 
@@ -54,14 +56,28 @@ export function useAudioGeneration(nodeId: string, data: AudioNodeData) {
     .filter((segment) => segment.length > 0)
     .join('\n\n');
   const emotionPrompt = data.emotionPrompt ?? '';
+  // 组织成员没有发起模型任务的资格时不放行。面板与节点本体的重试共用这个 hook，
+  // 所以门控放在这里，两条入口都盖到。
+  const modelTaskAccess = useModelTaskAccess();
+  const { t } = useTranslation();
 
   const generate = useCallback(async () => {
     if (isGenerating) return;
+    if (modelTaskAccess.blocked) {
+      if (modelTaskAccess.message) {
+        updateNodeData(nodeId, { generationError: modelTaskAccess.message });
+      }
+      return;
+    }
+    if (!isMusic && data.voiceAvailable === false) {
+      updateNodeData(nodeId, { generationError: t('node.audioNode.selectVoiceFirst') });
+      return;
+    }
     const trimmed = effectivePrompt;
     if (trimmed.length === 0) return;
     const project = readUrl().project;
     if (!project) {
-      updateNodeData(nodeId, { generationError: '当前 URL 缺少 project 参数' });
+      updateNodeData(nodeId, { generationError: t('canvas.generation.missingProjectParam') });
       return;
     }
     updateNodeData(nodeId, {
@@ -104,15 +120,18 @@ export function useAudioGeneration(nodeId: string, data: AudioNodeData) {
       );
       updateNodeData(nodeId, {
         isGenerating: false,
-        generationError: error instanceof Error ? error.message : '生成失败',
+        generationError: error instanceof Error ? error.message : t('node.audioNode.generateFailed'),
       });
     }
   }, [
+    t,
     isGenerating,
+    modelTaskAccess,
     isMusic,
     data.musicLengthMs,
     data.forceInstrumental,
     data.respectSectionsDurations,
+    data.voiceAvailable,
     data.voiceRef,
     effectivePrompt,
     emotionPrompt,
@@ -120,5 +139,5 @@ export function useAudioGeneration(nodeId: string, data: AudioNodeData) {
     updateNodeData,
   ]);
 
-  return { generate, isGenerating, effectivePrompt, isMusic };
+  return { generate, isGenerating, effectivePrompt, isMusic, modelTaskAccess };
 }

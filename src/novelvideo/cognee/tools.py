@@ -13,6 +13,13 @@ from typing import Callable, List
 from novelvideo.cognee import CogneeStore
 from novelvideo.utils.logging import tool_logger
 
+# Legacy-only AI episode planner.
+# No current frontend workflow selects this mode: the "plan episodes" button
+# posts an empty body (frontend/src/routes/_app/projects.$project/episodes.tsx),
+# so planning_mode falls back to the "chapters" default in api/schemas.py.
+# Reaching this code still requires an explicit planning_mode="ai" from an API
+# client. Structured-v2 projects must not enter this path.
+# These tools all run cognee.search() and therefore require an embedding index.
 def create_episode_planner_tools(store: CogneeStore) -> List[Callable]:
     """创建 EpisodePlanner 的 Cognee 工具集。
 

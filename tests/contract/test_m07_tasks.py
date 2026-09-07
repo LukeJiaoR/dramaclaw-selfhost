@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from novelvideo.project_context import ProjectContext
 from novelvideo.ports import registry
 from novelvideo.ports.local.project import AllowAllProjectAccess
-from novelvideo.ports.local.tasks import InlineTaskBackend, InMemoryCancellationStore
+from novelvideo.ports.local.tasks import InMemoryCancellationStore
 from novelvideo.task_backend.cancel import TaskCancelled, is_cancel_requested
 from novelvideo.task_backend.limits import project_lane_effective_active_limit
 from novelvideo.task_backend.queues import QUEUE_KINDS
@@ -656,9 +656,9 @@ async def test_m07_task_backend_read_and_stream_shapes_are_ce_ee_isomorphic(
 
 
 @pytest.mark.asyncio
-async def test_inline_cancel_is_cooperative_runner_stop(tmp_path):
+async def test_inline_cancel_is_cooperative_runner_stop(signed_inline_backend, tmp_path):
     ctx = _ctx(tmp_path)
-    backend = InlineTaskBackend()
+    backend = signed_inline_backend()
     task_type = "m07_cooperative_cancel"
     observed_cancel = False
     runner_started = threading.Event()
@@ -717,11 +717,13 @@ async def test_inline_cancel_is_cooperative_runner_stop(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_inline_backend_runs_sync_core_outside_active_event_loop(monkeypatch, tmp_path):
+async def test_inline_backend_runs_sync_core_outside_active_event_loop(
+    monkeypatch, signed_inline_backend, tmp_path
+):
     from novelvideo.ports.local import tasks as local_tasks
 
     ctx = _ctx(tmp_path)
-    backend = InlineTaskBackend()
+    backend = signed_inline_backend()
     observed = threading.Event()
 
     def fake_run_project_task_core_sync(*args, **kwargs):

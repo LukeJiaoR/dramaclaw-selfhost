@@ -25,6 +25,7 @@ export const CANVAS_NODE_TYPES = {
   pano360Viewer: 'pano360ViewerNode',
   threeDWorld: 'threeDWorldNode',
   skill: 'skillNode',
+  style: 'styleNode',
 } as const;
 
 export type CanvasNodeType = (typeof CANVAS_NODE_TYPES)[keyof typeof CANVAS_NODE_TYPES];
@@ -57,6 +58,22 @@ export type ImageQuality = string;
 
 export interface NodeDisplayData {
   displayName?: string;
+  /**
+   * 节点被创建出来的时刻（epoch ms），由 nodeFactory 落，之后没人改。
+   *
+   * 和 `generationStartedAt` 的区别是这个字段**持久**：后者每条生成链路跑完都会写回
+   * null，只在转圈那几十秒里存在，事后回头看什么都不剩。侧栏大纲靠这个字段区分
+   * 「同一条提示词生成三次」的重名节点，所以它绝对不能被生成流程碰。
+   *
+   * 老画布里的节点没有这个字段（加字段之前存的），读的时候要当 undefined 处理。
+   */
+  createdAt?: number | null;
+  /**
+   * 跨项目粘贴带进来的节点在素材拷进本项目之前 / 失败之后的标记（见
+   * application/crossProjectAssets）。`'copying'` 期间媒体字段一律为 null——源项目的
+   * URL 不会出现在 store 或落库数据里；填回目标项目地址后字段即摘除。
+   */
+  assetMigration?: 'copying' | 'failed';
   [key: string]: unknown;
 }
 
@@ -153,6 +170,11 @@ export interface VideoNodeData extends NodeDisplayData {
    * (如新接入的)排在其后,按节点 y 坐标兜底。
    */
   referenceOrder?: string[];
+  /** Uploaded document reference for all-reference generation. */
+  referenceFileUrl?: string | null;
+  referenceFileName?: string | null;
+  /** Public HTTP(S) page reference for all-reference generation. */
+  referenceLink?: string | null;
   isGenerating?: boolean;
   generationStartedAt?: number | null;
   generationDurationMs?: number;
@@ -485,6 +507,8 @@ export interface AudioNodeData extends NodeDisplayData {
   emotionPrompt?: string;
   /** 选中的声线引用（freezone-audio references 接口里的一条记录）。 */
   voiceRef?: AudioVoiceRef | null;
+  /** 最近一次声线列表加载是否确认至少存在一条可用声线；缺省表示尚未确认。 */
+  voiceAvailable?: boolean;
   /** 当前声线的展示名（缓存自 references 接口，避免每次选完都要重新拉列表）。 */
   voiceLabel?: string;
   /** 当前声线的语言标签（来自 references；可空）。 */
@@ -664,6 +688,15 @@ export interface SkillNodeData extends NodeDisplayData {
   [key: string]: unknown;
 }
 
+/**
+ * 画布上的「风格节点」：图片节点 `styleTemplateId` 在画布上的投影，本身不参与
+ * 生成请求（提交时读的仍是下游图片节点的 `styleTemplateId`）。建/改/删由
+ * [[styleNodeSync]] 的对账规则驱动，用户不能从菜单单独创建一个。
+ */
+export interface StyleNodeData extends NodeDisplayData {
+  styleTemplateId: string | null;
+}
+
 export type CanvasNodeData =
   | UploadImageNodeData
   | ExportImageNodeData
@@ -681,7 +714,8 @@ export type CanvasNodeData =
   | ScriptNodeData
   | Pano360ViewerNodeData
   | ThreeDWorldNodeData
-  | SkillNodeData;
+  | SkillNodeData
+  | StyleNodeData;
 
 export type CanvasNode = Node<CanvasNodeData, CanvasNodeType>;
 export type VideoKeyframeSlot = 'first' | 'last';
@@ -741,6 +775,12 @@ export function isExportImageNode(
   node: CanvasNode | null | undefined
 ): node is Node<ExportImageNodeData, typeof CANVAS_NODE_TYPES.exportImage> {
   return node?.type === CANVAS_NODE_TYPES.exportImage;
+}
+
+export function isStyleNode(
+  node: CanvasNode | null | undefined
+): node is Node<StyleNodeData, typeof CANVAS_NODE_TYPES.style> {
+  return node?.type === CANVAS_NODE_TYPES.style;
 }
 
 export function isBeatContextNode(

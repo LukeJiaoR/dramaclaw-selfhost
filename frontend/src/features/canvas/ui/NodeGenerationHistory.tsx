@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
 import { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   AlertCircle,
   Check,
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react';
 
 import type { FreezoneGenerationHistoryRecord } from '@/api/ops';
+import type { TFn } from '@/lib/i18n-types';
 import { resolveMediaUrl } from '@/lib/media-url';
 
 /**
@@ -303,18 +305,18 @@ export function hasCompletedHistoryRecords(
   return records.some(isCompleted);
 }
 
-function formatRelativeTime(iso: string): string {
+function formatRelativeTime(iso: string, t: TFn): string {
   const then = new Date(iso).getTime();
   if (Number.isNaN(then)) return '';
   const diffMs = Date.now() - then;
   const sec = Math.round(diffMs / 1000);
-  if (sec < 60) return `${Math.max(sec, 0)}秒前`;
+  if (sec < 60) return t('canvas.nodeHistory.secondsAgo', { count: Math.max(sec, 0) });
   const min = Math.round(sec / 60);
-  if (min < 60) return `${min}分钟前`;
+  if (min < 60) return t('canvas.nodeHistory.minutesAgo', { count: min });
   const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr}小时前`;
+  if (hr < 24) return t('canvas.nodeHistory.hoursAgo', { count: hr });
   const day = Math.round(hr / 24);
-  if (day < 30) return `${day}天前`;
+  if (day < 30) return t('canvas.nodeHistory.daysAgo', { count: day });
   return new Date(then).toLocaleDateString();
 }
 
@@ -362,6 +364,7 @@ export function NodeGenerationHistory({
   fallbackThumbnailUrl,
   className,
 }: NodeGenerationHistoryProps) {
+  const { t } = useTranslation();
   // Only successful generations belong in the history strip — failed / pending
   // / running attempts are noise here. Newest first; the backend already sorts,
   // but guard against ordering drift.
@@ -384,7 +387,8 @@ export function NodeGenerationHistory({
       <div className="flex items-center justify-between px-0.5">
         <span className="inline-flex items-center gap-1 text-[11px] font-medium text-text-muted">
           <History className="h-3 w-3" />
-          历史记录{sorted.length > 0 ? ` · ${sorted.length}` : ''}
+          {t('canvas.nodeHistory.title')}
+          {sorted.length > 0 ? ` · ${sorted.length}` : ''}
         </span>
         {onRefresh && (
           <button
@@ -394,7 +398,7 @@ export function NodeGenerationHistory({
               event.stopPropagation();
               onRefresh();
             }}
-            title="刷新历史"
+            title={t('canvas.nodeHistory.refresh')}
           >
             {isLoading ? (
               <Loader2 className="h-3 w-3 animate-spin" />
@@ -408,6 +412,10 @@ export function NodeGenerationHistory({
         {sorted.map((record) => {
           const rawUrl = historyRecordOutputUrl(record);
           const url = resolveMediaUrl(rawUrl);
+          // 缩略图位只喂降采样变体：原图动辄 5504x3072，画进 56x56 的格子后
+          // 每张仍要整幅 decode + raster——九张实测 2.1s 主线程长任务、掉 7 帧。
+          // `url` 保持原图，onRestore 恢复回节点的必须是原始产物。
+          const thumbUrl = resolveMediaUrl(rawUrl, { variant: 'thumb' });
           const completed = isCompleted(record);
           const isImage =
             completed && Boolean(url) && record.media_type === 'image';
@@ -419,6 +427,7 @@ export function NodeGenerationHistory({
             completed && !isImage && !isVideo
               ? resolveMediaUrl(
                   historyRecordPreviewImageUrl(record) ?? fallbackThumbnailUrl ?? null,
+                  { variant: 'thumb' },
                 )
               : null;
           const restorable = completed && (url || historyRecordPrompt(record));
@@ -433,9 +442,9 @@ export function NodeGenerationHistory({
                 event.stopPropagation();
                 if (restorable) onRestore(record);
               }}
-              title={`${formatRelativeTime(record.recorded_at)}${
+              title={`${formatRelativeTime(record.recorded_at, t)}${
                 completed ? '' : ` · ${record.status}`
-              }${active ? ' · 当前' : ''}`}
+              }${active ? ` · ${t('canvas.nodeHistory.current')}` : ''}`}
               className={`group relative h-14 w-14 shrink-0 overflow-hidden rounded-[8px] border transition ${
                 active
                   ? 'border-[rgb(var(--accent-rgb))]'
@@ -446,9 +455,10 @@ export function NodeGenerationHistory({
             >
               {isImage ? (
                 <img
-                  src={url ?? undefined}
+                  src={thumbUrl ?? undefined}
                   alt=""
                   loading="lazy"
+                  decoding="async"
                   className="h-full w-full object-cover"
                 />
               ) : isVideo ? (
@@ -464,6 +474,7 @@ export function NodeGenerationHistory({
                   src={previewImg}
                   alt=""
                   loading="lazy"
+                  decoding="async"
                   className="h-full w-full object-cover"
                 />
               ) : (
@@ -492,7 +503,7 @@ export function NodeGenerationHistory({
                     : 'bg-black/55 text-white/80'
                 }`}
               >
-                {formatRelativeTime(record.recorded_at)}
+                {formatRelativeTime(record.recorded_at, t)}
               </span>
             </button>
           );

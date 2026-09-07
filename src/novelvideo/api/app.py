@@ -17,20 +17,27 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from novelvideo.api import OPENAPI_TAGS, api_router, register_verification_routes
 from novelvideo.api.auth import get_api_user
 from novelvideo.api.routes.files import preview_project_media_file
+from novelvideo.ports.authz import AuthzError, authz_error_payload
 from novelvideo.shared.billing_errors import (
     BILLING_RULE_NOT_CONFIGURED_MESSAGE,
     INSUFFICIENT_CREDITS_MESSAGE,
+    BillingError,
     BillingRuleNotConfiguredError,
     InsufficientCreditsError,
+    billing_error_payload,
     billing_rule_not_configured_payload,
     insufficient_credits_payload,
 )
 from novelvideo.shared.api_coverage import mount_api_coverage_middleware
+from novelvideo.task_backend.limit_logging import log_task_limit_rejection
 from novelvideo.task_backend.limits import (
+    ChannelTaskLimitExceeded,
     GlobalLaneQueueLimitExceeded,
     ProjectTaskLimitExceeded,
     ProjectUserTaskLimitExceeded,
+    UserTaskLimitExceeded,
 )
+from novelvideo.utils.upload_safety import MAX_PROJECT_UPLOAD_BYTES
 
 logger = logging.getLogger("novelvideo.api.app")
 
@@ -39,7 +46,7 @@ logger = logging.getLogger("novelvideo.api.app")
 # (50k nodes × ~80 bytes JSON each) with comfortable headroom; anything
 # bigger is almost certainly a runaway client / DoS attempt.
 MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024
-MAX_UPLOAD_REQUEST_BODY_BYTES = 200 * 1024 * 1024
+MAX_UPLOAD_REQUEST_BODY_BYTES = MAX_PROJECT_UPLOAD_BYTES
 _RESOURCE_REQUEST_COUNTS: Counter[str] = Counter()
 _RESOURCE_REQUEST_TOTAL = 0
 _RESOURCE_REQUEST_LOCK = threading.Lock()
@@ -49,7 +56,10 @@ def _request_body_limit(request: Request) -> int:
     content_type = request.headers.get("content-type", "").lower()
     if (
         request.url.path.startswith("/api/v1/projects/")
-        and request.url.path.endswith("/upload")
+        and (
+            request.url.path.endswith("/upload")
+            or request.url.path.endswith("/reference-file-upload")
+        )
         and "multipart/form-data" in content_type
     ):
         return MAX_UPLOAD_REQUEST_BODY_BYTES
@@ -97,6 +107,7 @@ def create_app() -> FastAPI:
         exc: ProjectTaskLimitExceeded,
     ) -> JSONResponse:
         _ = request
+        log_task_limit_rejection(exc, limit_scope="project")
         return JSONResponse(
             status_code=429,
             content={
@@ -118,6 +129,7 @@ def create_app() -> FastAPI:
         exc: ProjectUserTaskLimitExceeded,
     ) -> JSONResponse:
         _ = request
+        log_task_limit_rejection(exc, limit_scope="user")
         return JSONResponse(
             status_code=429,
             content={
@@ -143,6 +155,7 @@ def create_app() -> FastAPI:
         exc: GlobalLaneQueueLimitExceeded,
     ) -> JSONResponse:
         _ = request
+        log_task_limit_rejection(exc, limit_scope="global_lane_queue")
         return JSONResponse(
             status_code=429,
             content={
@@ -154,6 +167,64 @@ def create_app() -> FastAPI:
                     "limit": exc.limit,
                     "queued": exc.queued,
                     "limit_scope": "global_lane_queue",
+                },
+            },
+        )
+
+    @application.exception_handler(ChannelTaskLimitExceeded)
+    async def _channel_task_limit_exceeded(
+        request: Request,
+        exc: ChannelTaskLimitExceeded,
+    ) -> JSONResponse:
+        _ = request
+        limit_scope = "platform" if exc.scope_kind == "platform" else "channel"
+        log_task_limit_rejection(exc, limit_scope=limit_scope)
+        if exc.scope_kind == "platform":
+            # 共享池(``org_id is None``)拦下的是不归属任何渠道的请求,对他们
+            # 说"渠道"没有对应概念;而池子是全平台共享的,"等待已有任务完成"
+            # 也无从等起 —— 撞闸的人自己可能一个任务都没在跑。
+            message = f"当前平台 {exc.queue_kind} 队列任务已满，请稍后再试"
+        else:
+            message = (
+                f"当前渠道 {exc.queue_kind} 队列任务已满，请等待已有任务完成后再提交"
+            )
+        return JSONResponse(
+            status_code=429,
+            content={
+                "ok": False,
+                "error": message,
+                "data": {
+                    "scope_kind": exc.scope_kind,
+                    "org_id": exc.org_id,
+                    "queue_kind": exc.queue_kind,
+                    "limit": exc.limit,
+                    "active": exc.active,
+                    "limit_scope": limit_scope,
+                },
+            },
+        )
+
+    @application.exception_handler(UserTaskLimitExceeded)
+    async def _user_task_limit_exceeded(
+        request: Request,
+        exc: UserTaskLimitExceeded,
+    ) -> JSONResponse:
+        _ = request
+        log_task_limit_rejection(exc, limit_scope="user")
+        return JSONResponse(
+            status_code=429,
+            content={
+                "ok": False,
+                "error": (
+                    f"你在 {exc.queue_kind} 队列的在途任务已满，"
+                    "请等待自己的任务完成后再提交"
+                ),
+                "data": {
+                    "requester_user_id": exc.requester_user_id,
+                    "queue_kind": exc.queue_kind,
+                    "limit": exc.limit,
+                    "active": exc.active,
+                    "limit_scope": "user",
                 },
             },
         )
@@ -186,6 +257,46 @@ def create_app() -> FastAPI:
                 "ok": False,
                 "error": BILLING_RULE_NOT_CONFIGURED_MESSAGE,
                 "data": billing_rule_not_configured_payload(exc),
+            },
+        )
+
+    @application.exception_handler(BillingError)
+    async def _billing_error(
+        request: Request,
+        exc: BillingError,
+    ) -> JSONResponse:
+        _ = request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={
+                "ok": False,
+                "error": exc.user_message,
+                "data": billing_error_payload(exc),
+            },
+        )
+
+    @application.exception_handler(AuthzError)
+    async def _authz_error(
+        request: Request,
+        exc: AuthzError,
+    ) -> JSONResponse:
+        # Without this handler the denial escaped to Starlette's
+        # ServerErrorMiddleware, which answers text/plain 500 — no machine code
+        # for the frontend and, because nothing on this path logged, no trace
+        # for whoever triages it.
+        logger.warning(
+            "organization authorization denied: code=%s status=%s method=%s path=%s",
+            exc.code,
+            exc.http_status,
+            request.method,
+            request.url.path,
+        )
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={
+                "ok": False,
+                "error": exc.user_message,
+                "data": authz_error_payload(exc),
             },
         )
 
@@ -319,9 +430,13 @@ def create_app() -> FastAPI:
     async def static_project_media(
         project: str,
         file_path: str,
+        request: Request,
+        st_thumb: str | None = None,
         user: dict = Depends(get_api_user),
     ):
-        return await preview_project_media_file(project, file_path, user)
+        return await preview_project_media_file(
+            project, file_path, user, st_thumb=st_thumb, request=request
+        )
 
     @application.get("/static/{legacy_path:path}", include_in_schema=False)
     async def legacy_static_media(legacy_path: str):

@@ -138,7 +138,11 @@ class _M09Store:
         assert episode == 1
         return [dict(beat) for beat in self.beats]
 
-    async def list_visual_beats(self):
+    async def load_working_content(self, episode: int):
+        assert episode == 1
+        return "INT. ALLEY - NIGHT\nHero walks through the alley."
+
+    async def list_beat_asset_refs(self):
         return [
             SimpleNamespace(
                 episode_number=1,
@@ -212,6 +216,11 @@ class _FakeCreditQuote:
 @pytest.fixture()
 def m09_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from novelvideo.api import auth as api_auth
+    # Imported here rather than at module scope on purpose: ``test_m01_auth``
+    # pops every ``novelvideo.api.*`` entry out of ``sys.modules`` to rebuild the
+    # app in CE mode, so a module-level binding would be a dead object by the
+    # time this fixture runs, and patching it would silently miss the routes.
+    from novelvideo.api import deps
     from novelvideo.api.deps import ProjectResolution
     from novelvideo.api.routes import assets, files, generation
     from novelvideo.generators.video_pool_indexer import add_video_to_pool
@@ -288,7 +297,7 @@ def m09_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         assert project == _PROJECT
         return resolution
 
-    async def make_store_for_context(_ctx):
+    async def make_store_for_context(_ctx, **_kwargs):
         return store
 
     async def make_store(username: str, project: str):
@@ -342,7 +351,11 @@ def m09_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(files, "resolve_project_scope", resolve_project_scope)
     monkeypatch.setattr(assets, "resolve_project_scope", resolve_project_scope)
-    monkeypatch.setattr(assets, "make_sqlite_store_for_context", make_store_for_context)
+    # On ``deps``: the assets route opens its store through
+    # ``sqlite_store_for_context_scope``, which looks the factory up as a ``deps``
+    # global at call time. Patching the route module would leave the real factory
+    # in play.
+    monkeypatch.setattr(deps, "make_sqlite_store_for_context", make_store_for_context)
     monkeypatch.setattr(assets, "get_project_dir", lambda username, project: project_dir, raising=False)
     monkeypatch.setattr(assets, "make_sqlite_store", make_store, raising=False)
 
@@ -499,7 +512,10 @@ def test_m09_l2_exercises_all_23_endpoint_contracts(m09_client_factory):
         )
     )
     _assert_ok(
-        client.post(f"/api/v1/projects/{_PROJECT}/episodes/1/optimize/video-global", json={})
+        client.post(
+            f"/api/v1/projects/{_PROJECT}/episodes/1/optimize/video-global",
+            json={"language": "zh"},
+        )
     )
     _assert_ok(client.get(f"/api/v1/projects/{_PROJECT}/assets/identity/{_IDENTITY}/references"))
     _assert_ok(client.get(f"/api/v1/projects/{_PROJECT}/media/media/existing.mp4"))
@@ -567,7 +583,10 @@ def test_global_video_prompt_batch_bills_existing_sketches(
     assert quote["data"]["display"] == "12"
 
     response = _assert_ok(
-        client.post(f"/api/v1/projects/{_PROJECT}/episodes/1/optimize/video-global", json={})
+        client.post(
+            f"/api/v1/projects/{_PROJECT}/episodes/1/optimize/video-global",
+            json={"language": "zh"},
+        )
     )
 
     _assert_task_payload(response, backend=backend, task_type="global_optimize_video")
@@ -581,6 +600,7 @@ def test_global_video_prompt_batch_bills_existing_sketches(
         "item_count": 2,
     }
     assert call["payload"]["beat_numbers"] == [1, 2]
+    assert call["payload"]["language"] == "en"
 
 
 def test_m09_render_execute_rejects_stale_fingerprint_and_plan_hash(m09_client_factory):

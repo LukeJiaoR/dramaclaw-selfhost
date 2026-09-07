@@ -80,6 +80,21 @@ export interface TaskKey {
   episode: number;
   beatNum?: number;
   scope?: string;
+  /**
+   * "Only follow runs that cover this beat."
+   *
+   * Different from `beatNum`, which matches the task row's `beat_num` column.
+   * Selection-scoped runs (`sketch_regen`, `selected_regen`) write
+   * `beat_num = null` and carry their beat list in `metadata.beat_numbers`, so
+   * `beatNum` can never match them — passing it just makes reconcile miss the
+   * row entirely (see the comment above `regenTask` in sketch-section.tsx).
+   *
+   * Setting this gives each beat its own registry entry and filters reconcile
+   * by coverage, so one beat's in-flight run no longer freezes every other
+   * beat's panel. A row with no beat list is "unknown coverage" and still
+   * matches — same rule as `covers()`.
+   */
+  coversBeat?: number;
 }
 
 export interface TaskStreamState {
@@ -109,6 +124,17 @@ export interface TaskControllerSnapshot {
    * found" and completion events never reach the FE.
    */
   activeScope: string | null;
+  /**
+   * Beats the currently-tracked run covers, or `null` when unknown.
+   *
+   * Per-beat panels (草图 / 渲染图) all subscribe to one episode-wide entry
+   * because selection-scoped runs carry `beat_num = null` and an opaque scope
+   * hash — without this field every panel would render the same spinner and a
+   * single regen would look like the whole episode was generating.
+   * `null` means "no attribution available", which callers read as
+   * "covers everything" rather than hiding a genuinely running beat.
+   */
+  activeBeatNumbers: number[] | null;
   streamState: TaskStreamState;
   /**
    * Mirrors `entry.ownerInstanceId !== null`. Exposed through the snapshot so
@@ -155,7 +181,7 @@ const ACTIVE_STATUSES: readonly TaskStatus[] = [
  * iff they identify the same scoped task. Exported for tests.
  */
 export function serializeKey(k: TaskKey): string {
-  return `${k.taskType}|${k.project}|${k.episode}|${k.beatNum ?? ""}|${k.scope ?? ""}`;
+  return `${k.taskType}|${k.project}|${k.episode}|${k.beatNum ?? ""}|${k.scope ?? ""}|${k.coversBeat ?? ""}`;
 }
 
 export function isActiveStatus(status: TaskStatus): boolean {
@@ -181,6 +207,7 @@ function createEntry(key: TaskKey): TaskRegistryEntry {
     activeTaskType: key.taskType,
     activeTaskId: null,
     activeScope: key.scope ?? null,
+    activeBeatNumbers: key.beatNum === undefined ? null : [key.beatNum],
     streamState: INITIAL_STREAM_STATE,
     hasOwner: false,
   };

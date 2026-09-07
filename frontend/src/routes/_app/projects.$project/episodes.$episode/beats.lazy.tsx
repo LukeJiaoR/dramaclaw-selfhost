@@ -110,7 +110,10 @@ const SHOW_EPISODE_FREEZONE_ENTRY = false;
  * NiceGUI sketch grid features are exposed from the toolbar as dialogs
  * so the default shell stays aligned with the FE main branch split layout.
  */
-function BeatsTabContent() {
+// 导出只为页面级网络合同测试（``episode-beats-scope-contract.test.tsx``）：那条断言
+// 要的是"进这一集一共发了哪些 beats 请求"，hook 单测覆盖不到组合层顺手把别集也拉
+// 一遍的情况。路由本身仍只用文件末尾那个 ``Route``。
+export function BeatsTabContent() {
   const { t } = useTranslation();
   const scrollHideRef = useHideHeaderOnScroll<HTMLDivElement>();
   // Route params
@@ -829,13 +832,10 @@ function BeatsTabContent() {
               {t("episode.sketchPlan.title", {
                 beats: checkedBeatNums.length,
                 grids: sketchPlanItems.length,
-                defaultValue: `草图计划（${checkedBeatNums.length} beats → ${sketchPlanItems.length} 个网格）`,
               })}
             </AlertDialogTitle>
             <AlertDialogDescription>
-              {t("episode.sketchPlan.subtitle", {
-                defaultValue: "系统已根据场景自动分组。确认后会直接发配草图任务。",
-              })}
+              {t("episode.sketchPlan.subtitle")}
             </AlertDialogDescription>
           </AlertDialogHeader>
 
@@ -891,7 +891,6 @@ function BeatsTabContent() {
             >
               {t("episode.sketchPlan.confirm", {
                 grids: sketchPlanItems.length,
-                defaultValue: `确认草图 ${sketchPlanItems.length} 个网格`,
               })}
               <CreditCostInline
                 display={sketchPlanCostDisplay}

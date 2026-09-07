@@ -31,7 +31,7 @@ import {
 } from '@xyflow/react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
-import { MousePointerClick, Upload } from 'lucide-react';
+import { MousePointerClick } from 'lucide-react';
 import '@xyflow/react/dist/style.css';
 
 import { useShallow } from 'zustand/react/shallow';
@@ -77,6 +77,7 @@ import {
   CANVAS_PANNING_CLASS,
   PANNING_CLASS_RELEASE_DELAY_MS,
   isLowDetailZoom,
+  onCanvasHydrateViewport,
   setCanvasGestureActive,
   setCanvasLowDetail,
 } from '@/features/canvas/application/canvasLod';
@@ -122,7 +123,10 @@ import {
   type BatchConnectParams,
 } from './ui/MultiSelectionConnectButton';
 import { NodeSpawnPlusOverlay } from './ui/NodeSpawnPlusOverlay';
+import { ReferencePickBanner } from './ui/ReferencePickBanner';
+import { ViewportReturnHint } from './ui/ViewportReturnHint';
 import { CanvasContextMenu } from './ui/CanvasContextMenu';
+import { CanvasFileDropOverlay } from './ui/CanvasFileDropOverlay';
 import { NodeToolDialog } from './ui/NodeToolDialog';
 import { ImageViewerModal } from './ui/ImageViewerModal';
 import { VideoViewerModal } from './ui/VideoViewerModal';
@@ -139,16 +143,23 @@ import { useCanvasToolStore } from './ui/canvasToolStore';
 import { SnapAlignGuides } from './snap-align/SnapAlignGuides';
 import { useSnapAlignStore } from './snap-align/snapAlignStore';
 import {
-  buildSnapAlignIndex,
-  computeSnapAlignFromIndex,
-  type SnapAlignIndex,
-} from './snap-align/computeSnapAlign';
+  createSnapAlignDragSession,
+  isSnapAlignPositionChange,
+  resolveSnapAlignDragMove,
+  type SnapAlignDragSession,
+} from './snap-align/resolveSnapAlignDrag';
 import { computeAutoLayout } from './application/autoLayout';
-import { migratePastedNodeAssets } from './application/crossProjectAssets';
+import { holdCanvasAutosave } from '@/features/freezone/canvasAutosaveHold';
+import {
+  migratePastedNodeAssets,
+  withholdForeignAssetUrls,
+  type PastedNodeForMigration,
+} from './application/crossProjectAssets';
 
 const DEFAULT_VIEWPORT: Viewport = { x: 0, y: 0, zoom: 1 };
 const DEFAULT_EDGE_OPTIONS = { type: 'disconnectableEdge' };
 const REACT_FLOW_PRO_OPTIONS = { hideAttribution: true };
+const CANVAS_NODE_DRAG_FOCUS_CLASS = 'canvas-node-drag-focus';
 // 拖线吸附半径(px,以光标到目标 handle 的距离计)。节点的 target handle 在左边
 // 缘的一个小点上,而节点本身宽 300~400px;半径太小(默认 20 / 旧值 50)时,把线
 // 拖到节点中部就已超出 handle 的吸附范围,既不自动吸附也没有「会连上」的视觉反
@@ -807,6 +818,7 @@ export function Canvas({
   const setHoveredNodeId = useCanvasStore((state) => state.setHoveredNodeId);
 
   const [showNodeMenu, setShowNodeMenu] = useState(false);
+  const [isNodeDragFocusActive, setIsNodeDragFocusActive] = useState(false);
   const [menuPosition, setMenuPosition] = useState({ x: 0, y: 0 });
   const [flowPosition, setFlowPosition] = useState({ x: 0, y: 0 });
   const [pendingNodePlacement, setPendingNodePlacement] =
@@ -879,6 +891,21 @@ export function Canvas({
     }, NODE_SPAWN_PLUS_HIDE_DELAY_MS);
   }, [clearHoveredNodeTimer]);
 
+  const enterNodeDragFocus = useCallback(() => {
+    document.body.classList.add(CANVAS_NODE_DRAG_FOCUS_CLASS);
+    setIsNodeDragFocusActive(true);
+    clearHoveredNodeTimer();
+    setHoveredNodeId(null);
+    setShowNodeMenu(false);
+    setMenuAllowedTypes(undefined);
+    setContextMenu(null);
+  }, [clearHoveredNodeTimer, setHoveredNodeId]);
+
+  const exitNodeDragFocus = useCallback(() => {
+    document.body.classList.remove(CANVAS_NODE_DRAG_FOCUS_CLASS);
+    setIsNodeDragFocusActive(false);
+  }, []);
+
   const handleNodeMouseEnter = useCallback(
     (_event: ReactMouseEvent, node: CanvasNode) => {
       clearHoveredNodeTimer();
@@ -924,6 +951,7 @@ export function Canvas({
   useEffect(() => {
     return () => {
       clearHoveredNodeTimer();
+      document.body.classList.remove(CANVAS_NODE_DRAG_FOCUS_CLASS);
       if (placementConfirmTimerRef.current !== null) {
         clearTimeout(placementConfirmTimerRef.current);
       }
@@ -954,9 +982,9 @@ export function Canvas({
     partnerStarts: Map<string, { x: number; y: number }>;
     draggedStart: { x: number; y: number };
   } | null>(null);
-  // 吸附对齐索引缓存：单节点拖动期间其它节点不动,索引在拖动开始(nodeId 变化)时建一次,
-  // 之后每帧只做二分查找,避免每帧 filter + 重扫全部节点。拖动结束时清空。
-  const snapAlignIndexRef = useRef<{ nodeId: string; index: SnapAlignIndex } | null>(null);
+  // 单节点拖动期间其它节点不动：缓存绝对坐标索引、父级坐标偏移和磁滞锁，避免每帧
+  // 重扫节点，也保证组内相对坐标能正确换算到统一 Flow 坐标系。
+  const snapAlignSessionRef = useRef<SnapAlignDragSession | null>(null);
   const marqueeSelectionRef = useRef<{
     active: boolean;
     pointerId: number;
@@ -1598,48 +1626,54 @@ export function Canvas({
       if (unlockedChanges.length === 0) {
         return;
       }
-      // 吸附对齐：仅在用户启用、且只有一个节点正在被拖动时介入。
+      // 吸附对齐：仅在用户启用、且只有一个节点正在被拖动时介入；结束帧也要沿用
+      // 活动会话，否则 React Flow 的原始 pointer 坐标会覆盖已经吸附的最终位置。
       // 多选拖动暂不做吸附 —— 各节点单独算 snap delta 会导致它们之间出现错位。
       // alt-复制拖动也跳过：handleNodeDrag 会把 source 复位 / 把 copy 按 delta 跟上，
       // 这里再吸附会和它打架。
       let effectiveChanges = unlockedChanges;
       const snapEnabled = useSnapAlignStore.getState().enabled;
       if (snapEnabled && !altDragCopyRef.current) {
-        const draggingPositionChanges = unlockedChanges.filter(
-          (change) =>
-            change.type === 'position' &&
-            'dragging' in change &&
-            change.dragging === true &&
-            change.position
+        const snapPositionChanges = unlockedChanges.filter((change) =>
+          isSnapAlignPositionChange(change, snapAlignSessionRef.current?.nodeId),
         );
-        if (draggingPositionChanges.length === 1) {
-          const change = draggingPositionChanges[0] as Extract<
-            NodeChange<CanvasNode>,
-            { type: 'position' }
-          > & { position: { x: number; y: number }; dragging: true };
+        if (snapPositionChanges.length === 1) {
+          const change = snapPositionChanges[0];
           const draggedNode = nodes.find((n) => n.id === change.id);
           if (draggedNode) {
             // 仅在新一次拖动(目标节点变化)时重建索引;同一拖动的后续帧复用。
-            if (snapAlignIndexRef.current?.nodeId !== change.id) {
-              const otherNodes = nodes.filter(
-                (n) => n.id !== change.id && n.type !== CANVAS_NODE_TYPES.group
-              );
-              snapAlignIndexRef.current = {
-                nodeId: change.id,
-                index: buildSnapAlignIndex(otherNodes),
-              };
+            if (snapAlignSessionRef.current?.nodeId !== change.id) {
+              const linkedPartnerIds = [
+                ...(linkedDragRef.current?.partnerStarts.keys() ?? []),
+              ];
+              snapAlignSessionRef.current = createSnapAlignDragSession({
+                nodes,
+                draggedNode,
+                linkedPartnerIds,
+                getAbsolutePosition: (node) =>
+                  reactFlowInstance.getInternalNode(node.id)?.internals.positionAbsolute ??
+                  node.position,
+              });
             }
-            const snap = computeSnapAlignFromIndex(
+            const snapSession = snapAlignSessionRef.current;
+            const snap = resolveSnapAlignDragMove({
               draggedNode,
-              change.position,
-              snapAlignIndexRef.current.index
-            );
+              proposedPosition: change.position,
+              session: snapSession,
+              zoom: reactFlowInstance.getZoom(),
+            });
+            snapAlignSessionRef.current = snap.session;
             useSnapAlignStore.getState().setGuides(snap.guides);
             effectiveChanges = unlockedChanges.map((c) =>
-              c === change ? { ...change, position: snap.position } : c
+              c === change
+                ? {
+                    ...change,
+                    position: snap.position,
+                  }
+                : c
             );
           }
-        } else if (draggingPositionChanges.length > 1) {
+        } else if (snapPositionChanges.length > 1) {
           // 多选拖动期间隐藏引导线，避免误导。
           useSnapAlignStore.getState().clearGuides();
         }
@@ -1684,7 +1718,7 @@ export function Canvas({
 
       scheduleCanvasPersist();
     },
-    [applyNodesChange, scheduleCanvasPersist]
+    [applyNodesChange, reactFlowInstance, scheduleCanvasPersist]
   );
 
   const handleEdgesChange = useCallback(
@@ -1973,6 +2007,17 @@ export function Canvas({
     onPanEnd: handleMinimapPanEnd,
     onViewportSettled: handleMinimapViewportSettled,
   });
+
+  // 换画布同样不触发 onMove/onMoveEnd（程序化 setViewport 的事件慢一拍），由
+  // hydrate 在同一个事件里直接喂过来，好让裁剪开关与节点挂载落在同一次提交。
+  useEffect(
+    () =>
+      onCanvasHydrateViewport((zoom) => {
+        applyLowDetailClass(zoom);
+        setLowDetailActive(isLowDetailZoom(zoom));
+      }),
+    [applyLowDetailClass]
+  );
 
   // 首屏恢复的视口不会触发 onMove/onMoveEnd，低缩放档要在这里补一次。
   useEffect(() => {
@@ -3442,7 +3487,19 @@ export function Canvas({
 
       const idMap = new Map<string, string>();
       const sizeMap = new Map<string, { width: number; height: number }>();
-      const pastedForMigration: Array<{ id: string; data: CanvasNodeData }> = [];
+      const pastedForMigration: PastedNodeForMigration[] = [];
+      // 跨项目粘贴（来自序列化剪贴板且源项目 ≠ 当前项目）：指向源项目的媒体 URL 在入
+      // store **之前**就被扣下（withholdForeignAssetUrls），节点先以「素材复制中」占位入
+      // 画布，后端拷完才填回目标项目地址——store 与落库数据里任何时候都没有源项目 URL。
+      // 同时 hold 住当前项目的自动保存，让占位态别白白落一次库；迁移结束（成功或失败）
+      // 再 release，由 useCanvasSync 补存完整节点。hold 超时恢复保存也只会存到占位节点。
+      const sourceProject = snapshot?.sourceProject ?? null;
+      const currentProject = readUrl().project ?? null;
+      const migrationTarget =
+        sourceProject && currentProject && sourceProject !== currentProject
+          ? currentProject
+          : null;
+      const releaseAutosaveHold = migrationTarget ? holdCanvasAutosave(migrationTarget) : null;
       for (const sourceNode of sourceNodes) {
         const data = cloneNodeData(sourceNode.data);
         if ('isGenerating' in (data as Record<string, unknown>)) {
@@ -3482,14 +3539,19 @@ export function Canvas({
               x: sourceNode.position.x + chosenOffset.x + offsetStep * 8,
               y: sourceNode.position.y + chosenOffset.y + offsetStep * 6,
             };
+        const { data: storeData, withheld } = migrationTarget
+          ? withholdForeignAssetUrls(data, migrationTarget)
+          : { data, withheld: [] };
         const nextNodeId = addNode(
           sourceNode.type as CanvasNodeType,
           position,
-          { ...data }
+          { ...storeData }
         );
         idMap.set(sourceNode.id, nextNodeId);
         sizeMap.set(nextNodeId, getNodeSize(sourceNode));
-        pastedForMigration.push({ id: nextNodeId, data });
+        if (withheld.length > 0) {
+          pastedForMigration.push({ id: nextNodeId, withheld });
+        }
       }
 
       const sizeSyncChanges = Array.from(sizeMap.entries()).map(([nodeId, size]) => ({
@@ -3547,37 +3609,37 @@ export function Canvas({
         scheduleCanvasPersist(0);
       }
 
-      // 跨项目粘贴：把节点里指向「源项目」的媒体资产重新上传到当前项目，完成后静默
-      // 改写 URL。后台执行、不阻塞粘贴；单条失败保留原 URL 并提示。仅当来自序列化
-      // 剪贴板（paste）且源项目与当前项目不同才触发——同项目复制/副本无需迁移。
-      const sourceProject = snapshot?.sourceProject ?? null;
-      const currentProject = readUrl().project ?? null;
-      if (
-        sourceProject
-        && currentProject
-        && sourceProject !== currentProject
-        && pastedForMigration.length > 0
-      ) {
+      // 跨项目粘贴：让后端把扣下的源项目媒体拷进当前项目，完成后填回目标地址、摘掉
+      // 占位标记。后台执行、不阻塞粘贴；失败的节点保持字段为空并标记 failed（占位遮罩
+      // 提示删除重贴）。无论成败都要 release 上面的自动保存 hold。
+      if (migrationTarget && pastedForMigration.length > 0) {
         void migratePastedNodeAssets({
           nodes: pastedForMigration,
-          targetProject: currentProject,
+          targetProject: migrationTarget,
           getLiveNodeData: (nodeId) =>
             useCanvasStore.getState().nodes.find((node) => node.id === nodeId)?.data ?? null,
           updateNodeData,
         })
-          .then(({ migrated, failed }) => {
-            if (failed > 0) {
-              toast.error(t('canvas.crossProjectAssets.partialFailure', { count: failed }));
+          .then(({ migrated, failed, failedNodeIds }) => {
+            if (failedNodeIds.length > 0 || failed > 0) {
+              toast.error(
+                t('canvas.crossProjectAssets.partialFailure', { count: Math.max(failed, 1) })
+              );
             } else if (migrated > 0) {
               toast.success(t('canvas.crossProjectAssets.success', { count: migrated }));
             }
-            if (migrated > 0) {
+            if (migrated > 0 || failedNodeIds.length > 0) {
               scheduleCanvasPersist(0);
             }
           })
           .catch((error) => {
             console.warn('[canvas] cross-project asset migration failed', error);
+          })
+          .finally(() => {
+            releaseAutosaveHold?.();
           });
+      } else {
+        releaseAutosaveHold?.();
       }
 
       return { firstNodeId, idMap };
@@ -3679,6 +3741,7 @@ export function Canvas({
 
   const handleNodeDragStart = useCallback(
     (event: ReactMouseEvent, node: CanvasNode, draggedNodes: CanvasNode[]) => {
+      enterNodeDragFocus();
       // 组内成员拖动：记下「所有被拖成员」（多选时第三参带全量）所属的组 id，松手时
       // 逐组按成员最终落点 fitGroupToChildren 重新包住（libtv 式，拖动期间不动框）。
       // 只看被抓节点会漏掉多选里其它组的成员 —— 它们没有 extent:'parent' 钳制，
@@ -3795,7 +3858,7 @@ export function Canvas({
         sourceToCopyIdMap: duplicateResult.idMap,
       };
     },
-    [duplicateNodes, nodes, selectedNodeIds]
+    [duplicateNodes, enterNodeDragFocus, nodes, selectedNodeIds]
   );
 
   const handleNodeDrag = useCallback(
@@ -3881,8 +3944,9 @@ export function Canvas({
 
   const handleNodeDragStop = useCallback(
     (_event: ReactMouseEvent, node: CanvasNode) => {
+      exitNodeDragFocus();
       useSnapAlignStore.getState().clearGuides();
-      snapAlignIndexRef.current = null;
+      snapAlignSessionRef.current = null;
       // 联动拖动收尾:partner 的最终位置已在拖动期间(dragging:true)写入,松手时
       // React Flow 对被拖节点发出的 dragging:false 变更会统一压入同一条撤销记录,
       // 故这里只需清掉引用,不再额外提交以免产生重复的 undo 步骤。
@@ -3963,13 +4027,14 @@ export function Canvas({
       }
       scheduleCanvasPersist(0);
     },
-    [applyNodesChange, scheduleCanvasPersist, setSelectedNode]
+    [applyNodesChange, exitNodeDragFocus, scheduleCanvasPersist, setSelectedNode]
   );
 
   // 拖「选区框」整体移动多选节点时，React Flow 走 onSelectionDrag* 而非 onNodeDrag*，
   // 组成员的 refit 同样要在这条路径上收尾，否则组成员被拖出框后无人包住。
   const handleSelectionDragStart = useCallback(
     (_event: ReactMouseEvent, draggedNodes: CanvasNode[]) => {
+      enterNodeDragFocus();
       const stateNodes = useCanvasStore.getState().nodes;
       const groupIds = new Set<string>();
       for (const item of draggedNodes) {
@@ -3979,10 +4044,11 @@ export function Canvas({
       groupFitDragRef.current =
         groupIds.size > 0 ? { groupIds: [...groupIds] } : null;
     },
-    []
+    [enterNodeDragFocus]
   );
 
   const handleSelectionDragStop = useCallback(() => {
+    exitNodeDragFocus();
     const groupFit = groupFitDragRef.current;
     groupFitDragRef.current = null;
     if (groupFit) {
@@ -3991,7 +4057,7 @@ export function Canvas({
         fitGroupToChildren(groupId);
       }
     }
-  }, []);
+  }, [exitNodeDragFocus]);
 
   // 手动建边落到某个节点上时，这条边会不会把视频节点的素材撑过能力包络？非空即拒绝。
   // 三条手动路径（React Flow 拖线松手、"+" 拖拽的落点高亮、"+" 松手建边）共用同一把
@@ -4775,6 +4841,7 @@ export function Canvas({
     <div
       ref={wrapperRef}
       data-canvas-tool={handToolActive ? 'hand' : 'move'}
+      data-node-drag-focus={isNodeDragFocusActive ? 'true' : undefined}
       className="dc-canvas relative h-full w-full bg-background"
       onDragEnter={handleCanvasDragEnter}
       onDragOver={handleCanvasDragOver}
@@ -4874,6 +4941,9 @@ export function Canvas({
         <SnapAlignGuides />
       </ReactFlow>
 
+      <ReferencePickBanner />
+      <ViewportReturnHint />
+
       {marqueeSelectionRect && (
         <div
           className="pointer-events-none absolute z-[130] rounded-md border border-dashed border-white/55 bg-white/[0.04]"
@@ -4927,7 +4997,7 @@ export function Canvas({
             [
               {
                 key: 'upload',
-                label: '上传',
+                label: t('canvas.contextMenu.upload'),
                 onSelect: () => {
                   const flowPos = reactFlowInstance.screenToFlowPosition({
                     x: contextMenu.clientX,
@@ -4939,7 +5009,7 @@ export function Canvas({
               },
               {
                 key: 'add-node',
-                label: '添加节点',
+                label: t('canvas.contextMenu.addNode'),
                 onSelect: () =>
                   openNodeMenuAtClientPosition({
                     x: contextMenu.clientX,
@@ -4950,7 +5020,7 @@ export function Canvas({
             [
               {
                 key: 'undo',
-                label: '撤销',
+                label: t('canvas.contextMenu.undo'),
                 shortcut: '⌘Z',
                 disabled: !contextMenu.canUndo,
                 onSelect: () => {
@@ -4961,7 +5031,7 @@ export function Canvas({
               },
               {
                 key: 'redo',
-                label: '重做',
+                label: t('canvas.contextMenu.redo'),
                 shortcut: '⇧⌘Z',
                 disabled: !contextMenu.canRedo,
                 onSelect: () => {
@@ -4974,7 +5044,7 @@ export function Canvas({
             [
               {
                 key: 'paste',
-                label: '粘贴',
+                label: t('canvas.contextMenu.paste'),
                 shortcut: '⌘V',
                 disabled: !contextMenu.canPaste,
                 onSelect: () => {
@@ -4995,16 +5065,7 @@ export function Canvas({
 
       {nodes.length === 0 && emptyHint}
 
-      {isFileDropActive && (
-        <div className="pointer-events-none absolute inset-0 z-[120] flex items-center justify-center">
-          <div className="absolute inset-3 rounded-2xl border-2 border-dashed border-accent/70 bg-accent/[0.06]" />
-          <div className="relative flex flex-col items-center gap-3 rounded-2xl bg-surface-dark/90 px-8 py-6 text-center shadow-2xl ring-1 ring-white/10">
-            <Upload className="h-8 w-8 text-accent" />
-            <div className="text-sm font-medium text-text-dark">释放以添加到画布</div>
-            <div className="text-xs text-text-muted">支持图片、视频、音频，自动生成对应节点</div>
-          </div>
-        </div>
-      )}
+      <CanvasFileDropOverlay isVisible={isFileDropActive} />
 
       <CanvasMinimapButton
         pinned={minimapPinned}

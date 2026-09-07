@@ -9,12 +9,24 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from novelvideo.freezone.paths import CANVAS_ID_RE, freezone_root
+from novelvideo.freezone.paths import (
+    CANVAS_ID_RE,
+    freezone_root,
+    resolve_static_url_to_path,
+)
+
+# Imported as a module, not by name: the prewarm call below must resolve through
+# it at call time. Import-safe without Pillow — the renderer loads PIL lazily.
+from novelvideo.utils import thumbnails
+
+logger = logging.getLogger("novelvideo.freezone.history")
 
 _SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 _DEFAULT_LIMIT = 100
@@ -105,14 +117,63 @@ def append_generation_history(
     path = generation_history_path(project_dir, normalized["canvas_id"], node_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n")
+        f.write(
+            json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+    prewarm_history_thumbnail(project_dir, normalized)
     return normalized
+
+
+# Keep this allowlist aligned with the one generated image the history strip
+# displays. Video, audio, 3D and text records do not enter this path.
+_IMAGE_OUTPUT_KEYS = ("output_url", "image_url", "master_url", "url")
+
+
+def prewarm_history_thumbnail(project_dir: Path, record: dict[str, Any]) -> int:
+    """Queue one 320px thumbnail for a newly written history record.
+
+    This is intentionally narrow: one record produces at most one background
+    job and only the ``thumb`` variant. Existing records are never scanned or
+    backfilled while being read, so opening a large history cannot fan out into
+    CPU-bound image decodes. Best-effort and never allowed to break the history
+    write.
+    """
+
+    if (
+        record.get("status") not in {"completed", "succeeded"}
+        or record.get("media_type") != "image"
+    ):
+        return 0
+
+    result = record.get("result")
+    if not isinstance(result, dict):
+        return 0
+
+    try:
+        for key in _IMAGE_OUTPUT_KEYS:
+            value = result.get(key)
+            if not isinstance(value, str):
+                continue
+            url = value.strip()
+            if not url or not thumbnails.is_thumbnailable(Path(urlsplit(url).path)):
+                continue
+            try:
+                source = resolve_static_url_to_path(url, project_dir)
+            except (OSError, ValueError):
+                continue
+            return thumbnails.prewarm(project_dir, source, ["thumb"])
+    except Exception:
+        logger.debug(
+            "thumbnail prewarm skipped for %s", record.get("id"), exc_info=True
+        )
+    return 0
 
 
 def _read_history_file(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     records: list[dict[str, Any]] = []
+    deleted_record_ids: set[str] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -120,9 +181,52 @@ def _read_history_file(path: Path) -> list[dict[str, Any]]:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict):
-            records.append(value)
-    return records
+        if not isinstance(value, dict):
+            continue
+        deleted_record_id = value.get("_deleted_record_id")
+        if isinstance(deleted_record_id, str) and deleted_record_id:
+            deleted_record_ids.add(deleted_record_id)
+            continue
+        records.append(value)
+    if not deleted_record_ids:
+        return records
+    return [record for record in records if record.get("id") not in deleted_record_ids]
+
+
+def delete_generation_history_record(
+    *,
+    project_dir: Path,
+    canvas_id: str,
+    node_id: str,
+    record_id: str,
+) -> bool:
+    """Hide one history record by appending an audit-friendly tombstone.
+
+    History files are append-only. Rewriting a JSONL file while a generation job
+    appends to it can lose the new record, so deletion uses a tombstone that all
+    readers apply instead. The generated media itself is deliberately retained:
+    another canvas node may still reference the same output URL.
+    """
+
+    normalized_record_id = str(record_id or "").strip()
+    if not normalized_record_id:
+        raise ValueError("record_id is required")
+    path = generation_history_path(project_dir, canvas_id, node_id)
+    if not any(
+        record.get("id") == normalized_record_id
+        for record in _read_history_file(path)
+    ):
+        return False
+    with path.open("a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {"_deleted_record_id": normalized_record_id},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+    return True
 
 
 def read_generation_history(
@@ -132,7 +236,9 @@ def read_generation_history(
     node_id: str,
     limit: int = _DEFAULT_LIMIT,
 ) -> list[dict[str, Any]]:
-    records = _read_history_file(generation_history_path(project_dir, canvas_id, node_id))
+    records = _read_history_file(
+        generation_history_path(project_dir, canvas_id, node_id)
+    )
     if limit <= 0:
         return records
     return records[-limit:]

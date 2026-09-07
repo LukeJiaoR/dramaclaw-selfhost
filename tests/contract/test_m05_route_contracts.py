@@ -208,6 +208,10 @@ class _M05Store:
             },
         ]
 
+    async def repair_path_unsafe_asset_names(self, kind: str, move_assets=None):
+        # 这里的名字都是干净的，list 接口上那道存量自愈是空跑。
+        return {}
+
     async def list_scenes(self):
         return list(self.scenes.values())
 
@@ -222,6 +226,9 @@ class _M05Store:
         for key, value in updates.items():
             setattr(scene, key, value)
         return True
+
+    async def touch_scene_asset(self, name: str):
+        return name in self.scenes
 
     async def rename_scene(self, old_name: str, new_name: str):
         scene = self.scenes.pop(old_name)
@@ -340,7 +347,7 @@ def m05_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         store.resolved_roles.append(("scenes", required_role))
         return ctx, "alice", _PROJECT, project_dir, str(project_dir), store
 
-    async def make_store_for_context(_ctx):
+    async def make_store_for_context(_ctx, **_kwargs):
         return store
 
     monkeypatch.setattr(scenes, "_resolve_scene_project", resolve_scene_project)
@@ -463,6 +470,53 @@ def _assert_task_shape(payload: dict, *, backend: str, task_type: str):
     assert payload["queue"] == ("inline" if backend == "inline" else "default")
     assert "celery_task_id" not in payload
     assert "celery_queue" not in payload
+
+
+@pytest.mark.parametrize(
+    "removed_field,value",
+    [
+        ("provider", "newapi"),
+        ("model", "newapi_gpt_image2"),
+        ("image_size", "4K"),
+        ("quality", "high"),
+        ("style", "cinematic"),
+        ("timeout_seconds", 7200),
+    ],
+)
+def test_scene_pano_rejects_removed_execution_fields_before_enqueue(
+    m05_client_factory, removed_field, value
+):
+    client, task_backend, _project_dir, _store = m05_client_factory()
+
+    response = client.post(
+        f"/api/v1/projects/{_PROJECT}/scenes/{_SCENE}/pano/generate-async",
+        json={"source": "text", removed_field: value},
+    )
+
+    assert response.status_code == 422
+    assert task_backend.calls == []
+
+
+@pytest.mark.parametrize(
+    ("master_exists", "expected_step"),
+    [(True, "pano_from_master"), (False, "pano_from_text")],
+)
+def test_scene_pano_derives_source_from_server_asset_state(
+    m05_client_factory, master_exists, expected_step
+):
+    client, task_backend, project_dir, _store = m05_client_factory()
+    master_path = project_dir / "assets" / "scenes" / _SCENE / "master.png"
+    if master_exists:
+        master_path.parent.mkdir(parents=True, exist_ok=True)
+        master_path.write_bytes(_png_bytes())
+
+    response = client.post(
+        f"/api/v1/projects/{_PROJECT}/scenes/{_SCENE}/pano/generate-async",
+        json={"source": "master"},
+    )
+
+    assert response.status_code == 200
+    assert task_backend.calls[-1]["payload"]["step"] == expected_step
 
 
 def _seed_labels(project_dir: Path) -> None:

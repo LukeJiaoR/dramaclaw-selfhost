@@ -5,6 +5,7 @@
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -12,6 +13,7 @@ from novelvideo.official_defaults import (
     DEFAULT_TEXT_MODEL_BY_ENV,
     OFFICIAL_NEWAPI_BASE_URL,
 )
+from novelvideo.shared.runtime_env import is_ce_effective
 
 # 加载环境变量（必须在任何其他导入之前）
 load_dotenv()
@@ -124,6 +126,7 @@ def get_pydantic_model(
         "MODEL_NAME",
         preset["default_model"],
         model_name_override=model_name,
+        capability="text.generate.agent",
         timeout_seconds_override=_env_float(
             "MODEL_TIMEOUT",
             float(preset.get("timeout", 120)),
@@ -196,7 +199,7 @@ def _newapi_text_openai_provider(
                     api_key=api_key,
                     base_url=base_url,
                     timeout=timeout_seconds,
-                    max_retries=1,
+                    max_retries=0,
                     http_client=http_client,
                 ),
             )
@@ -246,17 +249,12 @@ def get_newapi_text_pydantic_model(
     *,
     model_name_override: str | None = None,
     timeout_seconds_override: float | None = None,
+    capability: str = "text.generate",
 ):
     """Create a PydanticAI OpenAI-compatible model that routes through newAPI."""
     model_name = str(model_name_override or "").strip() or get_newapi_text_model_name(
         model_env, default_model
     )
-    api_key, base_url = get_newapi_runtime_credentials(
-        env_api_key="MODEL_API_KEY",
-        env_base_url="MODEL_BASE_URL",
-    )
-    if not api_key:
-        raise ValueError("API key not set. Configure DramaClawAPI credentials.")
     timeout_seconds = (
         float(timeout_seconds_override)
         if timeout_seconds_override is not None
@@ -265,12 +263,36 @@ def get_newapi_text_pydantic_model(
             _env_float("NEWAPI_TEXT_TIMEOUT_SECONDS", 300.0),
         )
     )
+    profile = _get_newapi_text_model_profile(model_name)
+    if not is_ce_effective():
+        from novelvideo.model_gateway_runtime import (
+            create_request_scoped_gateway_model,
+        )
+
+        return create_request_scoped_gateway_model(
+            model_name=model_name,
+            capability=capability,
+            timeout_seconds=timeout_seconds,
+            profile=profile,
+            delegate_factory=_newapi_text_openai_model,
+            platform_credential_factory=lambda: get_newapi_runtime_credentials(
+                env_api_key="MODEL_API_KEY",
+                env_base_url="MODEL_BASE_URL",
+            ),
+        )
+
+    api_key, base_url = get_newapi_runtime_credentials(
+        env_api_key="MODEL_API_KEY",
+        env_base_url="MODEL_BASE_URL",
+    )
+    if not api_key:
+        raise ValueError("API key not set. Configure DramaClawAPI credentials.")
     return _newapi_text_openai_model(
         model_name,
         api_key=api_key,
         base_url=base_url,
         timeout_seconds=timeout_seconds,
-        profile=_get_newapi_text_model_profile(model_name),
+        profile=profile,
     )
 
 
@@ -535,6 +557,7 @@ def get_style_preset(
     username: str | None = None,
     project: str | None = None,
     project_dir: str | None = None,
+    state_dir: str | Path | None = None,
 ) -> dict:
     """获取视觉风格预设配置。
 
@@ -553,6 +576,7 @@ def get_style_preset(
         username=username,
         project=project,
         project_dir=project_dir,
+        state_dir=state_dir,
     )
     if not config:
         raise KeyError(f"Style '{style}' not found")
@@ -702,8 +726,14 @@ FISH_VOICE_PRESETS = {
 
 
 def get_fish_voice_id(age_group: str, gender: str) -> str:
-    """根据年龄段+性别获取预设 voice ID。"""
-    gender_key = "female" if "女" in gender else "male"
+    """根据年龄段+性别获取预设 voice ID。
+
+    两条抽取路写出的性别写法不同：legacy 的角色补全提示词要的是「男/女」,
+    structured_v1 的抽取器要的是 ``male``/``female``。只认中文会把每一个
+    structured 项目的女性角色都配成男声，所以两种写法都要认。
+    """
+    text = str(gender or "").strip().lower()
+    gender_key = "female" if ("女" in text or "female" in text) else "male"
     return FISH_VOICE_PRESETS.get(f"{age_group}_{gender_key}", "")
 
 

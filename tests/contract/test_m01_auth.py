@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import sys
 from pathlib import Path
@@ -55,28 +56,90 @@ class _RejectingAuthPort:
         return None
 
 
-def _ce_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
+def _api_modules() -> dict[str, object]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "novelvideo.api" or name.startswith("novelvideo.api.")
+    }
+
+
+_MISSING = object()
+
+
+@contextlib.contextmanager
+def _ce_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A CE app built against freshly imported API modules.
+
+    Building it means dropping every novelvideo.api.* module so the rebuilt app
+    picks up the patched roots. Those rebuilt modules must not outlive this
+    block: any test collected earlier holds functions whose globals belong to
+    the modules dropped here, and leaving the replacements behind turns those
+    references into orphans.
+
+    Restoring sys.modules is only half of it. Importing a submodule also binds
+    it as an attribute of its parent package, and the rebuild rebinds
+    novelvideo.api on novelvideo itself. A dotted patch target is resolved by
+    walking those attributes rather than by reading sys.modules, so restoring
+    one without the other leaves a patch landing on a module nobody is running.
+
+    Everything after the first change to sys.modules sits inside try, because a
+    failure while building the app would otherwise leave the process in exactly
+    the state this exists to prevent.
+    """
+    import novelvideo
+
+    original = _api_modules()
+    original_api_attr = getattr(novelvideo, "api", _MISSING)
+
     registry, _, _ = _reset_port_modules()
     monkeypatch.setenv("ST_CONTROL_PLANE_DSN", "")
     monkeypatch.setenv("REDIS_URL", "")
     monkeypatch.setenv("ST_EDITION", "ce")
     monkeypatch.setenv("ST_LOCAL_USERNAME", "local")
-    for module_name in list(sys.modules):
-        if module_name == "novelvideo.api" or module_name.startswith("novelvideo.api."):
-            sys.modules.pop(module_name)
-    _patch_roots(monkeypatch, tmp_path)
 
-    from novelvideo.ports.local import project as local_project
+    try:
+        for module_name in list(original):
+            sys.modules.pop(module_name, None)
+        _patch_roots(monkeypatch, tmp_path)
 
-    monkeypatch.setattr(local_project, "resolve_worker_id", lambda: "node_local", raising=False)
-    registry.ensure_bootstrap()
+        from novelvideo.ports.local import project as local_project
 
-    from novelvideo.api.app import create_app
+        monkeypatch.setattr(
+            local_project, "resolve_worker_id", lambda: "node_local", raising=False
+        )
+        registry.ensure_bootstrap()
 
-    app = create_app()
-    app.router.on_startup.clear()
-    app.router.on_shutdown.clear()
-    return TestClient(app)
+        from novelvideo.api.app import create_app
+
+        app = create_app()
+        app.router.on_startup.clear()
+        app.router.on_shutdown.clear()
+        with TestClient(app) as client:
+            yield client
+    finally:
+        for name in list(_api_modules()):
+            sys.modules.pop(name, None)
+        sys.modules.update(original)
+
+        # With nothing loaded beforehand there is no module to put back, but the
+        # attribute the rebuild created still points at a package that is no
+        # longer in sys.modules — an orphan of exactly the kind this guards.
+        if original_api_attr is _MISSING:
+            if hasattr(novelvideo, "api"):
+                delattr(novelvideo, "api")
+        else:
+            novelvideo.api = original_api_attr
+
+        # Parents before children, so each rebinding attaches to the package
+        # that has itself already been restored.
+        for name, module in sorted(
+            original.items(), key=lambda item: item[0].count(".")
+        ):
+            parent_name, _, attr = name.rpartition(".")
+            parent = sys.modules.get(parent_name)
+            if parent is not None:
+                setattr(parent, attr, module)
 
 
 def test_ce_auth_me_logout_and_project_crud_contract(
@@ -123,11 +186,12 @@ def test_ce_auth_me_logout_and_project_crud_contract(
         detail = client.get(f"/api/v1/projects/{project_id}")
         assert detail.status_code == 200
         assert detail.json()["data"]["project_id"] == project_id
-        assert (
-            detail.json()["data"]["cognee_embedding_model"]
-            == "DC-cognee-embedding-v2"
-        )
-        assert detail.json()["data"]["cognee_embedding_dimension"] == 1024
+        # New projects use structured extraction and are deliberately not bound
+        # to an embedding model. The binding is permanent once written, so this
+        # is decided at creation time; existing projects keep theirs.
+        assert detail.json()["data"]["knowledge_pipeline"] == "structured_v1"
+        assert "cognee_embedding_model" not in detail.json()["data"]
+        assert "cognee_embedding_dimension" not in detail.json()["data"]
 
 
 @pytest.mark.ee
@@ -164,3 +228,99 @@ def test_ee_auth_missing_and_bad_cookie_contract() -> None:
         assert bad_logout.json() == {"ok": True}
         assert "st_session=" in bad_logout.headers["set-cookie"]
         assert "Max-Age=0" in bad_logout.headers["set-cookie"]
+
+
+def test_ce_client_leaves_api_module_identity_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Building the CE app must not outlive itself in the import system.
+
+    Every test collected earlier holds functions whose globals belong to the
+    modules this client drops. If the replacements survive, a later patch given
+    as a dotted string lands on a module nobody is running, and the test it was
+    written for silently exercises unpatched code.
+    """
+    import novelvideo.api.routes.projects as before_projects
+
+    before = sys.modules["novelvideo.api.routes.projects"]
+
+    with _ce_client(monkeypatch, tmp_path):
+        pass
+
+    assert sys.modules["novelvideo.api.routes.projects"] is before
+    assert before_projects is before
+    # Dotted-string patch targets are resolved by walking package attributes,
+    # so those have to come back as well as sys.modules.
+    import novelvideo
+
+    assert novelvideo.api.routes.projects is before
+
+
+def test_ce_client_restores_the_import_system_even_when_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure while building the app must not leak the rebuilt modules.
+
+    Everything after the first change to sys.modules has to be covered, or the
+    one case where isolation matters most — something went wrong — is the one
+    case without it.
+    """
+    import novelvideo
+    import novelvideo.api.routes.projects  # noqa: F401
+
+    before = sys.modules["novelvideo.api.routes.projects"]
+
+    # Fail inside the try, after sys.modules has already been changed. Patching
+    # anything under novelvideo.api would not work: those modules are dropped
+    # and freshly imported, so the patch would not survive to be called.
+    def explode(*_args, **_kwargs) -> None:
+        raise RuntimeError("app build failed")
+
+    monkeypatch.setattr(sys.modules[__name__], "_patch_roots", explode)
+
+    with pytest.raises(RuntimeError, match="app build failed"):
+        with _ce_client(monkeypatch, tmp_path):
+            pass
+
+    assert sys.modules["novelvideo.api.routes.projects"] is before
+    assert novelvideo.api.routes.projects is before
+
+
+def test_ce_client_leaves_nothing_behind_when_nothing_was_loaded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Running this file alone starts with no novelvideo.api.* loaded.
+
+    Restoring an empty snapshot puts no module back, but the attribute the
+    rebuild created still points at a package that is gone from sys.modules —
+    an orphan of the same kind, reached the same way.
+    """
+    import novelvideo
+
+    stashed = _api_modules()
+    stashed_attr = getattr(novelvideo, "api", _MISSING)
+    for name in stashed:
+        sys.modules.pop(name, None)
+    if hasattr(novelvideo, "api"):
+        delattr(novelvideo, "api")
+
+    try:
+        with _ce_client(monkeypatch, tmp_path):
+            pass
+
+        assert not _api_modules(), "rebuilt modules outlived the client"
+        assert not hasattr(novelvideo, "api"), (
+            "novelvideo.api still points at a package no longer importable"
+        )
+    finally:
+        sys.modules.update(stashed)
+        if stashed_attr is not _MISSING:
+            novelvideo.api = stashed_attr
+        for name, module in sorted(stashed.items(), key=lambda i: i[0].count(".")):
+            parent_name, _, attr = name.rpartition(".")
+            parent = sys.modules.get(parent_name)
+            if parent is not None:
+                setattr(parent, attr, module)

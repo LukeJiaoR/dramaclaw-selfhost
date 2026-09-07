@@ -17,15 +17,25 @@ import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Card,
   CardContent,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { UsageCountBadge } from "@/components/assets/usage-count-badge";
 import { ASSET_CARD_META_BADGE_CLASS } from "@/components/assets/asset-card-styles";
 import { CopyAssetLinkButton } from "@/components/assets/copy-asset-link-button";
 import { CreditCostInline } from "@/components/credit-cost-inline";
+import { ViewportLazyImage } from "@/components/viewport-lazy-image";
 import type { CreditPromotionDisplay } from "@/components/credits/credit-visual";
 import { resolveMediaUrl } from "@/lib/media-url";
 import { sceneTypeLabel } from "@/lib/scene-type";
@@ -39,7 +49,6 @@ import type {
 
 interface SceneAssetCardProps {
   scene: SceneAsset;
-  referenceCount?: number;
   masterRunning?: boolean;
   reverseRunning?: boolean;
   panoRunning?: boolean;
@@ -53,6 +62,12 @@ interface SceneAssetCardProps {
   reversePromotion?: CreditPromotionDisplay | null;
   panoCost?: string;
   panoPromotion?: CreditPromotionDisplay | null;
+  singleFaceStageCost?: string;
+  singleFaceStagePromotion?: CreditPromotionDisplay | null;
+  singleFaceStageDisabledReason?: string;
+  panoStageCost?: string;
+  panoStagePromotion?: CreditPromotionDisplay | null;
+  panoStageDisabledReason?: string;
   customUploading?: boolean;
   customDeleting?: boolean;
   onEdit: () => void;
@@ -97,7 +112,7 @@ function AssetImageSlot({
           <>
             {/* Blurred background fill for contain mode */}
             {fit === "contain" && (
-              <img
+              <ViewportLazyImage
                 src={resolved}
                 alt=""
                 aria-hidden="true"
@@ -113,11 +128,9 @@ function AssetImageSlot({
                 onPreview ? "cursor-zoom-in" : "cursor-default",
               )}
             >
-              <img
+              <ViewportLazyImage
                 src={resolved}
                 alt={label}
-                loading="lazy"
-                decoding="async"
                 className={cn(
                   "h-full w-full",
                   fit === "contain" ? "object-contain" : "object-cover",
@@ -163,7 +176,6 @@ function StagePlyBadge({
 
 export function SceneAssetCard({
   scene,
-  referenceCount = 0,
   masterRunning = false,
   reverseRunning = false,
   panoRunning = false,
@@ -177,6 +189,12 @@ export function SceneAssetCard({
   reversePromotion,
   panoCost,
   panoPromotion,
+  singleFaceStageCost,
+  singleFaceStagePromotion,
+  singleFaceStageDisabledReason,
+  panoStageCost,
+  panoStagePromotion,
+  panoStageDisabledReason,
   customUploading = false,
   customDeleting = false,
   onEdit,
@@ -199,6 +217,8 @@ export function SceneAssetCard({
   const { t } = useTranslation();
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   const [previewLabel, setPreviewLabel] = useState("");
+  const [pendingStageSource, setPendingStageSource] =
+    useState<SceneStagePlySource | null>(null);
   const hasMaster = Boolean(resolveMediaUrl(scene.master_url));
   const hasReverse = Boolean(resolveMediaUrl(scene.reverse_master_url));
   const hasPano = Boolean(resolveMediaUrl(scene.pano_url));
@@ -216,6 +236,12 @@ export function SceneAssetCard({
     : t("assets.scenes.generatePanoFromText");
   const stage = scene.stage_3gs;
   const canOpenStageViewer = Boolean(onOpenStageViewer);
+  const pendingStageFeature =
+    pendingStageSource === "pano"
+      ? t("assets.scenes.stage.panoFeature")
+      : t("assets.scenes.stage.singleFaceFeature");
+  const pendingStageCost =
+    pendingStageSource === "pano" ? panoStageCost : singleFaceStageCost;
 
   const masterResolved = resolveMediaUrl(scene.master_url);
   const reverseResolved = resolveMediaUrl(scene.reverse_master_url);
@@ -233,7 +259,7 @@ export function SceneAssetCard({
               <div className="flex shrink-0 flex-wrap items-center gap-1">
                 {scene.scene_type && (
                   <span className={ASSET_CARD_META_BADGE_CLASS}>
-                    {sceneTypeLabel(scene.scene_type)}
+                    {sceneTypeLabel(scene.scene_type, t)}
                   </span>
                 )}
                 {derivedBase && (
@@ -258,7 +284,6 @@ export function SceneAssetCard({
                   {t("assets.scenes.pano")}{" "}
                   {hasPano ? t("assets.common.generated") : t("assets.common.missing")}
                 </span>
-                <UsageCountBadge count={referenceCount} />
               </div>
             </div>
             <div className="flex shrink-0 items-center gap-1">
@@ -514,8 +539,13 @@ export function SceneAssetCard({
                   type="button"
                   size="sm"
                   variant="ghost"
-                  onClick={() => onGenerateStagePly("master")}
-                  disabled={!hasMaster || stageBusy}
+                  onClick={() => setPendingStageSource("master")}
+                  disabled={
+                    !hasMaster ||
+                    stageBusy ||
+                    Boolean(singleFaceStageDisabledReason)
+                  }
+                  title={singleFaceStageDisabledReason}
                   className="h-8 gap-1.5 rounded-[8px] px-2.5 text-xs"
                 >
                   {masterPlyRunning ? (
@@ -524,13 +554,22 @@ export function SceneAssetCard({
                     <RefreshCw className="size-3.5" />
                   )}
                   {t("assets.scenes.stage.masterToPly")}
+                  <CreditCostInline
+                    display={singleFaceStageCost}
+                    promotion={singleFaceStagePromotion}
+                  />
                 </Button>
                 <Button
                   type="button"
                   size="sm"
                   variant="ghost"
-                  onClick={() => onGenerateStagePly("reverse")}
-                  disabled={!hasReverse || stageBusy}
+                  onClick={() => setPendingStageSource("reverse")}
+                  disabled={
+                    !hasReverse ||
+                    stageBusy ||
+                    Boolean(singleFaceStageDisabledReason)
+                  }
+                  title={singleFaceStageDisabledReason}
                   className="h-8 gap-1.5 rounded-[8px] px-2.5 text-xs"
                 >
                   {reversePlyRunning ? (
@@ -539,13 +578,23 @@ export function SceneAssetCard({
                     <RefreshCw className="size-3.5" />
                   )}
                   {t("assets.scenes.stage.reverseToPly")}
+                  <CreditCostInline
+                    display={singleFaceStageCost}
+                    promotion={singleFaceStagePromotion}
+                  />
                 </Button>
                 <Button
                   type="button"
                   size="sm"
                   variant="ghost"
-                  onClick={() => onGenerateStagePly("pano")}
-                  disabled={!hasPano || panoRunning || stageBusy}
+                  onClick={() => setPendingStageSource("pano")}
+                  disabled={
+                    !hasPano ||
+                    panoRunning ||
+                    stageBusy ||
+                    Boolean(panoStageDisabledReason)
+                  }
+                  title={panoStageDisabledReason}
                   className="h-8 gap-1.5 rounded-[8px] px-2.5 text-xs"
                 >
                   {panoPlyRunning ? (
@@ -554,6 +603,10 @@ export function SceneAssetCard({
                     <RefreshCw className="size-3.5" />
                   )}
                   {t("assets.scenes.stage.panoToPly")}
+                  <CreditCostInline
+                    display={panoStageCost}
+                    promotion={panoStagePromotion}
+                  />
                 </Button>
                 {canOpenStageViewer ? (
                   <Button
@@ -576,6 +629,44 @@ export function SceneAssetCard({
           )}
         </CardContent>
       </Card>
+      <AlertDialog
+        open={pendingStageSource !== null}
+        onOpenChange={(open) => !open && setPendingStageSource(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("assets.scenes.stage.confirmTitle")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("assets.scenes.stage.confirmDescription", {
+                feature: pendingStageFeature,
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="outline"
+              onClick={() => {
+                const source = pendingStageSource;
+                setPendingStageSource(null);
+                if (source) onGenerateStagePly(source);
+              }}
+            >
+              {t("assets.scenes.stage.confirmAction")}
+              <CreditCostInline
+                display={pendingStageCost}
+                promotion={
+                  pendingStageSource === "pano"
+                    ? panoStagePromotion
+                    : singleFaceStagePromotion
+                }
+              />
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       {previewSrc && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6"

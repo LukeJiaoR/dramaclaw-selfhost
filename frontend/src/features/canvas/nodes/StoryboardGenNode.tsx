@@ -26,7 +26,7 @@ import {
   type StoryboardRatioControlMode,
   type StoryboardGenNodeData,
 } from '@/features/canvas/domain/canvasNodes';
-import { EXPORT_RESULT_DISPLAY_NAME, resolveNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
+import { EXPORT_RESULT_DISPLAY_NAME, localizeNodeDisplayName } from '@/features/canvas/domain/nodeDisplay';
 import { useCanvasStore } from '@/stores/canvasStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 import { canvasAiGateway } from '@/features/canvas/application/canvasServices';
@@ -34,6 +34,7 @@ import { generationTaskDescriptor } from '@/features/canvas/application/resumeGe
 import { useUpstreamImages } from '@/features/canvas/application/useUpstreamGraph';
 import { resolveErrorContent, showErrorDialog } from '@/features/canvas/application/errorDialog';
 import { backendErrorToastMessage } from '@/lib/api-errors';
+import { useModelTaskAccess } from '@/lib/model-task-access';
 import {
   detectAspectRatio,
   parseAspectRatio,
@@ -104,10 +105,6 @@ interface PickerAnchor {
   top: number;
 }
 
-const AUTO_ASPECT_RATIO_OPTION: AspectRatioChoice = {
-  value: AUTO_REQUEST_ASPECT_RATIO,
-  label: '自动',
-};
 const PICKER_FALLBACK_ANCHOR: PickerAnchor = { left: 8, top: 8 };
 
 // 分镜节点永远把渲染好的宫格图作为参考图一起提交，所以模式恒为图生图。
@@ -563,6 +560,7 @@ function generateGridImageDataUrl(
 
 export const StoryboardGenNode = memo(({ id, data, selected, width, height }: StoryboardGenNodeProps) => {
   const { t, i18n } = useTranslation();
+  const modelTaskAccess = useModelTaskAccess();
   const { zoom } = useViewport();
   const updateNodeInternals = useUpdateNodeInternals();
   const setSelectedNode = useCanvasStore((state) => state.setSelectedNode);
@@ -612,8 +610,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
   );
   const frameDescriptionDraftsRef = useRef(frameDescriptionDrafts);
   const resolvedTitle = useMemo(
-    () => resolveNodeDisplayName(CANVAS_NODE_TYPES.storyboardGen, nodeData),
-    [nodeData]
+    () => localizeNodeDisplayName(CANVAS_NODE_TYPES.storyboardGen, nodeData, t),
+    [nodeData, t]
   );
 
   const incomingImages = useUpstreamImages(id);
@@ -622,7 +620,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
       incomingImages.map((imageUrl, index) => ({
         imageUrl,
         displayUrl: resolveImageDisplayUrl(imageUrl),
-        label: `图${index + 1}`,
+        label: `图${index + 1}`, // i18n-exempt —— 与 prompt 里的 @图N 成对
       })),
     [incomingImages]
   );
@@ -659,16 +657,20 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     });
   }, [effectiveExtraParams, nodeData.size, selectedModel]);
 
+  const autoAspectRatioOption = useMemo<AspectRatioChoice>(
+    () => ({ value: AUTO_REQUEST_ASPECT_RATIO, label: t('modelParams.autoAspectRatio') }),
+    [t]
+  );
   const aspectRatioOptions = useMemo<AspectRatioChoice[]>(
-    () => [AUTO_ASPECT_RATIO_OPTION, ...selectedModel.aspectRatios],
-    [selectedModel.aspectRatios]
+    () => [autoAspectRatioOption, ...selectedModel.aspectRatios],
+    [autoAspectRatioOption, selectedModel.aspectRatios]
   );
 
   const selectedAspectRatio = useMemo((): AspectRatioChoice => {
     const nodeAspectRatio = nodeData.requestAspectRatio;
     const found = nodeAspectRatio ? aspectRatioOptions.find((item) => item.value === nodeAspectRatio) : undefined;
-    return found ?? AUTO_ASPECT_RATIO_OPTION;
-  }, [aspectRatioOptions, nodeData.requestAspectRatio]);
+    return found ?? autoAspectRatioOption;
+  }, [aspectRatioOptions, autoAspectRatioOption, nodeData.requestAspectRatio]);
 
   const ratioControlMode: StoryboardRatioControlMode = showStoryboardGenAdvancedRatioControls
     ? (nodeData.ratioControlMode === 'overall' ? 'overall' : 'cell')
@@ -975,6 +977,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     const { gridRows, gridCols, frames } = nodeData;
     const parts: string[] = [];
 
+    // 下面拼的是发给模型的 prompt，不是界面文案，跟着界面语言走反而会让出图不稳。
+    // i18n-exempt-start
     const promptDirectives: string[] = [
       `生成一张${gridRows}×${gridCols}的${gridRows * gridCols}宫格多版本候选图，每一格是独立候选画面`,
     ];
@@ -998,6 +1002,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
 
       parts.push(`候选${index + 1}：${sanitizedDescription}`);
     });
+    // i18n-exempt-end
 
     return parts.join('\n');
   }, [
@@ -1048,6 +1053,11 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     if (!nodeData) {
       return;
     }
+    // 组织成员没有发起模型任务的资格时不放行：后端会拒，这里先说清楚原因。
+    if (modelTaskAccess.blocked) {
+      if (modelTaskAccess.message) setError(modelTaskAccess.message);
+      return;
+    }
 
     const safeRows = Math.max(1, nodeData.gridRows);
     const safeCols = Math.max(1, nodeData.gridCols);
@@ -1094,17 +1104,17 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     // 后台一个图片模型都没配时不放行（上面的网格预览是纯本地渲染，不受影响）：
     // selectedModel 此时是占位定义，提交出去后端 `_resolve_catalog_request` 直接 409。
     if (imageModelsEmpty) {
-      const errorMessage = '管理员尚未配置任何图片模型，暂时无法生成';
+      const errorMessage = t('node.storyboardGen.noImageModelConfigured');
       setError(errorMessage);
-      void showErrorDialog(errorMessage, '错误');
+      void showErrorDialog(errorMessage, t('common.error'));
       return;
     }
 
     const prompt = buildPrompt();
     if (!prompt) {
-      const errorMessage = '请填写至少一个宫格候选描述';
+      const errorMessage = t('node.storyboardGen.needOneFrameDescription');
       setError(errorMessage);
-      void showErrorDialog(errorMessage, '错误');
+      void showErrorDialog(errorMessage, t('common.error'));
       return;
     }
 
@@ -1216,7 +1226,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
         ...generationTaskDescriptor(ref),
       });
     } catch (generationError) {
-      const resolvedError = resolveErrorContent(generationError, '生成失败');
+      const resolvedError = resolveErrorContent(generationError, t('node.storyboardGen.generateFailed'));
       const displayErrorMessage = backendErrorToastMessage(generationError, t);
       const diagnostics = resolveGenerationErrorDiagnostics(
         generationError,
@@ -1268,6 +1278,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
     }
   }, [
     nodeData,
+    modelTaskAccess,
     imageModelsEmpty,
     incomingImages,
     requestResolution.requestModel,
@@ -1370,7 +1381,7 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
       return;
     }
 
-    const marker = `@图${imageIndex + 1}`;
+    const marker = `@图${imageIndex + 1}`; // i18n-exempt —— 后端解析的引用 token
     const currentDescription = frameDescriptionDraftsRef.current[frame.id] ?? frame.description;
     const cursor = pickerCursor ?? currentDescription.length;
     const { nextText: nextDescription, nextCursor } = insertReferenceToken(
@@ -1776,6 +1787,8 @@ export const StoryboardGenNode = memo(({ id, data, selected, width, height }: St
               enableStoryboardGenGridPreviewShortcut && event.ctrlKey && event.altKey && event.shiftKey;
             void handleGenerate(previewGridOnly);
           }}
+          disabled={modelTaskAccess.blocked}
+          title={modelTaskAccess.message ?? undefined}
           variant="primary"
           size="sm"
           className={`!min-w-0 shrink-0 ${NODE_CONTROL_PRIMARY_BUTTON_CLASS} ${STORYBOARD_GEN_GENERATE_BUTTON_CLASS}`}

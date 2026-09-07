@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -21,12 +22,14 @@ import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from novelvideo.director_world import block_world_builder, pano_sharp, stage_manifest
 from novelvideo.director_world.paths import safe_name, world_path
+from novelvideo.egress_context import TrustedEgressContext
 from novelvideo.ports import get_usage_meter
 from novelvideo.task_backend.cancel import TaskCancelled, TaskTimedOut
 from novelvideo.task_backend.subprocesses import run_project_subprocess
@@ -38,6 +41,9 @@ from novelvideo.utils.path_resolver import (
 
 logger = logging.getLogger(__name__)
 
+
+#: Gateway capability that meters the 360 panorama the builder subprocess produces.
+SCENE_360_EGRESS_CAPABILITY = "image.generate.pano_360"
 
 SPATIAL_CONTRACT_SCHEMA_VERSION = "scene_spatial_contract_v8_topology_only_locks"
 SPATIAL_CONTRACT_DEFAULT_MODEL = "DC-scene-spatial-contract-LLM"
@@ -149,9 +155,6 @@ def _refund_scene_360_model_call(
     provider: str,
     error: str,
 ) -> None:
-    if not reservation_id:
-        return
-
     async def _refund() -> None:
         await get_usage_meter().refund_model_call_credit_reservation(
             reservation_id,
@@ -229,6 +232,25 @@ def resolve_scene_360_image_provider(provider: str = "") -> str:
     )
 
 
+class Scene360ImageModelSelectionError(ValueError):
+    """Raised when a scene 360 model selection is unknown or uses another provider."""
+
+
+@dataclass(frozen=True, slots=True)
+class Scene360CatalogModelAuthority:
+    """Catalog model identity recovered from a verified task envelope."""
+
+    catalog_id: str
+    provider: str
+    model: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("catalog_id", "provider", "model"):
+            value = getattr(self, field_name)
+            if type(value) is not str or not value.strip():
+                raise ValueError(f"{field_name} is required")
+
+
 def resolve_scene_360_image_model(provider: str = "", model: str = "") -> str:
     """Return the model used by scene 360 image generation."""
     resolved_provider = resolve_scene_360_image_provider(provider)
@@ -237,9 +259,24 @@ def resolve_scene_360_image_model(provider: str = "", model: str = "") -> str:
         from novelvideo.config import IMAGE_GENERATION_SELECTIONS
 
         selection = IMAGE_GENERATION_SELECTIONS.get(resolved_model)
-        if selection and selection.get("provider") == resolved_provider:
+        if selection is not None:
+            selection_provider = str(selection.get("provider") or "").strip().lower()
+            if selection_provider != resolved_provider:
+                raise Scene360ImageModelSelectionError(
+                    f"scene 360 image model selection {resolved_model} does not use provider "
+                    f"{resolved_provider}"
+                )
             return str(selection.get("model") or "").strip()
-        return resolved_model
+
+        for registered in IMAGE_GENERATION_SELECTIONS.values():
+            registered_provider = str(registered.get("provider") or "").strip().lower()
+            registered_model = str(registered.get("model") or "").strip()
+            if registered_provider == resolved_provider and registered_model == resolved_model:
+                return registered_model
+
+        raise Scene360ImageModelSelectionError(
+            f"unknown scene 360 image model selection: {resolved_model}"
+        )
     if resolved_provider in {"huimeng", "huimengi"}:
         return (
             os.environ.get("SCENE_360_HUIMENG_MODEL")
@@ -1168,13 +1205,23 @@ def run_scene_360(
     update_manifest: bool = True,
     timeout_seconds: int = 1800,
     progress_callback: Callable[[float, str], None] | None = None,
+    model_authority: Scene360CatalogModelAuthority | None = None,
     _manage_model_credit: bool = True,
+    egress_context: TrustedEgressContext | None = None,
 ) -> dict[str, Any]:
     """Generate `pano_360.png` from a scene master image or text description."""
+
+    from novelvideo.task_backend.subprocesses import (
+        build_model_child_env,
+        resolve_organization_egress_context,
+    )
 
     def report(progress: float, message: str) -> None:
         if progress_callback:
             progress_callback(progress, message)
+
+    org_context = resolve_organization_egress_context(egress_context)
+    is_org = org_context is not None
 
     project_dir = Path(project_dir)
     source = str(source or "").strip().lower()
@@ -1191,7 +1238,25 @@ def run_scene_360(
     generation_dir.mkdir(parents=True, exist_ok=True)
 
     provider = resolve_scene_360_image_provider(provider)
-    resolved_model = resolve_scene_360_image_model(provider=provider, model=model)
+    requested_model = str(model or "").strip()
+    if model_authority is None:
+        resolved_model = resolve_scene_360_image_model(
+            provider=provider,
+            model=requested_model,
+        )
+    else:
+        if type(model_authority) is not Scene360CatalogModelAuthority:
+            raise TypeError(
+                "model_authority must be a Scene360CatalogModelAuthority"
+            )
+        if (
+            model_authority.provider.strip().lower() != provider
+            or model_authority.model.strip() != requested_model
+        ):
+            raise Scene360ImageModelSelectionError(
+                "scene 360 catalog model authority does not match execution model"
+            )
+        resolved_model = model_authority.model.strip()
     style = (style or os.environ.get("SCENE_360_STYLE") or "realistic").strip()
     image_size = (image_size or os.environ.get("SCENE_360_IMAGE_SIZE") or "2K").strip()
     quality = (
@@ -1420,9 +1485,54 @@ def run_scene_360(
             image_size=image_size,
             quality=quality,
         )
+    # The generator is a separate OS process, so trusted identity cannot follow it.
+    # Claim and resolve here, then hand only the resolved credential across.
+    egress_state = None
+    child_env: dict[str, str] | None = None
+    if is_org:
+        from novelvideo.generators.nanobanana_grid import (
+            _abandon_organization_image_egress,
+            _complete_organization_image_egress,
+            _prepare_organization_image_egress,
+        )
+        from novelvideo.model_gateway_runtime import (
+            next_model_gateway_business_task_id,
+        )
+        from novelvideo.ports.egress_operations import canonical_request_digest
+
+        egress_request = {
+            "provider": provider,
+            "model": resolved_model,
+            "image_size": image_size,
+            "quality": quality,
+            "style": style,
+            "aspect_ratio": "2:1",
+            "source": source,
+            "scene_id": scene_id,
+            "has_master": bool(master_path),
+            "has_reverse_master": bool(reverse_master_path),
+        }
+        egress_state = _run_credit_coro(
+            lambda: _prepare_organization_image_egress(
+                egress_context=org_context,
+                provider=provider,
+                capability=SCENE_360_EGRESS_CAPABILITY,
+                request=egress_request,
+                business_task_id=next_model_gateway_business_task_id(
+                    SCENE_360_EGRESS_CAPABILITY,
+                    request_digest=canonical_request_digest(egress_request),
+                ),
+            )
+        )
+        child_env = build_model_child_env(
+            os.environ.copy(),
+            egress_context=org_context,
+            gateway_credential=egress_state.credential,
+        )
     try:
         proc = run_project_subprocess(
             cmd,
+            env=child_env,
             capture_output=True,
             text=True,
             timeout=int(timeout_seconds),
@@ -1435,6 +1545,17 @@ def run_scene_360(
             raise RuntimeError(f"360 生成器成功退出，但没有写出结果: {generated}")
 
         provider_trace = _read_scene_360_provider_trace(generation_dir)
+        if egress_state is not None:
+            _run_credit_coro(
+                lambda: _complete_organization_image_egress(
+                    egress_state,
+                    trace=provider_trace,
+                    result_ref=(
+                        f"image:sha256:{hashlib.sha256(generated.read_bytes()).hexdigest()}"
+                    ),
+                )
+            )
+            egress_state = None
         pano_path = out_dir / "pano_360.png"
         archived: Path | None = None
         if update_manifest and pano_path.exists():
@@ -1508,6 +1629,10 @@ def run_scene_360(
             "stdout_tail": (proc.stdout or "")[-2000:],
         }
     except BaseException as exc:
+        if egress_state is not None:
+            _run_credit_coro(
+                lambda: _abandon_organization_image_egress(egress_state)
+            )
         if _manage_model_credit:
             _refund_scene_360_model_call(
                 reservation_id,
@@ -1544,12 +1669,17 @@ def run_voxel_world_from_360(
     max_y: int = 64,
     timeout_seconds: int = 1800,
     progress_callback: Callable[[float, str], None] | None = None,
+    egress_context=None,
 ) -> dict[str, Any]:
     """Generate legacy DirectorWorld `world.json` from the scene spatial layout.
 
     This is intentionally synchronous and UI-free. It runs inside a task worker,
     compresses spatial_layout.png, then calls the block-world generator.
     """
+
+    from novelvideo.task_backend.subprocesses import require_direct_model_egress_allowed
+
+    require_direct_model_egress_allowed(egress_context)
 
     def report(progress: float, message: str) -> None:
         if progress_callback:

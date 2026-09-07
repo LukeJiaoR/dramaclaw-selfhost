@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
-import io
+import asyncio
+import logging
 import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from urllib.parse import quote
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile
+from starlette.concurrency import run_in_threadpool
 
 from novelvideo.api.asset_metadata import newest_updated_at, tree_updated_at
 from novelvideo.api.auth import get_api_user
+from novelvideo.api.upload_workers import (
+    run_asset_upload_operation,
+    scene_ply_upload_limiter,
+    scene_upload_lock,
+)
 from novelvideo.api.deps import (
+    may_run_asset_repair,
     make_sqlite_store_for_context,
     make_static_url_for_context,
 )
@@ -24,6 +33,7 @@ from novelvideo.api.schemas import (
     SceneReferenceGenerateRequest,
     SceneUpdate,
 )
+from novelvideo.api.task_start_errors import handle_task_start_runtime_error
 from novelvideo.api.viewer_manifests import (
     build_director_stage_manifest,
     build_pano_viewer_manifest,
@@ -39,8 +49,19 @@ from novelvideo.ports import get_task_backend
 from novelvideo.project_config import load_project_config_file
 from novelvideo.project_context import ProjectContext, resolve_project_context
 from novelvideo.sqlite_store import SQLiteStore
+from novelvideo.project_config import load_project_config_file_from_state_dir
+from novelvideo.scene_prerequisites import (
+    SceneBuildNotApplicableError,
+    ScenePlanningRunningError,
+    running_scene_planner,
+    scene_build_applies,
+    scene_prerequisite_response,
+)
 from novelvideo.task_identity import project_task_state_key
+from novelvideo.task_state import get_task_manager
 from novelvideo.task_scopes import scene_reference_asset_scope, stage_asset_scope
+from novelvideo.utils.asset_names import move_asset_dir, path_safe_asset_name
+from novelvideo.utils.async_ops import metadata_io_limiter
 from novelvideo.utils.derived_scenes import (
     compose_derived_scene_name,
 )
@@ -49,8 +70,29 @@ from novelvideo.utils.path_resolver import (
     compute_scene_master_path,
     compute_scene_reverse_master_path,
 )
+from novelvideo.utils.upload_safety import create_staged_upload_file
+from novelvideo.utils.static_urls import project_static_url
+from novelvideo.utils.upload_safety import (
+    MAX_PROJECT_UPLOAD_BYTES,
+    UploadTooLargeError,
+    stream_to_file_with_limit,
+)
 
 router = APIRouter()
+logger = logging.getLogger("novelvideo.api.scenes")
+
+
+class _InvalidSceneImageError(ValueError):
+    pass
+
+
+class _InvalidScenePanoRatioError(ValueError):
+    pass
+
+
+class _EmptyScenePackageError(ValueError):
+    pass
+
 
 _SCENE_TIME_TOKENS = {
     "清晨",
@@ -96,7 +138,10 @@ async def _resolve_scene_project(
         project_id=project,
         required_role=required_role,
     )
-    store = await make_sqlite_store_for_context(ctx)
+    # Scene routes use SQLite's direct async methods. Hydrating the legacy
+    # character/episode/prop caches here adds three unrelated full-table reads
+    # to every scene request and was especially visible on OSS-backed homes.
+    store = await make_sqlite_store_for_context(ctx, load_graph_state=False)
     return (
         ctx,
         ctx.owner_username,
@@ -380,7 +425,12 @@ def _stage_3gs_payload(
     }
 
 
-def _copy_upload_to_temp_file(file: UploadFile, *, suffix: str) -> tuple[Path, int]:
+def _copy_upload_to_temp_file(
+    file: UploadFile,
+    *,
+    suffix: str,
+    max_bytes: int = MAX_PROJECT_UPLOAD_BYTES,
+) -> tuple[Path, int]:
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -389,13 +439,164 @@ def _copy_upload_to_temp_file(file: UploadFile, *, suffix: str) -> tuple[Path, i
                 file.file.seek(0)
             except (AttributeError, OSError):
                 pass
-            shutil.copyfileobj(file.file, tmp)
-            size = tmp.tell()
+        size = stream_to_file_with_limit(file.file, tmp_path, max_bytes=max_bytes)
     except Exception:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
         raise
     return tmp_path, size
+
+
+def _persist_custom_scene_upload(
+    file: UploadFile,
+    *,
+    suffix: str,
+    project_dir: Path,
+    scene_name: str,
+) -> None:
+    from novelvideo import stage_asset_tasks
+
+    tmp_path: Path | None = None
+    try:
+        tmp_path, size = _copy_upload_to_temp_file(
+            file,
+            suffix=suffix,
+            max_bytes=MAX_PROJECT_UPLOAD_BYTES,
+        )
+        if size == 0:
+            raise _EmptyScenePackageError("Custom scene package is empty")
+        stage_asset_tasks.upload_scene_package(project_dir, scene_name, tmp_path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _load_scene_upload_image(file: UploadFile):
+    from PIL import Image
+
+    try:
+        try:
+            file.file.seek(0)
+        except (AttributeError, OSError):
+            pass
+        with Image.open(file.file) as source:
+            return source.convert("RGB")
+    except Exception as exc:
+        raise _InvalidSceneImageError(str(exc)) from exc
+
+
+def _publish_scene_image(image, target: Path, archive_stem: str) -> None:
+    tmp_path: Path | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = create_staged_upload_file(
+            target.parent,
+            prefix=f".{target.stem}_",
+            suffix=target.suffix,
+            destination=target,
+        )
+        image.save(tmp_path, format="PNG")
+        if target.exists():
+            target.replace(target.parent / f"{archive_stem}_{time.time_ns()}.png")
+        tmp_path.replace(target)
+        tmp_path = None
+    finally:
+        image.close()
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _persist_scene_master_upload(file: UploadFile, target: Path) -> None:
+    image = _load_scene_upload_image(file)
+    _publish_scene_image(image, target, "master")
+
+
+def _persist_scene_pano_upload(
+    file: UploadFile,
+    *,
+    project_dir: Path,
+    scene_name: str,
+) -> None:
+    image = _load_scene_upload_image(file)
+    width, height = image.size
+    if height <= 0 or abs((width / height) - 2.0) > 0.08:
+        image.close()
+        raise _InvalidScenePanoRatioError(
+            f"360 panorama must be close to 2:1 equirectangular; got {width}x{height}"
+        )
+    out_dir = stage_manifest.stage_dir(project_dir, scene_name)
+    pano_path = out_dir / "pano_360.png"
+    _publish_scene_image(image, pano_path, "pano_360")
+    stage_manifest.update_manifest(
+        project_dir,
+        scene_name,
+        clear_fields=[
+            "ply_path",
+            "collision_glb_path",
+            "voxel_json_path",
+            "pano_sharp_args",
+            "splat_transform_args",
+        ],
+        pano_path=pano_path.name,
+        source="uploaded_360",
+    )
+
+
+def _scene_upload_lock_key(project_dir: Path, scene_name: str) -> tuple[str, str]:
+    stage_dir = stage_manifest.stage_dir(project_dir, scene_name)
+    return "scene-stage", str(stage_dir.resolve())
+
+
+def _delete_scene_pano_files(project_dir: Path, scene_name: str) -> bool:
+    pano_path = stage_manifest.resolve_pano_path(project_dir, scene_name)
+    deleted = False
+    if pano_path is not None:
+        pano_path.unlink(missing_ok=True)
+        deleted = True
+    stage_manifest.update_manifest(
+        project_dir,
+        scene_name,
+        clear_fields=[
+            "source",
+            "pano_path",
+            "ply_path",
+            "collision_glb_path",
+            "voxel_json_path",
+            "pano_sharp_args",
+            "splat_transform_args",
+        ],
+    )
+    return deleted
+
+
+def _delete_scene_custom_files(project_dir: Path, scene_name: str) -> bool:
+    custom_scene_path = stage_manifest.resolve_ply_path(
+        project_dir, scene_name, ply_kind="custom"
+    )
+    active_ply_path = stage_manifest.resolve_ply_path(project_dir, scene_name)
+    deleted = False
+    if custom_scene_path is not None:
+        custom_scene_path.unlink(missing_ok=True)
+        deleted = True
+
+    clear_fields = ["custom_scene_path"]
+    manifest = stage_manifest.load_manifest(project_dir, scene_name) or {}
+    if manifest.get("source") == "custom_scene" or (
+        custom_scene_path is not None
+        and active_ply_path is not None
+        and custom_scene_path.resolve() == active_ply_path.resolve()
+    ):
+        clear_fields.extend(
+            [
+                "source",
+                "ply_path",
+                "collision_glb_path",
+                "voxel_json_path",
+                "splat_transform_args",
+            ]
+        )
+    stage_manifest.update_manifest(project_dir, scene_name, clear_fields=clear_fields)
+    return deleted
 
 
 def _move_dir_if_exists(old_dir: Path, new_dir: Path) -> None:
@@ -408,11 +609,11 @@ def _move_dir_if_exists(old_dir: Path, new_dir: Path) -> None:
 
 
 def _rename_scene_asset_dirs(project_dir: Path, old_name: str, new_name: str) -> None:
-    _move_dir_if_exists(
-        project_dir / "assets" / "scenes" / old_name,
-        project_dir / "assets" / "scenes" / new_name,
-    )
+    # 走 move_asset_dir 而不是直接拼路径：存量自愈传进来的 old_name 是没消毒过的库里
+    # 旧值，``../../config.json`` 拼出来的源路径在资产根之外。
+    move_asset_dir(project_dir / "assets" / "scenes", old_name, new_name)
 
+    # stage_dir 自己过 safe_name（会把点全剥掉），拼不出爬到 director_worlds 之外的路径。
     old_stage_root = stage_manifest.stage_dir(project_dir, old_name).parent
     new_stage_root = stage_manifest.stage_dir(project_dir, new_name).parent
     _move_dir_if_exists(old_stage_root, new_stage_root)
@@ -466,7 +667,9 @@ def _scene_payload(
         "time_of_day": time_of_day,
         "environment_prompt": scene.environment_prompt,
         "variant_prompt": getattr(scene, "variant_prompt", ""),
-        "effective_environment_prompt": build_scene_effective_prompt(scene, base_scene),
+        "effective_environment_prompt": build_scene_effective_prompt(
+            scene, base_scene
+        ),
         "description": scene.description,
         "derived_from_scene": derived_from_scene,
         "spatial_layout_image": scene.spatial_layout_image,
@@ -499,6 +702,53 @@ def _scene_payload(
             project_dir=project_dir,
             scene_name=scene.name,
         ),
+    }
+
+
+def _scene_summary_payload(
+    scene: NovelScene,
+    *,
+    ctx: ProjectContext | None,
+    project_dir: Path,
+    project_id: str = "",
+    base_scene: NovelScene | None = None,
+) -> dict[str, Any]:
+    """Return the SQLite-only fields needed to group/search the scene list.
+
+    The full payload probes master/reverse/pano files, loads several manifests,
+    and recursively walks asset directories. Doing that for every scene before
+    the first paint makes list latency scale with OSSFS round trips rather than
+    the tiny scenes table. Full payloads are fetched for the selected group.
+    """
+
+    base_scene_id = str(getattr(scene, "base_scene_id", "") or "").strip()
+    updated_at = str(getattr(scene, "updated_at", "") or "")
+    master_path = canonical_scene_master_path(project_dir, scene.name)
+    master_rel = master_path.relative_to(project_dir).as_posix()
+    asset_project = str(getattr(ctx, "project_id", "") or project_id).strip()
+    master_url = project_static_url(asset_project, master_rel)
+    if updated_at:
+        master_url = f"{master_url}?v={quote(updated_at, safe='')}"
+    return {
+        "name": scene.name,
+        "aliases": scene.aliases,
+        "scene_type": scene.scene_type,
+        "base_scene_id": base_scene_id,
+        "variant_id": str(getattr(scene, "variant_id", "") or "").strip(),
+        "time_of_day": str(getattr(scene, "time_of_day", "") or "").strip(),
+        "environment_prompt": scene.environment_prompt,
+        "variant_prompt": getattr(scene, "variant_prompt", ""),
+        "effective_environment_prompt": build_scene_effective_prompt(scene, base_scene),
+        "description": scene.description,
+        "derived_from_scene": base_scene_id,
+        "spatial_layout_image": scene.spatial_layout_image,
+        "notes": scene.notes,
+        "updated_at": updated_at,
+        # The canonical preview slot is a projection, not proof that the file
+        # exists. The browser loads it lazily; authoritative state remains in
+        # the selected-scene detail response.
+        "master_path": str(master_path),
+        "master_url": master_url,
     }
 
 
@@ -611,21 +861,61 @@ def _compose_scene_asset_name(
     return scene_name
 
 
+async def _heal_path_unsafe_scene_names(store: SQLiteStore, project_dir: Path) -> dict[str, str]:
+    """修好库里名字带斜杠的存量场景。
+
+    模型层的 ``NovelScene.sanitize_name`` 只管新数据；那道闸加上之前落库的
+    ``家中客厅/哥哥卧室`` 还躺在表里，它的 ``{name}`` 接口全是 404，删不掉也生不出源图。
+
+    调用方要先过 ``may_run_asset_repair``：这是一次写操作（搬目录 + 改主键），不该由
+    只读协作者的一次页面加载触发。
+    """
+
+    def move_assets(old_name: str, new_name: str) -> None:
+        _rename_scene_asset_dirs(project_dir, old_name, new_name)
+
+    return await store.repair_path_unsafe_asset_names("scene", move_assets)
+
+
 @router.get("/projects/{project}/scenes")
 async def list_scenes(
     project: str,
+    summary: bool = False,
+    names: Annotated[list[str] | None, Query()] = None,
     user: dict = Depends(get_api_user),
 ):
     ctx, _username, _project_name, project_dir, _output_dir, store = (
         await _resolve_scene_project(project, user, required_role="viewer")
     )
+    if may_run_asset_repair(ctx):
+        await _heal_path_unsafe_scene_names(store, project_dir)
     scenes = await store.list_scenes()
     scenes_by_name = {
         scene.name: scene for scene in scenes if str(scene.name or "").strip()
     }
-    return {
-        "ok": True,
-        "data": [
+    requested_names = {
+        str(name or "").strip() for name in (names or []) if str(name or "").strip()
+    }
+    if requested_names:
+        scenes = [scene for scene in scenes if scene.name in requested_names]
+    if summary:
+        return {
+            "ok": True,
+            "data": [
+                _scene_summary_payload(
+                    scene,
+                    ctx=ctx,
+                    project_dir=project_dir,
+                    project_id=project,
+                    base_scene=scenes_by_name.get(
+                        str(getattr(scene, "base_scene_id", "") or "")
+                    ),
+                )
+                for scene in scenes
+            ],
+        }
+    data = await asyncio.to_thread(
+        lambda: [
             _scene_payload(
                 scene,
                 ctx=ctx,
@@ -638,8 +928,9 @@ async def list_scenes(
                 ),
             )
             for scene in scenes
-        ],
-    }
+        ]
+    )
+    return {"ok": True, "data": data}
 
 
 @router.get("/projects/{project}/scenes/plate-preview")
@@ -886,11 +1177,15 @@ async def create_scene(
     ctx, username, project_name, project_dir, _output_dir, store = (
         await _resolve_scene_project(project, user)
     )
-    name = _compose_scene_asset_name(
-        body.name,
-        body.base_scene_id,
-        body.variant_id,
-        body.time_of_day,
+    # 在查重之前消毒：留到 add_scene 再改名的话，两个只差斜杠的名字会双双通过查重，
+    # 后写的那个把先写的静默覆盖掉。
+    name = path_safe_asset_name(
+        _compose_scene_asset_name(
+            body.name,
+            body.base_scene_id,
+            body.variant_id,
+            body.time_of_day,
+        )
     )
     if not name:
         return {"ok": False, "error": "Scene name is required"}
@@ -952,6 +1247,9 @@ async def update_scene(
     )
     if next_base:
         requested_name = structured_name
+    # 在挪目录之前消毒：store.rename_scene 里也会消毒，但目录迁移先于它执行，
+    # 不在这里统一就会出现「库里 a_b、盘上 a/b」的错位。
+    requested_name = path_safe_asset_name(str(requested_name or "").strip())
     if requested_name and requested_name != scene.name:
         guard_error = await _derived_scene_guard_error(store, scene.name)
         if guard_error:
@@ -1011,6 +1309,24 @@ async def build_scenes(project: str, user: dict = Depends(get_api_user)):
     if ctx is not None:
         if not has_imported_novel(project_dir):
             return novel_import_required_response()
+        # Answered before the queue, not inside it. Enqueueing reserves a
+        # feature credit, and the runner's no-op result then confirms the
+        # charge — so a narrated project could pay for a build that made no
+        # model call and produced no scene.
+        config = load_project_config_file_from_state_dir(ctx.state_dir)
+        if not scene_build_applies(
+            str(ctx.state_dir), str(config.get("spine_template") or "drama")
+        ):
+            return scene_prerequisite_response(SceneBuildNotApplicableError())
+        # The other half of the exclusion. Both write the scenes table, so a
+        # build landing on top of a running planner leaves a catalogue whose
+        # contents depend on which writer got there first.
+        tasks = await run_in_threadpool(
+            get_task_manager().list_tasks_for_project,
+            ctx,
+        )
+        if running_scene_planner(tasks):
+            return scene_prerequisite_response(ScenePlanningRunningError())
         queued = await get_task_backend().enqueue_project_task(
             ctx,
             product_surface="mainline",
@@ -1027,6 +1343,7 @@ async def build_scenes(project: str, user: dict = Depends(get_api_user)):
             "backend": queued.backend,
             "queue": queued.queue,
             "message": "场景补充任务已进入队列",
+            "message_code": "tasks.toast.scenesBuildQueued",
         }
 
     return {"ok": False, "error": "场景补充需要 project context"}
@@ -1046,18 +1363,24 @@ async def upload_scene_master(
     if scene is None:
         return {"ok": False, "error": f"Scene '{name}' not found"}
 
-    try:
-        from PIL import Image
-
-        img = Image.open(io.BytesIO(await file.read())).convert("RGB")
-    except Exception as exc:
-        return {"ok": False, "error": f"Invalid image file: {exc}"}
-
     master_path = canonical_scene_master_path(project_dir, scene.name)
-    master_path.parent.mkdir(parents=True, exist_ok=True)
-    if master_path.exists():
-        master_path.replace(master_path.parent / f"master_{int(time.time())}.png")
-    img.save(master_path, format="PNG")
+
+    async def touch_master(_result):
+        await store.touch_scene_asset(scene.name)
+        return await _require_scene(store, scene.name) or scene
+
+    try:
+        async with scene_upload_lock(
+            _scene_upload_lock_key(project_dir, scene.name)
+        ):
+            scene = await run_asset_upload_operation(
+                _persist_scene_master_upload,
+                file,
+                master_path,
+                finalize=touch_master,
+            )
+    except _InvalidSceneImageError as exc:
+        return {"ok": False, "error": f"Invalid image file: {exc}"}
 
     return {
         "ok": True,
@@ -1081,11 +1404,13 @@ async def delete_scene_master(
     scene = await _require_scene(store, name)
     if scene is None:
         return {"ok": False, "error": f"Scene '{name}' not found"}
-    master_path = compute_scene_master_path(project_dir, scene.name)
-    deleted = False
-    if master_path:
-        Path(master_path).unlink(missing_ok=True)
-        deleted = True
+    async with scene_upload_lock(_scene_upload_lock_key(project_dir, scene.name)):
+        master_path = compute_scene_master_path(project_dir, scene.name)
+        deleted = False
+        if master_path:
+            Path(master_path).unlink(missing_ok=True)
+            deleted = True
+            await store.touch_scene_asset(scene.name)
     return {"ok": True, "data": {"deleted": deleted}}
 
 
@@ -1193,38 +1518,19 @@ async def upload_scene_pano(
         return {"ok": False, "error": f"Scene '{name}' not found"}
 
     try:
-        from PIL import Image
-
-        img = Image.open(io.BytesIO(await file.read())).convert("RGB")
-    except Exception as exc:
+        async with scene_upload_lock(
+            _scene_upload_lock_key(project_dir, scene.name)
+        ):
+            await run_asset_upload_operation(
+                _persist_scene_pano_upload,
+                file,
+                project_dir=project_dir,
+                scene_name=scene.name,
+            )
+    except _InvalidSceneImageError as exc:
         return {"ok": False, "error": f"Invalid image file: {exc}"}
-
-    width, height = img.size
-    if height <= 0 or abs((width / height) - 2.0) > 0.08:
-        return {
-            "ok": False,
-            "error": f"360 panorama must be close to 2:1 equirectangular; got {width}x{height}",
-        }
-
-    out_dir = stage_manifest.stage_dir(project_dir, scene.name)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    pano_path = out_dir / "pano_360.png"
-    if pano_path.exists():
-        pano_path.replace(out_dir / f"pano_360_{int(time.time())}.png")
-    img.save(pano_path, format="PNG")
-    stage_manifest.update_manifest(
-        project_dir,
-        scene.name,
-        clear_fields=[
-            "ply_path",
-            "collision_glb_path",
-            "voxel_json_path",
-            "pano_sharp_args",
-            "splat_transform_args",
-        ],
-        pano_path=pano_path.name,
-        source="uploaded_360",
-    )
+    except _InvalidScenePanoRatioError as exc:
+        return {"ok": False, "error": str(exc)}
 
     return {
         "ok": True,
@@ -1248,24 +1554,13 @@ async def delete_scene_pano(
     scene = await _require_scene(store, name)
     if scene is None:
         return {"ok": False, "error": f"Scene '{name}' not found"}
-    pano_path = stage_manifest.resolve_pano_path(project_dir, scene.name)
-    deleted = False
-    if pano_path is not None:
-        pano_path.unlink(missing_ok=True)
-        deleted = True
-    stage_manifest.update_manifest(
-        project_dir,
-        scene.name,
-        clear_fields=[
-            "source",
-            "pano_path",
-            "ply_path",
-            "collision_glb_path",
-            "voxel_json_path",
-            "pano_sharp_args",
-            "splat_transform_args",
-        ],
-    )
+    async with scene_upload_lock(_scene_upload_lock_key(project_dir, scene.name)):
+        deleted = await run_asset_upload_operation(
+            _delete_scene_pano_files,
+            project_dir,
+            scene.name,
+            worker_limiter=metadata_io_limiter(),
+        )
     return {"ok": True, "data": {"deleted": deleted}}
 
 
@@ -1289,20 +1584,28 @@ async def upload_scene_custom_package(
             "error": "Custom scene package must be .ply, .sog, .splat, or .ksplat",
         }
 
-    tmp_path, size = _copy_upload_to_temp_file(file, suffix=suffix)
-    if size == 0:
-        tmp_path.unlink(missing_ok=True)
-        return {"ok": False, "error": "Custom scene package is empty"}
-
-    from novelvideo import stage_asset_tasks
-
     try:
-        stage_asset_tasks.upload_scene_package(project_dir, scene.name, tmp_path)
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
+        async with scene_upload_lock(_scene_upload_lock_key(project_dir, scene.name)):
+            await run_asset_upload_operation(
+                _persist_custom_scene_upload,
+                file,
+                suffix=suffix,
+                project_dir=project_dir,
+                scene_name=scene.name,
+                worker_limiter=(
+                    scene_ply_upload_limiter() if suffix == ".ply" else None
+                ),
+            )
+    except _EmptyScenePackageError as exc:
+        return {"ok": False, "error": str(exc)}
+    except UploadTooLargeError:
+        return {
+            "ok": False,
+            "error": (
+                "Custom scene package exceeds "
+                f"{MAX_PROJECT_UPLOAD_BYTES // (1024 * 1024)}MB limit"
+            ),
+        }
 
     return {
         "ok": True,
@@ -1327,32 +1630,13 @@ async def delete_scene_custom_package(
     if scene is None:
         return {"ok": False, "error": f"Scene '{name}' not found"}
 
-    custom_scene_path = stage_manifest.resolve_ply_path(
-        project_dir, scene.name, ply_kind="custom"
-    )
-    active_ply_path = stage_manifest.resolve_ply_path(project_dir, scene.name)
-    deleted = False
-    if custom_scene_path is not None:
-        custom_scene_path.unlink(missing_ok=True)
-        deleted = True
-
-    clear_fields = ["custom_scene_path"]
-    manifest = stage_manifest.load_manifest(project_dir, scene.name) or {}
-    if manifest.get("source") == "custom_scene" or (
-        custom_scene_path is not None
-        and active_ply_path is not None
-        and custom_scene_path.resolve() == active_ply_path.resolve()
-    ):
-        clear_fields.extend(
-            [
-                "source",
-                "ply_path",
-                "collision_glb_path",
-                "voxel_json_path",
-                "splat_transform_args",
-            ]
+    async with scene_upload_lock(_scene_upload_lock_key(project_dir, scene.name)):
+        deleted = await run_asset_upload_operation(
+            _delete_scene_custom_files,
+            project_dir,
+            scene.name,
+            worker_limiter=metadata_io_limiter(),
         )
-    stage_manifest.update_manifest(project_dir, scene.name, clear_fields=clear_fields)
 
     return {"ok": True, "data": {"deleted": deleted}}
 
@@ -1404,6 +1688,11 @@ async def _start_3gs_single_face_task(
             params=params,
         )
     except RuntimeError as exc:
+        handle_task_start_runtime_error(
+            logger,
+            "failed to start single-face stage asset task",
+            exc,
+        )
         return {"ok": False, "error": str(exc)}
 
     return {
@@ -1489,6 +1778,11 @@ async def generate_scene_3gs_pano_ply(
             params=params,
         )
     except RuntimeError as exc:
+        handle_task_start_runtime_error(
+            logger,
+            "failed to start pano stage asset task",
+            exc,
+        )
         return {"ok": False, "error": str(exc)}
 
     return {
@@ -1522,13 +1816,9 @@ async def generate_scene_pano(
 
     params: dict[str, Any] = {
         "description": _scene_360_description(scene),
-        "style": body.style or _project_style(username, project_name),
-        "timeout_seconds": body.timeout_seconds,
+        "style": _project_style(username, project_name),
+        "timeout_seconds": 1800,
     }
-    for key in ("provider", "model", "image_size", "quality"):
-        value = getattr(body, key)
-        if value:
-            params[key] = value
 
     try:
         scope, queued = await _start_or_enqueue_scene_pano(
@@ -1539,6 +1829,11 @@ async def generate_scene_pano(
             params=params,
         )
     except RuntimeError as exc:
+        handle_task_start_runtime_error(
+            logger,
+            "failed to start scene pano generation task",
+            exc,
+        )
         return {"ok": False, "error": str(exc)}
 
     return {

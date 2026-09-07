@@ -82,7 +82,7 @@ export function CreditBalanceBadge() {
         render={
           <button
             type="button"
-            className="group/credits ml-1 flex h-9 min-w-0 items-center gap-1 rounded-md px-1 text-sm font-medium text-muted-foreground transition-colors hover:bg-white/[0.05] hover:text-white"
+            className="group/credits ml-1 flex h-9 min-w-0 items-center gap-1 rounded-md px-1 text-sm font-medium text-muted-foreground outline-none transition-colors hover:text-white focus:outline-none focus:shadow-none focus:ring-0 focus-visible:outline-none focus-visible:shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
             aria-label={t("credits.openPanel")}
             onMouseEnter={openPanel}
             onMouseLeave={scheduleClosePanel}
@@ -108,19 +108,18 @@ export function CreditBalanceBadge() {
         onMouseEnter={openPanel}
         onMouseLeave={scheduleClosePanel}
       >
-        <div className="border-b border-white/8 px-4 py-3.5">
+        <div className="px-4 pb-2.5 pt-3.5">
           <div className="flex items-center justify-between">
-            <div className="text-sm font-semibold">{t("credits.personalAccount")}</div>
+            <div className="text-xs font-semibold">{t("credits.availableBalance")}</div>
             <button
               type="button"
               onClick={openCredits}
-              className="text-xs text-sky-300 transition-colors hover:text-sky-200"
+              className="text-xs font-medium text-primary outline-none transition-colors hover:text-primary/80 focus:outline-none focus:shadow-none focus:ring-0 focus-visible:outline-none focus-visible:shadow-none focus-visible:ring-0"
             >
               {t("credits.details")}
             </button>
           </div>
-          <div className="mt-3 text-xs text-white/50">{t("credits.balance")}</div>
-          <div className="mt-1 flex items-center gap-1.5">
+          <div className="mt-3 flex items-center gap-1.5">
             <CreditSparkIcon className="size-5" />
             <span className="text-2xl font-semibold tabular-nums">
               {balance === undefined ? "--" : formatFullCredits(balance, language)}
@@ -128,15 +127,15 @@ export function CreditBalanceBadge() {
           </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-px bg-white/8">
+        <div className="grid grid-cols-3 gap-2 px-4 pb-4 pt-1.5">
           {[
             ["earned", summary?.earned],
             ["spent", summary?.spent],
             ["refunded", summary?.refunded],
           ].map(([key, value]) => (
-            <div key={String(key)} className="bg-[#17191d] px-3 py-3">
-              <div className="text-[11px] text-white/45">{t(`credits.${key}`)}</div>
-              <div className="mt-1 text-sm font-medium tabular-nums">
+            <div key={String(key)} className="rounded-sm bg-white/[0.075] px-3 py-2.5">
+              <div className="text-[10px] font-medium text-white/58">{t(`credits.${key}`)}</div>
+              <div className="mt-1 text-sm font-semibold tabular-nums text-white/95">
                 {typeof value === "number" ? formatFullCredits(value, language) : "--"}
               </div>
             </div>
@@ -161,15 +160,6 @@ export function CreditBalanceBadge() {
             <ChevronRight className="size-4 text-white/35" />
           </button>
         ) : null}
-
-        <button
-          type="button"
-          onClick={openCredits}
-          className="flex w-full items-center justify-between border-t border-white/8 px-4 py-3 text-sm text-white/75 transition-colors hover:bg-white/[0.04] hover:text-white"
-        >
-          <span>{t("credits.viewTransactions")}</span>
-          <ChevronRight className="size-4 text-white/35" />
-        </button>
       </PopoverContent>
     </Popover>
   );

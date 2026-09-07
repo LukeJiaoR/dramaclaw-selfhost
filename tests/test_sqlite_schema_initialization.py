@@ -10,7 +10,10 @@ from pathlib import Path
 
 import pytest
 
-from novelvideo.sqlite_store import SQLiteStore
+from novelvideo.sqlite_store import (
+    _PROJECT_STORE_SCHEMA_VERSION,
+    SQLiteStore,
+)
 from novelvideo.task_state import TaskStateManager
 
 
@@ -309,7 +312,9 @@ def test_task_and_project_schema_initialize_safely_across_processes(tmp_path):
             ).fetchall()
         )
         assert components["task_state"] == 1
-        assert components["project_store"] == 2
+        # Track the constant rather than a literal, so a schema bump does
+        # not silently make this assertion stale.
+        assert components["project_store"] == _PROJECT_STORE_SCHEMA_VERSION
         tables = {
             row[0]
             for row in conn.execute(

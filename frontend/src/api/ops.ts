@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-import { apiCall, apiClient } from "./client";
+import { apiCall, apiCallEnvelope, apiClient } from "./client";
 
 // Per-node generation history -------------------------------------------- //
 
@@ -91,6 +91,21 @@ export async function fetchCanvasGenerationHistory(
     )}/generation-history?limit=${limit}`,
   );
   return data?.records ?? [];
+}
+
+/** Remove one entry from the history browser; the underlying media is retained. */
+export async function deleteNodeGenerationHistoryRecord(
+  project: string,
+  canvasId: string,
+  nodeId: string,
+  recordId: string,
+): Promise<{ deleted: boolean }> {
+  return await apiCall<{ deleted: boolean }>(
+    `projects/${encodeURIComponent(project)}/freezone/canvases/${encodeURIComponent(
+      canvasId,
+    )}/nodes/${encodeURIComponent(nodeId)}/generation-history?record_id=${encodeURIComponent(recordId)}`,
+    { method: "DELETE" },
+  );
 }
 
 // /freezone/gen ----------------------------------------------------------- //
@@ -462,7 +477,7 @@ export async function submitFreezoneVideoEdit(
 
 // /freezone/video/omni-gen ------------------------------------------------ //
 
-export type FreezoneVideoReferenceType = "image" | "video" | "audio";
+export type FreezoneVideoReferenceType = "image" | "video" | "audio" | "file" | "link";
 
 export interface FreezoneVideoReferenceItem {
   type: FreezoneVideoReferenceType;
@@ -475,7 +490,7 @@ export interface FreezoneVideoOmniGenPayload extends FreezoneNodeContext {
   prompt: string;
   theme?: string;
   cameraTemplateId?: string | null;
-  /** mixed image/video/audio references. backend caps: image≤9, video≤3, audio≤3, total≤12. */
+  /** Mixed media references; file/link support and limits come from the model catalog. */
   references?: FreezoneVideoReferenceItem[];
   marks?: FreezoneVideoMark[];
   aspectRatio?: FreezoneVideoAspectRatio;
@@ -780,18 +795,81 @@ export async function submitFreezoneReversePrompt(
 export interface FreezoneStyleTemplate {
   id: string;
   label: string;
-  /** Free-text English style description forwarded as part of the prompt. */
+  /** 题材分类:古装 / 都市 / 年代 / 生活 / 科幻 / 类型 / 写意,图墙顶部按它分组。 */
+  category: string;
+  /** 封面图相对路径,需经 resolveStyleAssetUrl 解析。 */
+  cover: string;
+  /** 女 / 少 / 男 / 老 四张示例图的相对路径。 */
+  samples: string[];
+  /** 中文风格提示词全文,原样拼进生成 prompt。 */
   style_prompt: string;
-  author?: string;
-  category?: string;
+}
+
+export interface FreezoneStyleTemplateList {
+  assetBase: string;
+  /** 后端风格清单的版本号,图片和提示词对不上时用来定位是哪一份清单在生效。 */
+  version: string;
+  templates: FreezoneStyleTemplate[];
+}
+
+/**
+ * 把后端吐回来的东西掰成风格模板数组。
+ *
+ * 这个端点的形状在两个仓库之间反复横跳过：早期 `data` 是裸列表，后来被换成
+ * `{asset_base, version, templates}` 的对象（于是没跟进的前端 `templates.find(...)`
+ * 当场抛 `is not a function`，整页白屏），现在又改回裸列表、元信息挂到信封同级。
+ * 所以这里不信任何一种形状，四种常见包装都认，认不出就退空列表 —— 图墙空着是能
+ * 看懂的降级，白屏不是。同一族的 {@link coerceCameraTemplateList} 就是这么做的。
+ */
+function coerceStyleTemplateList(payload: unknown): FreezoneStyleTemplate[] {
+  let candidate: unknown = payload;
+  if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+    const wrapper = candidate as Record<string, unknown>;
+    if (Array.isArray(wrapper.templates)) candidate = wrapper.templates;
+    else if (Array.isArray(wrapper.data)) candidate = wrapper.data;
+    else if (Array.isArray(wrapper.items)) candidate = wrapper.items;
+    else if (Array.isArray(wrapper.style_templates)) candidate = wrapper.style_templates;
+  }
+  if (!Array.isArray(candidate)) return [];
+  const result: FreezoneStyleTemplate[] = [];
+  for (const item of candidate) {
+    if (!item || typeof item !== "object") continue;
+    const entry = item as Record<string, unknown>;
+    // 没 id 就没法回写到节点上，这条直接丢掉；其余字段缺了还能降级显示。
+    const id = pickString(entry, "id", "template_id", "templateId", "key");
+    if (!id) continue;
+    result.push({
+      id,
+      label: pickString(entry, "label", "display_name", "displayName", "title", "name") ?? id,
+      category: pickString(entry, "category", "group", "kind") ?? "",
+      cover: pickString(entry, "cover", "cover_url", "coverUrl", "thumbnail") ?? "",
+      samples: pickStringArray(entry, "samples", "sample_urls", "sampleUrls"),
+      style_prompt:
+        pickString(entry, "style_prompt", "stylePrompt", "prompt", "prompt_fragment") ?? "",
+    });
+  }
+  return result;
 }
 
 export async function listFreezoneStyleTemplates(
   project: string,
-): Promise<FreezoneStyleTemplate[]> {
-  return await apiCall<FreezoneStyleTemplate[]>(
+): Promise<FreezoneStyleTemplateList> {
+  // 走 apiCallEnvelope 而不是 apiCall：清单元信息挂在 `data` 同级（`data` 得留给
+  // 裸列表，见后端路由注释）。元信息在 data 里的旧形状也照样能认出来。
+  const envelope = await apiCallEnvelope<unknown>(
     `projects/${encodeURIComponent(project)}/freezone/image/style-templates`,
   );
+  const nested =
+    envelope.data && typeof envelope.data === "object" && !Array.isArray(envelope.data)
+      ? (envelope.data as Record<string, unknown>)
+      : {};
+  const meta = (key: string) =>
+    pickString(envelope, key) ?? pickString(nested, key) ?? "";
+  return {
+    assetBase: meta("asset_base"),
+    version: meta("version"),
+    templates: coerceStyleTemplateList(envelope.data),
+  };
 }
 
 // /freezone/image/camera-options ----------------------------------------- //
@@ -1059,6 +1137,9 @@ export interface FreezoneVideoModelInfo {
   referenceImageMax?: number | null;
   referenceVideoMax?: number | null;
   referenceAudioMax?: number | null;
+  referenceFileMax?: number | null;
+  referenceLinkMax?: number | null;
+  referenceFileTypes?: string[];
   referenceAudioMinSeconds?: number | null;
   referenceAudioMaxSeconds?: number | null;
   referenceAudioTotalMinSeconds?: number | null;
@@ -1145,6 +1226,9 @@ function videoModelEntryFromObject(
     referenceImageMax: pickNumber(entry, "referenceImageMax", "reference_image_max"),
     referenceVideoMax: pickNumber(entry, "referenceVideoMax", "reference_video_max"),
     referenceAudioMax: pickNumber(entry, "referenceAudioMax", "reference_audio_max"),
+    referenceFileMax: pickNumber(entry, "referenceFileMax", "reference_file_max"),
+    referenceLinkMax: pickNumber(entry, "referenceLinkMax", "reference_link_max"),
+    referenceFileTypes: pickStringArray(entry, "referenceFileTypes", "reference_file_types"),
     referenceAudioMinSeconds: pickNumber(
       entry,
       "referenceAudioMinSeconds",
@@ -1772,8 +1856,7 @@ export interface FreezoneScene360Payload {
  * **单图 360 (simple pipeline)** — 老路径,只把一张图当 reference 走通用
  * 图编辑生成 panorama。不做 master/reverse overlap 分析、空间合约、缝合,
  * 适合 freezone 自由画布上 \"拿任一张图试试 360\" 的快速生成。
- * Asset-scoped scene 360 generation uses
- * {@link submitFreezoneScene360FromMaster} (复杂工作流),不是这条。
+ * Asset-scoped scene 360 generation uses the scenes asset API (复杂工作流),不是这条。
  */
 export async function submitFreezoneScene360(
   project: string,
@@ -1797,75 +1880,6 @@ export async function submitFreezoneScene360(
       },
     },
   );
-}
-
-// /scenes/{name}/pano/generate-async --------------------------------------- //
-
-export interface ScenePanoFromMasterPayload {
-  sceneId: string;
-  /** 后端会自动 fallback 到 text 如果 master 不存在;FE 默认传 'master'。 */
-  source?: "master" | "text";
-  style?: string;
-  provider?: string;
-  model?: string;
-  imageSize?: string;
-  quality?: string;
-  timeoutSeconds?: number;
-}
-
-/**
- * **复杂场景 360 工作流 (complex pipeline)** — 走 stage_asset
- * `pano_from_master` step:
- *  - 读 scene 的 master + reverse_master 文件
- *  - 跑 overlap analyzer (master/reverse 边缘融合分析)
- *  - 跑 spatial contract analyzer (空间合约)
- *  - 调 BuilderGPT/supertale_scene_360_gpt_image2.py 生成 pano_360.png
- *  - 写到 stage_manifest canonical 路径 (跟资产画布 pano viewer 同一份文件)
- *
- * Asset-scoped scene 360 generation uses this complex path, not the simple
- * `/freezone/scene-360` endpoint.
- *
- * 注: 走的是 scenes 路由 (不是 freezone 路由),所以返回的是
- * `{ok, task_type:"stage_asset", task_key, scope, task_id, backend}` 结构 —
- * cast 成 FreezoneJobRef shape (task_key + job_id + task_type) 给上层用。
- */
-export async function submitFreezoneScene360FromMaster(
-  project: string,
-  payload: ScenePanoFromMasterPayload,
-): Promise<FreezoneJobRef> {
-  const sceneId = payload.sceneId;
-  if (!sceneId) throw new Error("submitFreezoneScene360FromMaster: missing sceneId");
-  const result = await apiCall<{
-    ok: boolean;
-    task_type: string;
-    task_key: string;
-    task_id?: string;
-    scope?: string;
-    backend?: string;
-    error?: string;
-  }>(
-    `projects/${encodeURIComponent(project)}/scenes/${encodeURIComponent(sceneId)}/pano/generate-async`,
-    {
-      method: "POST",
-      json: {
-        source: payload.source ?? "master",
-        ...(payload.style ? { style: payload.style } : {}),
-        ...(payload.provider ? { provider: payload.provider } : {}),
-        ...(payload.model ? { model: payload.model } : {}),
-        ...(payload.imageSize ? { image_size: payload.imageSize } : {}),
-        ...(payload.quality ? { quality: payload.quality } : {}),
-        ...(payload.timeoutSeconds ? { timeout_seconds: payload.timeoutSeconds } : {}),
-      },
-    },
-  );
-  if (!result.ok || result.error) {
-    throw new Error(result.error ?? "scene 360 from master failed");
-  }
-  return {
-    task_key: result.task_key,
-    job_id: result.task_id ?? result.scope ?? sceneId,
-    task_type: "stage_asset",
-  } as FreezoneJobRef;
 }
 
 // /freezone/template-edit ------------------------------------------------- //
@@ -2397,9 +2411,10 @@ export interface FreezoneUploadResult {
 
 export interface FreezoneUploadOptions {
   /**
-   * Override the default ky timeout (30s). Pass `false` to disable —
-   * required for multi-MB video uploads on slow links, otherwise ky aborts
-   * the in-flight request and DevTools shows the row as `canceled`.
+   * Override the upload timeout. Defaults to `false` (no timeout) — a clock on
+   * an upload races the user's uplink rather than the server, and aborting
+   * mid-body shows up as HTTP 499 at the edge with the file never delivered
+   * (see uploadApi in lib/api.ts). Pass a number only to bound a specific call.
    */
   timeoutMs?: number | false;
 }
@@ -2418,7 +2433,7 @@ export async function uploadFreezoneImage(
     {
       method: "POST",
       body: fd,
-      timeout: options?.timeoutMs ?? undefined,
+      timeout: options?.timeoutMs ?? false,
     },
   ).json<{ ok: boolean; data?: FreezoneUploadResult; error?: string }>();
   if (!resp.ok || !resp.data) {
@@ -2427,16 +2442,64 @@ export async function uploadFreezoneImage(
   return resp.data;
 }
 
+export async function uploadFreezoneReferenceFile(
+  project: string,
+  file: File,
+): Promise<FreezoneUploadResult> {
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  const resp = await apiClient(
+    `projects/${encodeURIComponent(project)}/freezone/reference-file-upload`,
+    {
+      method: "POST",
+      body: fd,
+      timeout: false,
+    },
+  ).json<{ ok: boolean; data?: FreezoneUploadResult; error?: string }>();
+  if (!resp.ok || !resp.data) {
+    throw new Error(resp.error ?? "upload failed");
+  }
+  return resp.data;
+}
+
+// /freezone/assets/copy ---------------------------------------------------- //
+
+export interface FreezoneAssetCopyFailure {
+  source: string;
+  /** invalid_source / not_found / forbidden / unavailable / copy_failed */
+  reason: string;
+}
+
+export interface FreezoneAssetCopyResult {
+  /** 源 URL（原字符串）→ 目标项目里的新 URL。 */
+  mapping: Record<string, string>;
+  failed: FreezoneAssetCopyFailure[];
+}
+
+/**
+ * 跨项目粘贴：让后端把 `sources`（源项目的同源素材 URL）拷进 `project`。
+ * 字节不经过浏览器；OSS 部署下是服务端 CopyObject。单条失败只体现在 `failed` 里。
+ */
+export async function copyFreezoneAssets(
+  project: string,
+  sources: string[],
+): Promise<FreezoneAssetCopyResult> {
+  return apiCall<FreezoneAssetCopyResult>(
+    `projects/${encodeURIComponent(project)}/freezone/assets/copy`,
+    { method: "POST", json: { sources }, timeout: false },
+  );
+}
+
 /** Same endpoint as image upload — backend treats the upload as a generic blob. */
 export async function uploadFreezoneVideo(
   project: string,
   file: File | Blob,
   filename?: string,
 ): Promise<FreezoneUploadResult> {
-  // Disable the 30s default timeout: video files routinely run into the tens
-  // of MB and the upload streams the body, so a short timeout cancels the
-  // request before the server ever sees the end of the body.
-  return await uploadFreezoneImage(project, file, filename, { timeoutMs: false });
+  // Timeouts are off by default for uploads (see FreezoneUploadOptions):
+  // video files routinely run into the tens of MB and the body is streamed, so
+  // any clock cancels the request before the server sees the end of it.
+  return await uploadFreezoneImage(project, file, filename);
 }
 
 function dataUrlToBlob(dataUrl: string): Blob {
@@ -2711,6 +2774,23 @@ export async function syncFreezoneAssetLibraryFromMainline(
   return await apiCall<FreezoneVideoCharacterLibraryItem[]>(
     `projects/${encodeURIComponent(project)}/freezone/video/asset-library/sync-from-mainline`,
     { method: "POST" },
+  );
+}
+
+/**
+ * 给资产库条目改名。只动展示名，素材地址不变——画布上已经引用它的节点不受影响。
+ *
+ * 主线同步来的条目改了名会在下次「从主线同步」时被覆盖回去，所以调用侧只对本地
+ * 上传的条目开放这个入口。
+ */
+export async function renameFreezoneVideoCharacterLibraryItem(
+  project: string,
+  itemId: string,
+  name: string,
+): Promise<FreezoneVideoCharacterLibraryItem> {
+  return await apiCall<FreezoneVideoCharacterLibraryItem>(
+    `projects/${encodeURIComponent(project)}/freezone/video/character-library/${encodeURIComponent(itemId)}`,
+    { method: "PATCH", json: { name } },
   );
 }
 

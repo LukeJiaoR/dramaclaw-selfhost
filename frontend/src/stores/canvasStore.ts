@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
+// 这里取的是 i18next 默认实例（`@/i18n` 初始化的就是它）。不 import `@/i18n`
+// 本身，是因为那个模块会顺带拉进 react-i18next / HttpBackend，把它塞进这条被
+// 到处 import 的底层链路上，会让所有 mock 掉 react-i18next 的测试在 import 期炸掉。
+import i18n from 'i18next';
 import { create } from 'zustand';
 import {
   type Viewport,
@@ -33,6 +37,7 @@ import {
   isProtectedProjectionGroupNode,
   isStoryboardGroupNode,
   isStoryboardSplitNode,
+  isStyleNode,
 } from '@/features/canvas/domain/canvasNodes';
 import {
   DEFAULT_STORYBOARD_ASPECT,
@@ -61,6 +66,7 @@ import {
 } from '@/features/canvas/domain/viewportBookmarks';
 import { nodeCatalog } from '@/features/canvas/application/nodeCatalog';
 import { canvasNodeFactory } from '@/features/canvas/application/canvasServices';
+import { resetStyleNodeSyncStates } from '@/features/canvas/application/styleNodeSync';
 import {
   aspectRatioFromImageDimensions,
   ensureAtLeastOneMinEdge,
@@ -274,11 +280,29 @@ interface CanvasState {
     options?: { cols?: number; groupName?: string }
   ) => string | null;
 
-  updateNodeData: (nodeId: string, data: Partial<CanvasNodeData>) => void;
+  updateNodeData: (
+    nodeId: string,
+    data: Partial<CanvasNodeData>,
+    /** 见 updateNodeSize 的同名参数。 */
+    options?: { recordHistory?: boolean },
+  ) => void;
   updateNodeSize: (
     nodeId: string,
     size: { width: number; height: number },
-    options?: { lockManualSize?: boolean; data?: Partial<CanvasNodeData> },
+    options?: {
+      lockManualSize?: boolean;
+      data?: Partial<CanvasNodeData>;
+      /**
+       * 默认 true：这是一次用户可撤销的改动。
+       *
+       * 传 false 用于「把画布刚测出来的事实补记下来」这类写入（节点主体图的
+       * imageNaturalWidth/Height，见 planNaturalSizeRecordWrite）：屏幕上不变一
+       * 个像素，撤销它没有任何意义，而打开一个老项目会一次触发几十笔——真进了
+       * 撤销栈，用户按下 Ctrl+Z 得到的是「忘掉一张图的尺寸」，重做栈还被清空。
+       * 仍然算一次编辑（trackEdit），因为这笔数据要存到服务端去。
+       */
+      recordHistory?: boolean;
+    },
   ) => void;
   /**
    * Swap a node's `type` in place while keeping its `id` and position. Used
@@ -1452,6 +1476,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
 
   setCanvasData: (nodes, edges, history) => {
+    // 换画布/清空后，上一份画布留下的风格对账记账必须作废，否则重新 hydrate
+    // 出来的图片节点会被当成「同一个节点接着算」，该补建的判成用户删了节点。
+    resetStyleNodeSyncStates();
     const normalizedCanvas = normalizeCanvasData(nodes, edges);
 
     set({
@@ -1495,6 +1522,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
 
   hydrateCanvasDraft: (draft) => {
+    // 换画布/清空后，上一份画布留下的风格对账记账必须作废，否则重新 hydrate
+    // 出来的图片节点会被当成「同一个节点接着算」，该补建的判成用户删了节点。
+    resetStyleNodeSyncStates();
     const normalizedCanvas = normalizeCanvasData(draft.nodes, draft.edges);
 
     set({
@@ -1630,9 +1660,13 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     });
 
     // Mirror the source's upstream connections so the clone resolves the same
-    // references (上游图/文本) as the original generation.
+    // references (上游图/文本) as the original generation. 风格节点除外 ——
+    // 见下面 duplicateNodesAsSiblings 里的同一处说明。
+    const styleNodeIds = new Set(
+      state.nodes.filter((node) => isStyleNode(node)).map((node) => node.id),
+    );
     const clonedEdges: CanvasEdge[] = state.edges
-      .filter((edge) => edge.target === sourceNodeId)
+      .filter((edge) => edge.target === sourceNodeId && !styleNodeIds.has(edge.source))
       .map((edge) => ({
         id: `e-${edge.source}-${newNode.id}`,
         source: edge.source,
@@ -1690,10 +1724,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       const nameOverrides: Record<string, unknown> = {};
       if (!parentIsCloned) {
         if (typeof sourceData.displayName === 'string' && sourceData.displayName) {
-          nameOverrides.displayName = `${sourceData.displayName} - 副本`;
+          nameOverrides.displayName = i18n.t('canvas.naming.copySuffix', { name: sourceData.displayName });
         }
         if (typeof sourceData.label === 'string' && sourceData.label) {
-          nameOverrides.label = `${sourceData.label} - 副本`;
+          nameOverrides.label = i18n.t('canvas.naming.copySuffix', { name: sourceData.label });
         }
       }
 
@@ -1729,9 +1763,19 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     // that source's clone so the duplicated subgraph stays internally wired
     // rather than re-attaching to the originals.
     const newEdges: CanvasEdge[] = [];
+    const styleNodeIds = new Set(
+      state.nodes.filter((node) => isStyleNode(node)).map((node) => node.id),
+    );
     for (const edge of state.edges) {
       const newTarget = idMap.get(edge.target);
       if (!newTarget) {
+        continue;
+      }
+      // 风格节点没跟着一起复制时，这条边会克隆成「同一个风格节点 → 两个图片节点」。
+      // 那是 styleNodeSync 全部规则的前提被打破：两个下游各按自己的选择去改同一个
+      // 节点，互相触发对方的 effect，谁也收敛不了，React 到 50 层直接把画布抛挂。
+      // 副本自己的对账会走补建那一支给它配一个新的，所以这里丢掉正好。
+      if (styleNodeIds.has(edge.source) && !idMap.has(edge.source)) {
         continue;
       }
       const newSource = idMap.get(edge.source) ?? edge.source;
@@ -1881,7 +1925,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const groupX = Math.round(sourceAbs.x + sourceSize.width + 80);
     const groupY = Math.round(sourceAbs.y);
 
-    const groupDisplayName = options?.groupName ?? `全景截图组 (${captures.length} 张)`;
+    const groupDisplayName =
+      options?.groupName ?? i18n.t('canvas.naming.panoCaptureGroup', { total: captures.length });
     const groupNode = canvasNodeFactory.createNode(
       CANVAS_NODE_TYPES.group,
       { x: groupX, y: groupY },
@@ -2451,7 +2496,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     return true;
   },
 
-  updateNodeData: (nodeId, data) => {
+  updateNodeData: (nodeId, data, options) => {
     set((state) => {
       let changed = false;
       const nextNodes = state.nodes.map((node) => {
@@ -2485,6 +2530,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
       if (!changed) {
         return {};
+      }
+
+      if (options?.recordHistory === false) {
+        return { nodes: nextNodes, ...trackEdit(state) };
       }
 
       return {
@@ -2552,6 +2601,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
 
       if (!changed) {
         return {};
+      }
+
+      if (options?.recordHistory === false) {
+        // 历史与 dragHistorySnapshot 都不碰：这笔写入不是用户的改动，既不该能被
+        // 撤销，也不该把正在进行的拖拽的那份快照顶掉。
+        return { nodes: nextNodes, ...trackEdit(state) };
       }
 
       return {
@@ -2874,7 +2929,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     );
 
     const existingGroupCount = state.nodes.filter((node) => node.type === CANVAS_NODE_TYPES.group).length;
-    const groupDisplayName = opts?.label?.trim() || `组 ${existingGroupCount + 1}`;
+    const groupDisplayName =
+      opts?.label?.trim() || i18n.t('canvas.naming.group', { index: existingGroupCount + 1 });
     const groupNode = canvasNodeFactory.createNode(
       CANVAS_NODE_TYPES.group,
       { x: groupX, y: groupY },
@@ -3141,7 +3197,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     const existingStoryboardCount = state.nodes.filter((node) =>
       isStoryboardGroupNode(node)
     ).length;
-    const groupDisplayName = `分镜组 ${existingStoryboardCount + 1}`;
+    const groupDisplayName = i18n.t('canvas.naming.storyboardGroup', {
+      index: existingStoryboardCount + 1,
+    });
     const groupNode = canvasNodeFactory.createNode(
       CANVAS_NODE_TYPES.group,
       { x: groupX, y: groupY },
@@ -3405,7 +3463,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
         {
           imageUrl: image.imageUrl,
           previewImageUrl: image.previewImageUrl ?? image.imageUrl,
-          displayName: image.displayName ?? '分镜',
+          displayName: image.displayName ?? i18n.t('canvas.naming.storyboardFrame'),
         }
       );
       node.parentId = groupNodeId;
@@ -3541,12 +3599,18 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     if (!isGroupNode(group)) {
       return;
     }
-    // Capture style while `group` is still narrowed to a group node. The
-    // storyboard / projection predicates below share isGroupNode's type
-    // predicate, so chaining them would collapse `group` to `never` for the
-    // rest of the function (TS subtracts the identical predicate type).
+    // Capture geometry while `group` is still narrowed to a group node. The
+    // storyboard predicate below shares isGroupNode's type predicate, so
+    // chaining it would collapse `group` to `never` for the rest of the
+    // function (TS subtracts the identical predicate type).
     const groupStyle = group.style;
-    if (isProtectedProjectionGroupNode(group) || isStoryboardGroupNode(group)) {
+    const groupWidth = group.width;
+    const groupHeight = group.height;
+    // 主线投影组也要贴合：组框由后端按估算尺寸算出，成员的实际渲染尺寸（图片加载
+    // 后、文本换行后）只有前端知道。不贴合的话成员带 extent:"parent" 会被 React
+    // Flow 夹回小框里叠成一堆。这里只放开「几何贴合」——拓扑保护（不能解组）仍由
+    // ungroupNode 拦住。
+    if (isStoryboardGroupNode(group)) {
       return;
     }
     const children = state.nodes.filter((node) => node.parentId === groupNodeId);
@@ -3577,8 +3641,17 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     // Push members inward only when they spill past the top/left edge.
     const shiftX = Math.max(0, Math.round(SIDE_PAD - minX));
     const shiftY = Math.max(0, Math.round(TOP_PAD - minY));
-    const curWidth = typeof groupStyle?.width === 'number' ? groupStyle.width : 0;
-    const curHeight = typeof groupStyle?.height === 'number' ? groupStyle.height : 0;
+    // 手动缩放走 React Flow 的 dimensions change，只写显式 width/height 不写
+    // style；后端下发的投影组反过来只带 style。两边都读，否则 grow-only 会把另一
+    // 侧当成 0、把用户刚拉大的组又缩回内容尺寸。
+    const curWidth = Math.max(
+      typeof groupStyle?.width === 'number' ? groupStyle.width : 0,
+      typeof groupWidth === 'number' ? groupWidth : 0
+    );
+    const curHeight = Math.max(
+      typeof groupStyle?.height === 'number' ? groupStyle.height : 0,
+      typeof groupHeight === 'number' ? groupHeight : 0
+    );
     const neededWidth = Math.round(maxX + shiftX + SIDE_PAD);
     const neededHeight = Math.round(maxY + shiftY + SIDE_PAD);
     // Grow-only so a manual enlarge is never clawed back.
@@ -3619,11 +3692,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   arrangeGroupChildren: (groupNodeId, mode) => {
     const state = get();
     const group = state.nodes.find((node) => node.id === groupNodeId);
-    if (
-      !isGroupNode(group) ||
-      isProtectedProjectionGroupNode(group) ||
-      isStoryboardGroupNode(group)
-    ) {
+    // 主线投影组同样可以整理排列：「主线投影 · 锁定」锁的是拓扑（解组 / 删成员），
+    // 排列只搬成员位置、不改归属，而后端算出来的布局不合意时用户需要有补救手段。
+    // 分镜板的位置由缩略图板自己算，成员还是隐藏的，仍然不参与。
+    if (!isGroupNode(group) || isStoryboardGroupNode(group)) {
       return;
     }
     const children = state.nodes.filter((node) => node.parentId === groupNodeId);
@@ -3896,6 +3968,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
 
   clearCanvas: () => {
+    // 换画布/清空后，上一份画布留下的风格对账记账必须作废，否则重新 hydrate
+    // 出来的图片节点会被当成「同一个节点接着算」，该补建的判成用户删了节点。
+    resetStyleNodeSyncStates();
     set((state) => {
       if (state.nodes.length === 0 && state.edges.length === 0) {
         return {};

@@ -8,6 +8,9 @@ INSUFFICIENT_CREDITS_CODE = "INSUFFICIENT_CREDITS"
 INSUFFICIENT_CREDITS_MESSAGE = "积分不足，请联系管理员充值"
 BILLING_RULE_NOT_CONFIGURED_CODE = "BILLING_RULE_NOT_CONFIGURED"
 BILLING_RULE_NOT_CONFIGURED_MESSAGE = "计费规则未配置，请联系管理员设置积分规则"
+FEATURE_BILLING_IDENTITY_INVALID_CODE = "FEATURE_BILLING_IDENTITY_INVALID"
+FEATURE_BILLING_IDENTITY_INVALID_MESSAGE = "计费身份无效或无法确定，请联系管理员"
+FEATURE_BILLING_IDENTITY_REASON_MAX_LENGTH = 512
 GENERATION_BILLING_UNITS = {
     "call",
     "item",
@@ -19,8 +22,24 @@ GENERATION_BILLING_UNITS = {
 }
 
 
-class InsufficientCreditsError(RuntimeError):
+class BillingError(RuntimeError):
+    """Typed billing failure that every render point can surface verbatim."""
+
+    error_code: str
+    http_status: int
+    user_message: str
+
+    def details(self) -> dict[str, Any]:
+        """Extra, already-redacted fields merged into the rendered payload."""
+        return {}
+
+
+class InsufficientCreditsError(BillingError):
     """Raised when a credit reservation cannot be covered by current balance."""
+
+    error_code = INSUFFICIENT_CREDITS_CODE
+    http_status = 402
+    user_message = INSUFFICIENT_CREDITS_MESSAGE
 
     def __init__(self, *, user_id: str, cost: int, balance: int) -> None:
         self.user_id = user_id
@@ -42,8 +61,12 @@ class InsufficientCreditsStop(BaseException):
         super().__init__(INSUFFICIENT_CREDITS_MESSAGE)
 
 
-class BillingRuleNotConfiguredError(RuntimeError):
+class BillingRuleNotConfiguredError(BillingError):
     """Raised when a billable action has no usable admin pricing rule."""
+
+    error_code = BILLING_RULE_NOT_CONFIGURED_CODE
+    http_status = 409
+    user_message = BILLING_RULE_NOT_CONFIGURED_MESSAGE
 
     def __init__(self, *, kind: str, key: str) -> None:
         self.kind = str(kind or "").strip()
@@ -51,6 +74,25 @@ class BillingRuleNotConfiguredError(RuntimeError):
         super().__init__(
             f"billing rule is not configured for {self.kind or 'billing'}:{self.key}"
         )
+
+    def details(self) -> dict[str, Any]:
+        return {"billing_kind": self.kind, "billing_key": self.key}
+
+
+class FeatureBillingIdentityError(BillingError):
+    """Raised when the billing identity for a feature cannot be trusted."""
+
+    error_code = FEATURE_BILLING_IDENTITY_INVALID_CODE
+    http_status = 409
+    user_message = FEATURE_BILLING_IDENTITY_INVALID_MESSAGE
+
+    def __init__(self, *, internal_reason: str = "") -> None:
+        safe_reason = internal_reason if type(internal_reason) is str else ""
+        if len(safe_reason) > FEATURE_BILLING_IDENTITY_REASON_MAX_LENGTH:
+            safe_reason = (
+                safe_reason[: FEATURE_BILLING_IDENTITY_REASON_MAX_LENGTH - 3] + "..."
+            )
+        super().__init__(safe_reason or "feature billing identity is invalid")
 
 
 def iter_exception_chain(exc: BaseException | None):
@@ -90,6 +132,25 @@ def find_billing_rule_not_configured_error(
     return None
 
 
+def find_billing_error(exc: BaseException | None) -> BillingError | None:
+    for item in iter_exception_chain(exc):
+        if isinstance(item, BillingError):
+            return item
+    return None
+
+
+def billing_error_payload(exc: BaseException | None) -> dict[str, Any]:
+    err = find_billing_error(exc)
+    if err is None:
+        return {}
+    payload: dict[str, Any] = {
+        "error_code": err.error_code,
+        "message": err.user_message,
+    }
+    payload.update(err.details())
+    return payload
+
+
 def is_insufficient_credits_error(
     exc: BaseException | None = None, message: str = ""
 ) -> bool:
@@ -105,6 +166,12 @@ def is_insufficient_credits_error(
     return (
         "insufficient credits" in normalized
         or INSUFFICIENT_CREDITS_CODE.lower() in normalized
+    )
+
+
+def is_fatal_billing_error(exc: BaseException | None = None, message: str = "") -> bool:
+    return find_billing_error(exc) is not None or is_insufficient_credits_error(
+        exc, message
     )
 
 
@@ -143,17 +210,25 @@ def billing_rule_not_configured_payload(
 __all__ = [
     "BILLING_RULE_NOT_CONFIGURED_CODE",
     "BILLING_RULE_NOT_CONFIGURED_MESSAGE",
+    "BillingError",
     "BillingRuleNotConfiguredError",
+    "FEATURE_BILLING_IDENTITY_INVALID_CODE",
+    "FEATURE_BILLING_IDENTITY_INVALID_MESSAGE",
+    "FEATURE_BILLING_IDENTITY_REASON_MAX_LENGTH",
+    "FeatureBillingIdentityError",
     "GENERATION_BILLING_UNITS",
     "INSUFFICIENT_CREDITS_CODE",
     "INSUFFICIENT_CREDITS_MESSAGE",
     "InsufficientCreditsError",
     "InsufficientCreditsStop",
+    "billing_error_payload",
     "billing_rule_not_configured_payload",
+    "find_billing_error",
     "find_billing_rule_not_configured_error",
     "find_insufficient_credits_error",
     "find_insufficient_credits_stop",
     "insufficient_credits_payload",
+    "is_fatal_billing_error",
     "is_insufficient_credits_error",
     "iter_exception_chain",
 ]

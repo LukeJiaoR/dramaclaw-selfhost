@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
 import { createPortal } from "react-dom";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import {
   AlertTriangle,
@@ -14,10 +14,12 @@ import {
   ChevronRight,
   Languages,
   LogOut,
+  KeyRound,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AvatarUploadDialog } from "@/components/account/avatar-upload-dialog";
+import { PasswordChangeDialog } from "@/components/account/password-change-dialog";
 import {
   Tooltip,
   TooltipContent,
@@ -25,6 +27,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { CreditBalanceBadge } from "@/components/layout/credit-balance-badge";
+import { BrandLockup } from "@/components/layout/brand-lockup";
 import { NotificationDrawer } from "@/components/notifications/notification-drawer";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import {
@@ -37,7 +40,12 @@ import { useAppStore } from "@/stores/app-store";
 import { authRequired, isCeRuntime } from "@/lib/runtime-config";
 import { resetUserSessionState } from "@/lib/reset-region-state";
 import { useModelGatewayConfig } from "@/lib/queries/model-gateway";
+import { useOrgBranding } from "@/lib/queries/org-branding";
 import { useReleaseNotifications } from "@/lib/queries/release-notifications";
+import {
+  useAnnouncementReadState,
+  useAnnouncements,
+} from "@/components/login/cinematic/announcements";
 import {
   markUpgradeSeen,
   shouldShowUpgradeNudge,
@@ -49,14 +57,16 @@ import {
 } from "@/components/layout/project-header-navigation";
 const ACCOUNT_PANEL_TRANSITION_MS = 350;
 
-export function Header() {
+export function Header({ ambientBackground = false }: { ambientBackground?: boolean }) {
   const { t, i18n } = useTranslation();
+  const navigate = useNavigate();
   const params = useParams({ strict: false }) as { project?: string };
   const [companionOpen, setCompanionOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notificationOpen, setNotificationOpen] = useState(false);
   const [releaseNotificationStateVersion, setReleaseNotificationStateVersion] = useState(0);
   const [avatarDialogOpen, setAvatarDialogOpen] = useState(false);
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
   const [accountPanelOpen, setAccountPanelOpen] = useState(false);
   const [accountPanelVisible, setAccountPanelVisible] = useState(false);
   const [settingsWarningBubbleDismissed, setSettingsWarningBubbleDismissed] = useState(false);
@@ -68,6 +78,10 @@ export function Header() {
   const accountUnmountTimerRef = useRef<number | null>(null);
   const accountOpenFrameRef = useRef<number | null>(null);
   const accountAnchorRef = useRef<HTMLDivElement | null>(null);
+  const accountTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const accountPanelRef = useRef<HTMLDivElement | null>(null);
+  // 面板由点击/键盘打开时「钉住」：此时鼠标移开不再收走它。悬停打开的面板不钉。
+  const accountPanelPinnedRef = useRef(false);
   const settingsAnchorRef = useRef<HTMLDivElement | null>(null);
   const { username, logout } = useAuthStore();
   const queryClient = useQueryClient();
@@ -87,6 +101,13 @@ export function Header() {
   const setLanguage = useAppStore((s) => s.setLanguage);
   const showLogout = authRequired();
   const ceRuntime = isCeRuntime();
+  const orgBranding = useOrgBranding(!ceRuntime && Boolean(username));
+  const brandName = orgBranding.data?.branding
+    ? orgBranding.data.organization?.name ?? null
+    : null;
+  const homeLinkLabel = brandName
+    ? `${t("app.logoHomeTooltip")} — ${brandName}`
+    : t("app.logoHomeTooltip");
   const displayName = username ?? "User";
   const avatarInitial = displayName.slice(0, 1).toUpperCase();
   const activeLanguage = (i18n.resolvedLanguage ?? i18n.language).startsWith("zh")
@@ -95,8 +116,16 @@ export function Header() {
   const modelGatewayConfig = useModelGatewayConfig(ceRuntime);
   const releaseNotifications = useReleaseNotifications(i18n.resolvedLanguage ?? i18n.language);
   const releaseFeed = releaseNotifications.data?.data;
+  const announcements = useAnnouncements();
+  const announcementIds = useMemo(
+    () => announcements.map((announcement) => announcement.id),
+    [announcements],
+  );
+  const { markAllRead: markAllAnnouncementsRead, unreadCount: announcementUnreadCount } =
+    useAnnouncementReadState();
   void releaseNotificationStateVersion;
-  const hasUnreadNotification = shouldShowUpgradeNudge(releaseFeed);
+  const hasUnreadNotification =
+    shouldShowUpgradeNudge(releaseFeed) || announcementUnreadCount(announcementIds) > 0;
   const gatewayConfig = modelGatewayConfig.data?.data;
   const hasSettingsWarning = Boolean(
     ceRuntime &&
@@ -124,6 +153,10 @@ export function Header() {
       setSettingsWarningBubbleDismissed(false);
     }
   }, [hasSettingsWarning]);
+
+  useEffect(() => {
+    if (notificationOpen) markAllAnnouncementsRead(announcementIds);
+  }, [announcementIds, markAllAnnouncementsRead, notificationOpen]);
 
   const handleCompanionConfirm = (
     selection: CompanionSelection,
@@ -153,6 +186,7 @@ export function Header() {
   };
 
   const closeAccountPanelNow = () => {
+    accountPanelPinnedRef.current = false;
     clearAccountCloseTimer();
     clearAccountOpenFrame();
     clearAccountUnmountTimer();
@@ -179,6 +213,9 @@ export function Header() {
   };
 
   const scheduleCloseAccountPanel = () => {
+    // 钉住的面板只由 Escape、面板外交互或选中某一项关闭 —— 鼠标掠过就收走的话,
+    // 触屏和键盘用户点开后根本读不完里面的内容(公告中心现在只在这儿)。
+    if (accountPanelPinnedRef.current) return;
     clearAccountCloseTimer();
     accountCloseTimerRef.current = window.setTimeout(() => {
       setAccountPanelVisible(false);
@@ -191,6 +228,57 @@ export function Header() {
     }, 120);
   };
 
+  const toggleAccountPanel = () => {
+    if (accountPanelOpen && accountPanelPinnedRef.current) {
+      closeAccountPanelNow();
+      return;
+    }
+    accountPanelPinnedRef.current = true;
+    openAccountPanel();
+  };
+
+  // 账号面板是 header 里唯一的公告中心入口,必须在指针、触屏和键盘下都能开关。
+  // 面板 portal 到 body,不在触发器的 DOM 子树里,所以「点到外面」「焦点移到外面」
+  // 只能在 document 上判定。
+  useEffect(() => {
+    if (!accountPanelOpen) return;
+    const isInsideAccountUi = (target: EventTarget | null) =>
+      target instanceof Node
+      && (Boolean(accountAnchorRef.current?.contains(target))
+        || Boolean(accountPanelRef.current?.contains(target)));
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      closeAccountPanelNow();
+      accountTriggerRef.current?.focus();
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      if (isInsideAccountUi(event.target)) return;
+      closeAccountPanelNow();
+    };
+    const handleFocusIn = (event: FocusEvent) => {
+      if (isInsideAccountUi(event.target)) return;
+      closeAccountPanelNow();
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("focusin", handleFocusIn);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("focusin", handleFocusIn);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountPanelOpen]);
+
+  // 面板挂在 body 末尾,Tab 不会从触发器走进去。点击/键盘打开时把焦点送进第一项,
+  // 否则键盘用户能打开面板却够不到里面的公告中心。悬停打开的面板不抢焦点。
+  useEffect(() => {
+    if (!accountPanelOpen || !accountPanelPinnedRef.current) return;
+    accountPanelRef.current
+      ?.querySelector<HTMLElement>('button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])')
+      ?.focus();
+  }, [accountPanelOpen]);
+
   const switchLanguage = (lang: "zh" | "en") => {
     void i18n.changeLanguage(lang);
     setLanguage(lang);
@@ -199,6 +287,7 @@ export function Header() {
   const openNotifications = () => {
     closeAccountPanelNow();
     markUpgradeSeen(releaseFeed?.latest_tag);
+    markAllAnnouncementsRead(announcementIds);
     setReleaseNotificationStateVersion((version) => version + 1);
     setNotificationOpen(true);
   };
@@ -212,8 +301,22 @@ export function Header() {
     setAvatarDialogOpen(true);
   };
 
+  const openPasswordDialog = () => {
+    closeAccountPanelNow();
+    setPasswordDialogOpen(true);
+  };
+
+  const handlePasswordChanged = () => {
+    resetUserSessionState({ queryClient });
+    void navigate({ to: "/login", replace: true });
+  };
+
   return (
-    <div className="relative z-20 shrink-0 bg-background/58 text-sidebar-foreground backdrop-blur-xl">
+    <div
+      className={`relative z-20 shrink-0 text-sidebar-foreground ${
+        ambientBackground ? "bg-transparent" : "bg-background/58 backdrop-blur-xl"
+      }`}
+    >
       <header className="relative flex h-[48px] items-center justify-between gap-3 px-4">
         <div className="flex min-w-0 flex-1 items-center">
           <TooltipProvider delay={80}>
@@ -222,17 +325,12 @@ export function Header() {
                 render={
                   <Link
                     to="/"
-                    aria-label={t("app.logoHomeTooltip")}
+                    aria-label={homeLinkLabel}
                     className="flex min-w-0 shrink-0 items-center"
                   />
                 }
               >
-                <img
-                  src="/brand/dramaclaw-wordmark.png"
-                  alt=""
-                  aria-hidden="true"
-                  className="h-[22.7px] w-auto max-w-[113px] object-contain"
-                />
+                <BrandLockup value={orgBranding.data} />
               </TooltipTrigger>
               <TooltipContent
                 side="bottom"
@@ -280,28 +378,11 @@ export function Header() {
             </div>
           ) : null}
           <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            className="group/notification relative size-[32px] text-sidebar-foreground/82 transition-colors duration-150 ease-[var(--ease-out-quint)] hover:bg-white/[0.05] hover:text-white aria-expanded:bg-white/[0.05] aria-expanded:text-white"
-            aria-label={t("header.notifications")}
-            aria-expanded={notificationOpen}
-            onClick={openNotifications}
-          >
-            <Bell className="size-[17px]" />
-            {hasUnreadNotification ? (
-              <span
-                className="absolute right-[8px] top-[8px] size-1 rounded-full bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.72)]"
-                aria-hidden="true"
-              />
-            ) : null}
-          </Button>
-          <Button
             id="mybuddy-companion-entry"
             type="button"
             variant="ghost"
             size="icon-sm"
-            className="companion-capsule-entry -ml-0.5 -mr-0.5 size-[32px] transition-colors duration-150 ease-[var(--ease-out-quint)] hover:bg-white/[0.06] aria-expanded:bg-white/[0.06]"
+            className="companion-capsule-entry -ml-0.5 -mr-0.5 size-[32px]"
             onClick={() => setCompanionOpen(true)}
             aria-label={t("myBuddy.companion.entry")}
           >
@@ -324,11 +405,16 @@ export function Header() {
             onMouseLeave={scheduleCloseAccountPanel}
           >
             <Button
+              ref={accountTriggerRef}
               type="button"
               variant="ghost"
               size="icon-sm"
-              className="size-[28px] rounded-full p-0 hover:bg-transparent"
+              className="relative size-[28px] rounded-full p-0 hover:bg-transparent"
               aria-label={t("header.account.open")}
+              aria-haspopup="true"
+              aria-expanded={accountPanelOpen}
+              aria-controls={accountPanelOpen ? "header-account-panel" : undefined}
+              onClick={toggleAccountPanel}
             >
               <span className="flex size-[26px] items-center justify-center overflow-hidden rounded-full border border-white/[0.10] bg-white/[0.07] text-[11px] font-normal text-white/72">
                 {avatarUrl ? (
@@ -337,6 +423,12 @@ export function Header() {
                   avatarInitial
                 )}
               </span>
+              {hasUnreadNotification ? (
+                <span
+                  className="absolute right-0 top-0 size-1.5 rounded-full border border-background bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.72)]"
+                  aria-hidden="true"
+                />
+              ) : null}
             </Button>
           </div>
         </div>
@@ -349,11 +441,15 @@ export function Header() {
               avatarInitial={avatarInitial}
               avatarUrl={avatarUrl}
               displayName={displayName}
+              hasUnreadNotification={hasUnreadNotification}
               onChangeAvatar={openAvatarDialog}
+              onChangePassword={showLogout ? openPasswordDialog : undefined}
               onLanguageChange={switchLanguage}
+              onNotifications={openNotifications}
               onClose={scheduleCloseAccountPanel}
               onEnter={openAccountPanel}
               onLogout={showLogout ? () => void handleLogout() : undefined}
+              panelRef={accountPanelRef}
               position={accountPanelPosition}
               visible={accountPanelVisible}
               t={t}
@@ -373,12 +469,18 @@ export function Header() {
         open={notificationOpen}
         onOpenChange={setNotificationOpen}
         onUpgradeStateChange={handleUpgradeStateChange}
+        announcements={announcements}
       />
       <AvatarUploadDialog
         avatarInitial={avatarInitial}
         displayName={displayName}
         open={avatarDialogOpen}
         onOpenChange={setAvatarDialogOpen}
+      />
+      <PasswordChangeDialog
+        open={passwordDialogOpen}
+        onOpenChange={setPasswordDialogOpen}
+        onPasswordChanged={handlePasswordChanged}
       />
       {ceRuntime ? <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} /> : null}
       {settingsWarningBubble
@@ -461,11 +563,15 @@ function AccountPanel({
   avatarInitial,
   avatarUrl,
   displayName,
+  hasUnreadNotification,
   onChangeAvatar,
+  onChangePassword,
   onLanguageChange,
+  onNotifications,
   onClose,
   onEnter,
   onLogout,
+  panelRef,
   position,
   visible,
   t,
@@ -474,11 +580,15 @@ function AccountPanel({
   avatarInitial: string;
   avatarUrl: string | null;
   displayName: string;
+  hasUnreadNotification: boolean;
   onChangeAvatar: () => void;
+  onChangePassword?: () => void;
   onLanguageChange: (lang: "zh" | "en") => void;
+  onNotifications: () => void;
   onClose: () => void;
   onEnter: () => void;
   onLogout?: () => void;
+  panelRef: RefObject<HTMLDivElement | null>;
   position: { top: number; right: number };
   visible: boolean;
   t: (key: string) => string;
@@ -490,6 +600,9 @@ function AccountPanel({
 
   return (
     <div
+      ref={panelRef}
+      id="header-account-panel"
+      aria-label={t("header.account.open")}
       className={`fixed z-[80] w-[216px] transition-opacity duration-[350ms] ease-[var(--ease-out-quint)] ${
         visible ? "opacity-100" : "opacity-0"
       }`}
@@ -511,11 +624,22 @@ function AccountPanel({
           </span>
         </div>
         <div className="space-y-0.5">
-          {!isCeRuntime() ? (
+          <AccountMenuRow
+            icon={<Bell className="size-3.5" />}
+            label={t("header.notifications")}
+            unread={hasUnreadNotification}
+            onClick={onNotifications}
+          />
+          <AccountMenuRow
+            icon={<Camera className="size-3.5" />}
+            label={t("header.account.changeAvatar")}
+            onClick={onChangeAvatar}
+          />
+          {onChangePassword ? (
             <AccountMenuRow
-              icon={<Camera className="size-3.5" />}
-              label={t("header.account.changeAvatar")}
-              onClick={onChangeAvatar}
+              icon={<KeyRound className="size-3.5" />}
+              label={t("header.account.changePassword")}
+              onClick={onChangePassword}
             />
           ) : null}
           <AccountMenuRow
@@ -557,20 +681,18 @@ function AccountMenuRow({
   icon,
   label,
   meta,
+  unread = false,
   onClick,
 }: {
   active?: boolean;
   icon: ReactNode;
   label: string;
   meta?: string;
+  unread?: boolean;
   onClick?: () => void;
 }) {
-  return (
-    <button
-      type="button"
-      className="flex h-9 w-full items-center gap-2 rounded-[8px] px-1.5 text-left text-[13px] font-normal text-slate-100 transition-colors duration-150 hover:bg-white/[0.05]"
-      onClick={onClick}
-    >
+  const content = (
+    <>
       <span className="ml-1 flex size-3.5 shrink-0 items-center justify-center text-slate-100/58" aria-hidden="true">
         {icon}
       </span>
@@ -578,11 +700,24 @@ function AccountMenuRow({
       {meta ? (
         <span className="max-w-16 truncate text-[11px] text-slate-400">{meta}</span>
       ) : null}
+      {unread ? (
+        <span
+          className="size-1.5 shrink-0 rounded-full bg-rose-500 shadow-[0_0_6px_rgba(244,63,94,0.62)]"
+          aria-hidden="true"
+        />
+      ) : null}
       <ChevronRight
         className={`mr-1 size-3.5 shrink-0 text-slate-100/88 transition-transform duration-150 ${
           active ? "rotate-90" : ""
         }`}
       />
+    </>
+  );
+  const className =
+    "flex h-9 w-full items-center gap-2 rounded-[8px] px-1.5 text-left text-[13px] font-normal text-slate-100 transition-colors duration-150 hover:bg-white/[0.05]";
+  return (
+    <button type="button" className={className} onClick={onClick}>
+      {content}
     </button>
   );
 }

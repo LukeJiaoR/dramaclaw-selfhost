@@ -55,6 +55,10 @@ vi.mock("@xyflow/react", () => ({
     children ?? null,
   Position: { Left: "left", Right: "right" },
   useUpdateNodeInternals: () => vi.fn(),
+  // 节点按 transform[2] 决定主体图喂原图还是降采样副本；这里固定在缩放 1，
+  // 即「不是在细看单张图」那一档。
+  useStore: (selector: (state: { transform: [number, number, number] }) => unknown) =>
+    selector({ transform: [0, 0, 1] }),
 }));
 
 vi.mock("react-i18next", () => ({
@@ -121,6 +125,7 @@ vi.mock("@/features/canvas/hooks/useFreezoneStyleTemplates", () => ({
 }));
 vi.mock("@/features/canvas/application/useUpstreamGraph", () => ({
   useUpstreamContents: () => [],
+  useUpstreamNodes: () => [],
 }));
 vi.mock("@/features/canvas/application/useNodeGenerationTaskState", () => ({
   useNodeGenerationTaskState: () => ({ isGenerating: false }),
@@ -130,6 +135,9 @@ vi.mock("@/features/canvas/nodes/useReferenceMentionSync", () => ({
 }));
 vi.mock("@/lib/queries/generation-credit-cost", () => ({
   useGenerationCreditCost: () => ({ data: undefined, error: null }),
+}));
+vi.mock("@/lib/model-task-access", () => ({
+  useModelTaskAccess: () => ({ blocked: false, denialReason: null, message: null }),
 }));
 vi.mock("@/features/canvas/nodes/shared/albumPendingTotals", () => ({
   setAlbumPendingTotal: vi.fn(),

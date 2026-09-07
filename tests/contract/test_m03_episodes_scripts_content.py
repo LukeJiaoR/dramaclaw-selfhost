@@ -75,6 +75,11 @@ class _M03Store:
         for key, value in updates.items():
             setattr(self.episode, key, value)
 
+    async def patch_episode(self, episode_number: int, **updates):
+        # The real store offers both; routes take the column-level one so an
+        # edit cannot re-serialise columns it was not asked to change.
+        await self.update_episode(episode_number, **updates)
+
     def load_novel_content(self):
         return self.novel_text
 
@@ -103,6 +108,9 @@ class _M03Store:
 
     def get_all_characters(self):
         return []
+
+    async def count_beats_by_episode(self):
+        return {self.episode.number: len(self.beats)} if self.beats else {}
 
     async def get_beats_as_dicts(self, episode_num: int):
         if episode_num != self.episode.number:
@@ -194,6 +202,7 @@ def m03_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (tmp_path / "novel.txt").write_text("测试原文", encoding="utf-8")
 
     from novelvideo.api import auth as api_auth
+    from novelvideo.api import deps
     from novelvideo.api.deps import ProjectResolution
     from novelvideo.api.routes import content, episodes, scripts
     from novelvideo.ports.local.usage import NoOpUsageMeter
@@ -212,7 +221,7 @@ def m03_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             runtime_dir=str(tmp_path / "runtime"),
         )
 
-    async def make_store_for_context(_ctx):
+    async def make_store_for_context(_ctx, **_kwargs):
         return store
 
     async def make_store(username: str, project: str):
@@ -241,6 +250,13 @@ def m03_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "get_task_backend",
             lambda: SimpleNamespace(enqueue_project_task=enqueue_project_task),
         )
+
+    # ``/beats`` opens its store through ``sqlite_store_for_context_scope`` /
+    # ``sqlite_store_scope``, and those wrappers resolve the factory as a ``deps``
+    # global when they run — so the per-module patches above never reach that one
+    # route, and it would fall through to the real factory.
+    monkeypatch.setattr(deps, "make_sqlite_store_for_context", make_store_for_context)
+    monkeypatch.setattr(deps, "make_sqlite_store", make_store)
 
     monkeypatch.setattr(content, "resolve_project_scope", resolve_project_scope)
     monkeypatch.setattr(content, "get_usage_meter", NoOpUsageMeter)
@@ -414,6 +430,12 @@ def test_m03_l2_covers_episodes_scripts_and_content_endpoints(m03_client):
         json={"visual_description": "missing"},
     )
     assert missing_beat.status_code == 404
+
+    from novelvideo.utils.path_resolver import PathResolver
+
+    sketch_path = PathResolver(str(store.project_dir), 1).sketch(1)
+    sketch_path.parent.mkdir(parents=True, exist_ok=True)
+    sketch_path.write_bytes(b"sketch")
 
     video_prompt = client.post(
         "/api/v1/projects/demo/episodes/1/beats/1/video-prompt/generate",

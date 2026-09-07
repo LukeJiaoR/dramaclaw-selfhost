@@ -20,6 +20,7 @@ const summaryState = vi.hoisted(() => ({
   refunded: 34,
   pending: 0,
   promotion_count: 2,
+  scope: undefined as string | undefined,
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -57,7 +58,11 @@ vi.mock("@/lib/queries/auth", () => ({
   }),
 }));
 
-vi.mock("@/lib/queries/credits", () => ({
+// `creditScopeOf` is deliberately the real implementation: it is the one
+// deciding which wallet this popover claims to be showing, so stubbing it would
+// make the org-scope assertions below prove nothing.
+vi.mock("@/lib/queries/credits", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/queries/credits")>()),
   useCreditSummary: () => ({
     data: { data: summaryState },
     isStale: false,
@@ -72,24 +77,36 @@ vi.mock("@/components/ui/popover", () => ({
   PopoverContent: ({ children }: React.PropsWithChildren) => <>{children}</>,
 }));
 
-vi.mock("react-i18next", () => ({
-  useTranslation: () => ({
-    t: (key: string) =>
-      ({
-        "credits.balance": "当前积分余额",
-        "credits.short": "积分",
-        "credits.openPanel": "打开积分面板",
-        "credits.personalAccount": "个人积分账户",
-        "credits.details": "查看明细",
-        "credits.earned": "已获得",
-        "credits.spent": "已消费",
-        "credits.refunded": "已退款",
-        "credits.promotions": "可用促销",
-        "credits.promotionCount": "当前有 2 项可能适用的优惠",
-        "credits.viewTransactions": "查看积分明细",
-      })[key] ?? key,
-  }),
-}));
+// The real dictionary, not a hand-copied one: which wallet this popover claims
+// to be showing lives entirely in the copy, so a test carrying its own strings
+// would keep passing while the shipped labels said something else.
+vi.mock("react-i18next", async () => {
+  const { readFileSync } = await import("node:fs");
+  const dictionary = JSON.parse(
+    readFileSync("public/locales/zh/translation.json", "utf8"),
+  ) as Record<string, unknown>;
+  const translate = (key: string, vars?: Record<string, unknown>) => {
+    const raw = key
+      .split(".")
+      .reduce<unknown>(
+        (node, part) =>
+          node && typeof node === "object"
+            ? (node as Record<string, unknown>)[part]
+            : undefined,
+        dictionary,
+      );
+    if (typeof raw !== "string") return key;
+    return raw.replace(/\{\{(\w+)\}\}/g, (_match, name: string) =>
+      String(vars?.[name] ?? ""),
+    );
+  };
+  return {
+    useTranslation: () => ({
+      t: translate,
+      i18n: { resolvedLanguage: "zh", language: "zh" },
+    }),
+  };
+});
 
 function renderBadge() {
   const qc = new QueryClient({
@@ -109,14 +126,54 @@ describe("CreditBalanceBadge", () => {
     currentUserState.isLoading = false;
     currentUserState.balance = 1234;
     runtimeState.isCeRuntime = false;
+    summaryState.scope = undefined;
   });
 
   it("renders the current credit balance", async () => {
     renderBadge();
 
     expect(screen.getAllByText("1,234")).toHaveLength(2);
-    expect(screen.getByText("个人积分账户")).toBeInTheDocument();
+    expect(screen.getByText("可用积分余额")).toBeInTheDocument();
     expect(screen.getByText("当前有 2 项可能适用的优惠")).toBeInTheDocument();
+  });
+
+  it("keeps one details entry and presents the summary as lightweight cards", () => {
+    renderBadge();
+
+    expect(screen.getByRole("button", { name: "查看明细" })).toHaveClass(
+      "focus-visible:ring-0",
+    );
+    expect(screen.getByText("可用积分余额")).toHaveClass("text-xs");
+    expect(screen.queryByText("查看积分明细")).not.toBeInTheDocument();
+    for (const label of ["已获得", "已消费", "已退款"]) {
+      expect(screen.getByText(label).parentElement).toHaveClass("rounded-sm", "bg-white/[0.075]");
+      expect(screen.getByText(label).parentElement).not.toHaveClass("border");
+    }
+  });
+
+  it("uses the same available-balance title for an organization allocation", () => {
+    summaryState.scope = "org_member";
+
+    renderBadge();
+
+    expect(screen.getByText("可用积分余额")).toBeInTheDocument();
+    expect(screen.queryByText("组织分配给你的额度")).not.toBeInTheDocument();
+    expect(screen.queryByText("可用余额")).not.toBeInTheDocument();
+    expect(screen.queryByText("个人积分账户")).not.toBeInTheDocument();
+  });
+
+  // A backend that predates the scope contract omits the key entirely, and an
+  // unknown value must not be read as an organization.
+  it("keeps the available-balance title for an absent or unrecognised scope", () => {
+    for (const scope of [undefined, "personal", "something_new"]) {
+      summaryState.scope = scope;
+
+      const { unmount } = renderBadge();
+
+      expect(screen.getByText("可用积分余额")).toBeInTheDocument();
+      expect(screen.queryByText("组织分配给你的额度")).not.toBeInTheDocument();
+      unmount();
+    }
   });
 
   it("renders nothing when logged out", () => {

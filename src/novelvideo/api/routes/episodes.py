@@ -1,9 +1,13 @@
 """分集列表 & 规划 & 身份端点。"""
 
+import asyncio
 import logging
+import os
+from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends
+from starlette.concurrency import run_in_threadpool
 
 from novelvideo.api.auth import get_api_user
 from novelvideo.api.chapter_preview import build_chapter_preview
@@ -14,6 +18,8 @@ from novelvideo.api.deps import (
     make_sqlite_store_for_context,
     make_static_url_for_context,
     resolve_project_scope,
+    sqlite_store_for_context_scope,
+    sqlite_store_scope,
 )
 from novelvideo.api.schemas import EpisodePlanRequest, EpisodeUpdate, InsertManualShotRequest
 from novelvideo.novel_source import (
@@ -21,14 +27,37 @@ from novelvideo.novel_source import (
     novel_import_required_response,
     resolve_uploaded_novel_filename,
 )
+from novelvideo.identity_prerequisites import (
+    IdentityCharactersBuildingError,
+    IdentityPlanningPrerequisiteError,
+    identity_prerequisite_response,
+    require_identity_characters,
+)
+from novelvideo.knowledge_pipeline import (
+    KnowledgePipelineUnsupported,
+    is_structured_pipeline,
+)
 from novelvideo.ports import get_task_backend, get_usage_meter
 from novelvideo.project_config import load_project_config_file_from_state_dir
+from novelvideo.scene_prerequisites import (
+    SceneCatalogBuildingError,
+    scene_prerequisite_response,
+)
 from novelvideo.task_identity import project_task_state_key
+from novelvideo.task_state import ACTIVE_PROJECT_TASK_STATUSES, get_task_manager
 
 logger = logging.getLogger("novelvideo.api.episodes")
 
 router = APIRouter()
 AssetCompiler = None
+
+
+def _dir_entry_names(directory: "Path") -> set[str]:
+    """目录里的文件名集合；目录不存在/不可读时当空。"""
+    try:
+        return set(os.listdir(directory))
+    except OSError:
+        return set()
 
 _EPISODE_ASSET_PLANNER_TASKS = {
     "scene": ("episode_scene_planner", "场景"),
@@ -185,6 +214,15 @@ async def _enqueue_episode_asset_planner(
             asset_kind=asset_kind,
             user=user,
         )
+    if asset_kind == "scene":
+        build_task = await run_in_threadpool(
+            get_task_manager().get_task_for_project,
+            resolved.ctx,
+            "build_scenes",
+            0,
+        )
+        if build_task is not None and build_task.status in ACTIVE_PROJECT_TASK_STATUSES:
+            return scene_prerequisite_response(SceneCatalogBuildingError())
     task_scope = _episode_asset_task_scope(asset_kind, episode_num)
     queued = await get_task_backend().enqueue_project_task(
         resolved.ctx,
@@ -218,26 +256,38 @@ async def list_episodes(project: str, user: dict = Depends(get_api_user)):
     """获取项目分集列表。"""
     resolved = await resolve_project_scope(project, user, required_role="viewer")
 
-    store = (
-        await make_sqlite_store_for_context(resolved.ctx)
+    # 裸 factory 把关闭责任丢给调用点，而这里正常返回和抛错两条路都没有 close()——
+    # 每个 SQLiteStore 背后是一条 aiosqlite 连接加一个后台线程，按请求数累积。
+    # 本 PR 给这个路由加了 beat_count 之后它是分集列表的唯一数据源，进一次虾镜就走
+    # 一次，泄漏更明显。
+    store_scope = (
+        sqlite_store_for_context_scope(resolved.ctx)
         if resolved.ctx
-        else await make_sqlite_store(resolved.username, resolved.project_name)
+        else sqlite_store_scope(resolved.username, resolved.project_name)
     )
-    episodes = store.get_all_episodes()
+    async with store_scope as store:
+        episodes = store.get_all_episodes()
+        # 每张分集卡片都要显示镜头数。一次分组查询带上，前端就不必逐集去拉完整
+        # beats 载荷再数长度——那是「有几集发几个请求」，且每个请求都远比这个整数贵。
+        beat_counts = await store.count_beats_by_episode()
 
-    data = []
-    for ep in episodes:
-        data.append(
-            {
-                "number": ep.number if hasattr(ep, "number") else 0,
-                "title": ep.title if hasattr(ep, "title") else "",
-                "summary": (getattr(ep, "content_summary", "") or getattr(ep, "summary", "") or ""),
-                "identity_ids": list(getattr(ep, "identity_ids", []) or []),
-                "key_events": list(getattr(ep, "key_events", []) or []),
-                "scene_menu": _dump_episode_items(getattr(ep, "scene_menu", []) or []),
-                "prop_menu": _dump_episode_items(getattr(ep, "prop_menu", []) or []),
-            }
-        )
+        data = []
+        for ep in episodes:
+            number = ep.number if hasattr(ep, "number") else 0
+            data.append(
+                {
+                    "number": number,
+                    "title": ep.title if hasattr(ep, "title") else "",
+                    "summary": (
+                        getattr(ep, "content_summary", "") or getattr(ep, "summary", "") or ""
+                    ),
+                    "identity_ids": list(getattr(ep, "identity_ids", []) or []),
+                    "key_events": list(getattr(ep, "key_events", []) or []),
+                    "scene_menu": _dump_episode_items(getattr(ep, "scene_menu", []) or []),
+                    "prop_menu": _dump_episode_items(getattr(ep, "prop_menu", []) or []),
+                    "beat_count": beat_counts.get(number, 0),
+                }
+            )
 
     return {"ok": True, "data": data}
 
@@ -264,6 +314,15 @@ async def plan_episodes(project: str, body: EpisodePlanRequest, user: dict = Dep
     if ctx is not None:
         if not has_imported_novel(resolved.project_dir):
             return novel_import_required_response()
+        # The AI planners read the Cognee graph, which structured_v1 projects do
+        # not have. Reject before enqueue so the user gets an answer instead of
+        # a task that is guaranteed to fail after reserving credit.
+        if is_structured_pipeline(state_dir) and body.planning_mode != "chapters":
+            return {
+                "ok": False,
+                "code": KnowledgePipelineUnsupported.error_code,
+                "error": "该项目只支持按章节/集号的确定性分集",
+            }
         queued = await get_task_backend().enqueue_project_task(
             ctx,
             product_surface="mainline",
@@ -308,13 +367,16 @@ async def get_beats(project: str, episode_num: int, user: dict = Depends(get_api
     resolved = await resolve_project_scope(project, user, required_role="viewer")
     project_dir = resolved.project_dir
 
-    # 从图谱读取 beats（统一数据源）
-    store = (
-        await make_sqlite_store_for_context(resolved.ctx)
+    # 从图谱读取 beats（统一数据源）。
+    # get_beats_as_dicts 只读 beats 表，不碰 store 的角色/集/道具内存缓存，
+    # 所以跳过 load_graph_state()——那是三次全表读，比这里的查询本身还贵。
+    store_scope = (
+        sqlite_store_for_context_scope(resolved.ctx, load_graph_state=False)
         if resolved.ctx
-        else await make_sqlite_store(resolved.username, resolved.project_name)
+        else sqlite_store_scope(resolved.username, resolved.project_name)
     )
-    beats = await store.get_beats_as_dicts(episode_num)
+    async with store_scope as store:
+        beats = await store.get_beats_as_dicts(episode_num)
 
     # 为每个 beat 附加 sketch_url / frame_url / video_url / audio_url.
     # Asset files are named by beat_number. Do not use enumerate index here:
@@ -323,65 +385,86 @@ async def get_beats(project: str, episode_num: int, user: dict = Depends(get_api
     frames_dir = project_dir / "frames" / f"ep{episode_num:03d}"
     videos_dir = project_dir / "videos" / "beats" / f"ep{episode_num:03d}"
     audio_dir = project_dir / "audio" / f"ep{episode_num:03d}"
-    # 收集已存在的音频，循环后并发探测时长，供前端时长控件做默认值/下限（视频时长须 >= 音频）。
-    audio_duration_jobs: list[tuple[dict, str]] = []
-    for beat in beats:
-        beat["audio_duration_seconds"] = None
-        beat_num = int(beat.get("beat_number", 0) or 0)
-        if beat_num <= 0:
-            beat["sketch_url"] = ""
-            beat["frame_url"] = ""
-            beat["video_url"] = ""
-            beat["audio_url"] = ""
-            continue
-        # sketch
-        sketch_file = f"beat_{beat_num:02d}.png"
-        if (sketches_dir / sketch_file).exists():
-            rel = f"sketches/ep{episode_num:03d}/{sketch_file}"
-            beat["sketch_url"] = make_static_url_for_context(
-                resolved.ctx,
-                rel,
-                local_path=sketches_dir / sketch_file,
-            )
-        else:
-            beat["sketch_url"] = ""
-        # frame
-        frame_file = f"beat_{beat_num:02d}.png"
-        if (frames_dir / frame_file).exists():
-            rel = f"frames/ep{episode_num:03d}/{frame_file}"
-            beat["frame_url"] = make_static_url_for_context(
-                resolved.ctx, rel, local_path=frames_dir / frame_file
-            )
-        else:
-            beat["frame_url"] = ""
-        # video
-        video_file = f"beat_{beat_num:02d}.mp4"
-        if (videos_dir / video_file).exists():
-            rel = f"videos/beats/ep{episode_num:03d}/{video_file}"
-            beat["video_url"] = make_static_url_for_context(
-                resolved.ctx, rel, local_path=videos_dir / video_file
-            )
-        else:
-            beat["video_url"] = ""
-        # audio
-        audio_file = f"beat_{beat_num:02d}.mp3"
-        if (audio_dir / audio_file).exists():
-            rel = f"audio/ep{episode_num:03d}/{audio_file}"
-            beat["audio_url"] = make_static_url_for_context(
-                resolved.ctx, rel, local_path=audio_dir / audio_file
-            )
-            audio_duration_jobs.append((beat, str(audio_dir / audio_file)))
-        else:
-            beat["audio_url"] = ""
+    # 整段文件存在性探测 + URL 组装一次性搬进线程，事件循环上不留同步 syscall。
+    # 原先是逐 beat 做的：4 次 Path.exists() 找文件，命中后 project_static_url 再各
+    # 做一次 exists()+stat()——静态 URL 尾巴上的 ?v=mtime 要靠 stat 拿。一集 20 个
+    # beat 就是约 160 次 exists 加 80 次 stat，全在 async handler 里同步执行。本地
+    # SSD 上无感；OSSFS/网络盘上每次都是一个网络往返，一旦卡顿，单个 /beats 请求就
+    # 能把 Uvicorn worker 的心跳按住，同进程的其他请求跟着一起等。
+    #
+    # 现在：每个目录列一次（4 次 listdir 取代 4N 次 exists），剩下的 stat 仍是每个
+    # 命中文件一次，但整段都发生在线程里，事件循环随时可以调度别的请求。
+    def _attach_asset_urls() -> list[tuple[dict, str]]:
+        sketch_names = _dir_entry_names(sketches_dir)
+        frame_names = _dir_entry_names(frames_dir)
+        video_names = _dir_entry_names(videos_dir)
+        audio_names = _dir_entry_names(audio_dir)
+
+        # 收集已存在的音频交回给调用方并发探测时长，供前端时长控件做默认值/下限
+        # （视频时长须 >= 音频）。探测不在这个线程里做：它要 fork ffprobe，得走
+        # media_io 里那道有界并发闸门。
+        jobs: list[tuple[dict, str]] = []
+        for beat in beats:
+            beat["audio_duration_seconds"] = None
+            beat_num = int(beat.get("beat_number", 0) or 0)
+            if beat_num <= 0:
+                beat["sketch_url"] = ""
+                beat["frame_url"] = ""
+                beat["video_url"] = ""
+                beat["audio_url"] = ""
+                continue
+            # sketch
+            sketch_file = f"beat_{beat_num:02d}.png"
+            if sketch_file in sketch_names:
+                rel = f"sketches/ep{episode_num:03d}/{sketch_file}"
+                beat["sketch_url"] = make_static_url_for_context(
+                    resolved.ctx,
+                    rel,
+                    local_path=sketches_dir / sketch_file,
+                )
+            else:
+                beat["sketch_url"] = ""
+            # frame
+            frame_file = f"beat_{beat_num:02d}.png"
+            if frame_file in frame_names:
+                rel = f"frames/ep{episode_num:03d}/{frame_file}"
+                beat["frame_url"] = make_static_url_for_context(
+                    resolved.ctx, rel, local_path=frames_dir / frame_file
+                )
+            else:
+                beat["frame_url"] = ""
+            # video
+            video_file = f"beat_{beat_num:02d}.mp4"
+            if video_file in video_names:
+                rel = f"videos/beats/ep{episode_num:03d}/{video_file}"
+                beat["video_url"] = make_static_url_for_context(
+                    resolved.ctx, rel, local_path=videos_dir / video_file
+                )
+            else:
+                beat["video_url"] = ""
+            # audio
+            audio_file = f"beat_{beat_num:02d}.mp3"
+            if audio_file in audio_names:
+                rel = f"audio/ep{episode_num:03d}/{audio_file}"
+                beat["audio_url"] = make_static_url_for_context(
+                    resolved.ctx, rel, local_path=audio_dir / audio_file
+                )
+                jobs.append((beat, str(audio_dir / audio_file)))
+            else:
+                beat["audio_url"] = ""
+        return jobs
+
+    audio_duration_jobs = await asyncio.to_thread(_attach_asset_urls)
 
     if audio_duration_jobs:
-        import asyncio
+        from novelvideo.utils.media_io import get_audio_durations_async
 
-        from novelvideo.utils.media_io import get_audio_duration_async
-
-        durations = await asyncio.gather(
-            *(get_audio_duration_async(path) for _, path in audio_duration_jobs),
-            return_exceptions=True,
+        # 有界并发。这里此前是对整集的音频一次性 gather——一集多少个有声镜头就同时
+        # fork 多少个 ffprobe，而且用的是默认线程池，抽干期间进程里其他阻塞调用一起
+        # 排队。真正的修法是把时长在生成时写进库、读的时候直接出（TTS 本来就量过），
+        # 这里先把扇出封顶。
+        durations = await get_audio_durations_async(
+            [path for _, path in audio_duration_jobs]
         )
         for (beat, _), value in zip(audio_duration_jobs, durations):
             if isinstance(value, (int, float)) and value > 0:
@@ -478,6 +561,27 @@ async def plan_episode_identities(
     logger.info("[%s] EP%d plan_episode_identities", project, episode_num)
     resolved = await resolve_project_scope(project, user, required_role="editor")
     if resolved.ctx is not None:
+        try:
+            build_task = await run_in_threadpool(
+                get_task_manager().get_task_for_project,
+                resolved.ctx,
+                "build_characters",
+                0,
+            )
+            if (
+                build_task is not None
+                and build_task.status in ACTIVE_PROJECT_TASK_STATUSES
+            ):
+                raise IdentityCharactersBuildingError()
+
+            store = await make_sqlite_store_for_context(resolved.ctx)
+            try:
+                require_identity_characters(store.get_all_characters())
+            finally:
+                await store.close()
+        except IdentityPlanningPrerequisiteError as exc:
+            return identity_prerequisite_response(exc)
+
         queued = await get_task_backend().enqueue_project_task(
             resolved.ctx,
             product_surface="mainline",
@@ -511,6 +615,10 @@ async def plan_episode_identities(
         else await make_cognee_store(resolved.username, resolved.project_name)
     )
     await store.load_graph_state()
+    try:
+        require_identity_characters(store.get_all_characters())
+    except IdentityPlanningPrerequisiteError as exc:
+        return identity_prerequisite_response(exc)
     episodes = store.get_all_episodes()
 
     episode = None
@@ -621,7 +729,9 @@ async def update_episode(
     if not updates:
         return {"ok": True, "data": {"message": "No fields to update"}}
 
-    await store.update_episode(episode_num, **updates)
+    # Column-level: a user editing a title while planning runs must not roll
+    # back the menus that planning just wrote.
+    await store.patch_episode(episode_num, **updates)
 
     # 返回更新后的集信息
     ep = store.get_episode(episode_num)

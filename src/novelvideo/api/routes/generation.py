@@ -5,11 +5,12 @@ import io
 import logging
 import os
 import re
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from novelvideo.api.auth import get_api_user, require_scope
 from novelvideo.api.deps import (
@@ -50,6 +51,7 @@ from novelvideo.api.schemas import (
     Seedance2AssetCropRequest,
     Seedance2AssetDeleteRequest,
 )
+from novelvideo.utils.source_language import detect_episode_asset_language
 from novelvideo.api.viewer_manifests import (
     build_director_stage_manifest,
     build_pano_viewer_manifest,
@@ -71,6 +73,13 @@ from novelvideo.seedance2_i2v.voice_clone import normalize_seedance2_audio_type
 from novelvideo.project_config import load_project_config, save_project_config
 from novelvideo.project_context import ProjectContext
 from novelvideo.ports import get_credit_quote, get_task_backend, get_usage_meter
+from novelvideo.task_backend.limit_logging import log_task_limit_rejection
+from novelvideo.task_backend.limits import (
+    ChannelTaskLimitExceeded,
+    ProjectTaskLimitExceeded,
+    ProjectUserTaskLimitExceeded,
+    UserTaskLimitExceeded,
+)
 from novelvideo.task_identity import project_task_state_key
 from novelvideo.models import beat_scene_id
 from novelvideo.services.background_anchor_service import (
@@ -81,6 +90,17 @@ from novelvideo.services.background_anchor_service import (
     select_background_anchor,
 )
 from novelvideo.utils.path_resolver import PathResolver, compute_identity_path, compute_portrait_path
+
+
+class _TemporaryFileResponse(FileResponse):
+    """Delete the response file after ASGI delivery, including failed or cancelled sends."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with suppress(OSError):
+                Path(self.path).unlink(missing_ok=True)
 
 router = APIRouter()
 
@@ -431,6 +451,58 @@ def _find_pool_grid_entry(
         if not image_grid_paths or entry.grid_path in image_grid_paths:
             return entry
     return None
+
+
+_FANOUT_ACTIVE_LIMIT_ERRORS = (
+    ChannelTaskLimitExceeded,
+    UserTaskLimitExceeded,
+    ProjectTaskLimitExceeded,
+    ProjectUserTaskLimitExceeded,
+)
+
+
+_FanoutLimitError = (
+    ChannelTaskLimitExceeded
+    | UserTaskLimitExceeded
+    | ProjectTaskLimitExceeded
+    | ProjectUserTaskLimitExceeded
+)
+
+
+def _task_limit_reason(exc: _FanoutLimitError) -> str:
+    """撞闸异常 → 作用域词。
+
+    分支必须与 ``api/app.py`` 的 ``limit_scope`` 逐字同源（``:226`` 渠道闸 /
+    ``:206`` 与 ``:271`` 人闸）—— 两侧同算法是跨 EU 的漂移探测器，故三处扇出
+    循环共用这一个 helper，而不是各自内联一份。
+    """
+    if isinstance(exc, ProjectTaskLimitExceeded):
+        return "project"
+    if isinstance(exc, ChannelTaskLimitExceeded):
+        return "platform" if exc.scope_kind == "platform" else "channel"
+    if isinstance(exc, (ProjectUserTaskLimitExceeded, UserTaskLimitExceeded)):
+        return "user"
+    # pragma: no cover - the precise catch tuple keeps this unreachable
+    raise TypeError(f"unsupported fanout task-limit exception: {type(exc).__name__}")
+
+
+def _log_partial_dispatch_rejection(exc: _FanoutLimitError) -> None:
+    """已投出 k > 0 个后撞闸：异常就地被吞、响应是 200，走不到 ``api/app.py``
+    的 handler，日志得在这里补 —— 否则「投了一半撞闸」在面板上不存在。
+
+    一次撞闸记一行（按捕获到的那个异常），不按后面合成的每条 ``rejected`` 记。
+    """
+    log_task_limit_rejection(exc, limit_scope=_task_limit_reason(exc))
+
+
+def _task_limit_rejection(scope: str, exc: _FanoutLimitError) -> dict[str, Any]:
+    """把撞闸异常翻成扇出响应里的一条 ``rejected``（M8 §8.2 冻结形状）。"""
+    return {
+        "scope": scope,
+        "reason": _task_limit_reason(exc),
+        "limit": exc.limit,
+        "active": exc.active,
+    }
 
 
 def _custom_render_plan_error(plan: list[Any], beat_indices: list[int]) -> str | None:
@@ -850,13 +922,23 @@ def _merge_seedance2_request_config(
 
 
 async def _api_audio_duration_seconds(output_dir: str | Path, episode: int, beat_num: int):
+    """Duration of one beat's audio, or ``None`` if there isn't one to report.
+
+    ``None`` already means "no duration for this beat" here (the file may simply
+    not have been generated yet), so a probe that fails or times out reports the
+    same thing rather than failing the whole beat list. On network storage an
+    unreadable file is a routine condition, not a request-level error.
+    """
     from novelvideo.utils.media_io import get_audio_duration_async
     from novelvideo.utils.path_resolver import PathResolver
 
     audio_path = PathResolver(output_dir, episode).audio(beat_num)
     if not audio_path.exists():
         return None
-    return await get_audio_duration_async(str(audio_path))
+    try:
+        return await get_audio_duration_async(str(audio_path))
+    except Exception:
+        return None
 
 
 async def _prepare_seedance2_api_beat(
@@ -887,6 +969,7 @@ async def _prepare_seedance2_api_beat(
     )
     prepared = await prepare_seedance2_generation_inputs(
         project_output=output_dir,
+        state_dir=Path(store.state_dir),
         episode=episode,
         beat=beat,
         next_beat=all_beats[index + 1] if index + 1 < len(all_beats) else None,
@@ -919,6 +1002,7 @@ async def _prepare_seedance2_api_beat(
 async def _prepare_happyhorse_api_beat(
     *,
     output_dir: str | Path,
+    state_dir: str | Path,
     episode: int,
     beat: dict[str, Any],
     next_beat: dict[str, Any] | None,
@@ -969,6 +1053,7 @@ async def _prepare_happyhorse_api_beat(
             episode=episode,
             beat=beat,
             mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+            state_dir=state_dir,
             next_beat=next_beat,
             prop_menu=prop_menu,
         )
@@ -999,6 +1084,7 @@ async def _prepare_happyhorse_api_beat(
 async def _prepare_grok_video_api_beat(
     *,
     output_dir: str | Path,
+    state_dir: str | Path,
     episode: int,
     beat: dict[str, Any],
     next_beat: dict[str, Any] | None,
@@ -1049,6 +1135,7 @@ async def _prepare_grok_video_api_beat(
             episode=episode,
             beat=beat,
             mode=Seedance2I2VMode.MULTIMODAL_REFERENCE,
+            state_dir=state_dir,
             next_beat=next_beat,
             prop_menu=prop_menu,
         )
@@ -1273,6 +1360,15 @@ async def _seedance2_panel_context(
     characters = store.get_all_characters()
     episode_obj = _episode_from_store_or_none(store, episode_num)
     prop_menu = await _runtime_prop_menu_with_global_props(store, episode_obj, beats)
+    language = await detect_episode_asset_language(
+        store,
+        episode_num,
+        fallback_text="\n".join(
+            str(item.get(field) or "")
+            for item in beats
+            for field in ("narration_segment", "dialogue", "visual_description")
+        ),
+    )
     return {
         "project_ctx": resolved.ctx,
         "username": username,
@@ -1284,6 +1380,7 @@ async def _seedance2_panel_context(
         "next_beat": next_beat,
         "characters": characters,
         "prop_menu": prop_menu,
+        "language": language,
     }
 
 
@@ -1308,6 +1405,8 @@ def _seedance2_status_response(
         next_beat=ctx["next_beat"],
         characters=ctx["characters"],
         prop_menu=ctx["prop_menu"],
+        state_dir=Path(ctx["store"].state_dir),
+        language=ctx.get("language"),
     )
     assets = state.assets
     selected_assets = [asset for asset in assets if asset.selected]
@@ -1423,17 +1522,16 @@ async def upload_seedance2_asset(
         user=user,
     )
     from novelvideo.seedance2_i2v.panel_service import (
-        save_seedance2_uploaded_asset,
+        save_seedance2_uploaded_file,
     )
 
-    content = await file.read()
-    target = await save_seedance2_uploaded_asset(
+    target = await save_seedance2_uploaded_file(
         store=ctx["store"],
         episode=episode_num,
         beat=ctx["beat"],
         project_dir=ctx["output_dir"],
         filename=file.filename or "seedance2_asset",
-        content=content,
+        upload_stream=file.file,
         content_type=file.content_type or "",
     )
     if target is None:
@@ -1469,6 +1567,7 @@ async def delete_seedance2_asset(
         store=ctx["store"],
         episode=episode_num,
         beat=ctx["beat"],
+        project_dir=ctx["output_dir"],
         media_kind=body.media_kind,
         path=body.path,
     )
@@ -2121,26 +2220,43 @@ async def generate_sketches(
     dispatch_grid_indices = list(range(len(grid_plan))) if generate_all_grids else [body.grid_index]
     if ctx is not None:
         queued_tasks = []
-        for grid_index in dispatch_grid_indices:
+        rejected: list[dict[str, Any]] = []
+        for position, grid_index in enumerate(dispatch_grid_indices):
             scope = f"grid_{grid_index}"
             billing = _sketch_regen_billing_metadata(
                 sketch_image_selection,
                 billing_mode_keys[grid_index],
             )
-            queued = await get_task_backend().enqueue_project_task(
-                ctx,
-                product_surface="mainline",
-                task_type="sketch_grid_generation",
-                queue_kind="default",
-                episode=episode_num,
-                scope=scope,
-                payload={
-                    "episode": episode_num,
-                    "output_dir": output_dir,
-                    "config": {**base_config, "grid_index": grid_index},
-                    "billing": billing,
-                },
-            )
+            try:
+                queued = await get_task_backend().enqueue_project_task(
+                    ctx,
+                    product_surface="mainline",
+                    task_type="sketch_grid_generation",
+                    queue_kind="default",
+                    episode=episode_num,
+                    scope=scope,
+                    payload={
+                        "episode": episode_num,
+                        "output_dir": output_dir,
+                        "config": {**base_config, "grid_index": grid_index},
+                        "billing": billing,
+                    },
+                )
+            except _FANOUT_ACTIVE_LIMIT_ERRORS as exc:
+                if not queued_tasks:
+                    # 一个都没投出去＝纯粹超限：裸抛，交 api/app.py 的 handler
+                    # 渲染 429 ＋ 正确的 limit_scope（M8 不变量 7）。
+                    raise
+                _log_partial_dispatch_rejection(exc)
+                # 闸是全局的，后面每一个都必然被拒 —— 所以**只投这一次**（break），
+                # 但要把「当前这条 ＋ 后面还没尝试的」全部如实记进 rejected：
+                # 契约要 N−k 条（M8 :722 / :755），下游按尾段长度对齐
+                # （render-plan-dialog.tsx:265 断言 entries.length == rejected.length）。
+                for pending_index in dispatch_grid_indices[position:]:
+                    rejected.append(
+                        _task_limit_rejection(f"grid_{pending_index}", exc)
+                    )
+                break
             queued_tasks.append(
                 {
                     "grid_index": grid_index,
@@ -2163,9 +2279,11 @@ async def generate_sketches(
                 "task_type": "sketch_grid_generation",
                 "backend": queued_tasks[0]["backend"] if queued_tasks else "inline",
                 "data": {
-                    "dispatched": len(dispatch_grid_indices),
+                    # 实投数，不是意图数（M8 不变量 17）。
+                    "dispatched": len(queued_tasks),
                     "tasks": queued_tasks,
                     "scopes": [item["scope"] for item in queued_tasks],
+                    "rejected": rejected,
                 },
                 "message": f"第 {episode_num} 集全集草图生成已进入队列 ({grid_labels})",
             }
@@ -2554,8 +2672,7 @@ async def global_optimize_video(
 ):
     """全局视频提示词优化（草图 → AI 自由决策每个 beat 的 i2v/k2v 模式）。
 
-    language="en" (默认) 使用 SuperPower 模式（Gemini 英文提示词，含 camera/action/audio）。
-    language="zh" 使用中文简短提示词。
+    输出语言由作者保存的当前剧本文本决定，不受界面语言影响。
     """
     resolved = await _resolve_generation_project(project, user, required_role="editor")
     ctx = resolved.ctx
@@ -2572,6 +2689,16 @@ async def global_optimize_video(
 
     if not beats:
         return {"ok": False, "error": f"No beats found for episode {episode_num}"}
+
+    language = await detect_episode_asset_language(
+        store,
+        episode_num,
+        fallback_text="\n".join(
+            str(beat.get(field) or "")
+            for beat in beats
+            for field in ("narration_segment", "dialogue", "visual_description")
+        ),
+    )
 
     # 预检和报价必须使用同一统计口径。
     billable_beat_numbers = _global_optimize_billable_beat_numbers(
@@ -2608,7 +2735,7 @@ async def global_optimize_video(
                 "beats": beats,
                 "characters": char_list,
                 "output_dir": output_dir,
-                "language": body.language,
+                "language": language,
                 "billing": {
                     "items": billable_beat_count,
                     "beat_numbers": billable_beat_numbers,
@@ -3073,34 +3200,50 @@ async def render_execute(
     }
     scope = f"{dispatch_strategy}__{execution_hash}"
     dispatched_task_ids: list[str] = []
+    rejected: list[dict[str, Any]] = []
 
     if ctx is not None:
-        for entry in execution_plan:
+        for position, entry in enumerate(execution_plan):
             entry_beats = [int(beat) for beat in entry.beat_numbers]
             entry_scope = selection_scope(entry.mode_key, entry_beats)
             billing = _render_regen_billing_metadata(
                 render_image_selection,
                 entry.mode_key,
             )
-            queued = await get_task_backend().enqueue_project_task(
-                ctx,
-                product_surface="mainline",
-                task_type="selected_regen",
-                queue_kind="default",
-                episode=episode_num,
-                scope=entry_scope,
-                payload={
-                    "episode": episode_num,
-                    "mode_key": entry.mode_key,
-                    "output_dir": output_dir,
-                    "config": {
-                        **base_config,
+            try:
+                queued = await get_task_backend().enqueue_project_task(
+                    ctx,
+                    product_surface="mainline",
+                    task_type="selected_regen",
+                    queue_kind="default",
+                    episode=episode_num,
+                    scope=entry_scope,
+                    payload={
+                        "episode": episode_num,
                         "mode_key": entry.mode_key,
-                        "selected_beat_numbers": entry_beats,
+                        "output_dir": output_dir,
+                        "config": {
+                            **base_config,
+                            "mode_key": entry.mode_key,
+                            "selected_beat_numbers": entry_beats,
+                        },
+                        "billing": billing,
                     },
-                    "billing": billing,
-                },
-            )
+                )
+            except _FANOUT_ACTIVE_LIMIT_ERRORS as exc:
+                if not dispatched_task_ids:
+                    # k == 0：裸抛交 handler 渲染 429（M8 不变量 7）。
+                    raise
+                _log_partial_dispatch_rejection(exc)
+                # 只投这一次，但把未投的尾段逐条如实上报（N−k 条，M8 :722 / :755）。
+                for pending in execution_plan[position:]:
+                    pending_beats = [int(beat) for beat in pending.beat_numbers]
+                    rejected.append(
+                        _task_limit_rejection(
+                            selection_scope(pending.mode_key, pending_beats), exc
+                        )
+                    )
+                break
             dispatched_task_ids.append(queued.task_state.task_id)
     else:
         return {
@@ -3122,7 +3265,8 @@ async def render_execute(
             scope=scope,
             resolved_grids=[PlanEntryOut(**entry) for entry in _plan_to_dicts(execution_plan)],
         ).model_dump()
-        | ({"task_ids": dispatched_task_ids} if dispatched_task_ids else {}),
+        | ({"task_ids": dispatched_task_ids} if dispatched_task_ids else {})
+        | ({"rejected": rejected} if rejected else {}),
     }
 
 
@@ -4445,7 +4589,8 @@ async def generate_missing_manual_sketches(
 
     dispatched_scopes: list[str] = []
     dispatched_segments: list[list[int]] = []
-    for beat_numbers in segments:
+    rejected: list[dict[str, Any]] = []
+    for position, beat_numbers in enumerate(segments):
         beat_indices = [int(n) for n in beat_numbers]
         mode_key = choose_manual_sketch_mode_key(len(beat_indices))
         config = {
@@ -4460,20 +4605,36 @@ async def generate_missing_manual_sketches(
         }
         scope = selection_scope(mode_key, beat_indices)
         if ctx is not None:
-            await get_task_backend().enqueue_project_task(
-                ctx,
-                product_surface="mainline",
-                task_type="sketch_regen",
-                queue_kind="default",
-                episode=episode_num,
-                scope=scope,
-                payload={
-                    "episode": episode_num,
-                    "mode_key": mode_key,
-                    "output_dir": output_dir,
-                    "config": {**config, "mode_key": mode_key},
-                },
-            )
+            try:
+                await get_task_backend().enqueue_project_task(
+                    ctx,
+                    product_surface="mainline",
+                    task_type="sketch_regen",
+                    queue_kind="default",
+                    episode=episode_num,
+                    scope=scope,
+                    payload={
+                        "episode": episode_num,
+                        "mode_key": mode_key,
+                        "output_dir": output_dir,
+                        "config": {**config, "mode_key": mode_key},
+                    },
+                )
+            except _FANOUT_ACTIVE_LIMIT_ERRORS as exc:
+                if not dispatched_scopes:
+                    # k == 0：裸抛交 handler 渲染 429（M8 不变量 7）。
+                    raise
+                _log_partial_dispatch_rejection(exc)
+                # 只投这一次，但把未投的尾段逐条如实上报（N−k 条，M8 :722 / :755）。
+                for pending in segments[position:]:
+                    pending_beats = [int(n) for n in pending]
+                    pending_mode_key = choose_manual_sketch_mode_key(len(pending_beats))
+                    rejected.append(
+                        _task_limit_rejection(
+                            selection_scope(pending_mode_key, pending_beats), exc
+                        )
+                    )
+                break
             dispatched_scopes.append(scope)
             dispatched_segments.append(beat_indices)
             continue
@@ -4495,6 +4656,7 @@ async def generate_missing_manual_sketches(
             "dispatched": len(dispatched_segments),
             "scopes": dispatched_scopes,
             "segments": dispatched_segments,
+            "rejected": rejected,
         },
         "message": f"已启动 {len(dispatched_segments)} 组新增分镜草图生成",
     }
@@ -4631,6 +4793,7 @@ async def generate_single_video(
             prop_menu = await _runtime_prop_menu_with_global_props(store, episode_obj, beats)
             prepared = await _prepare_happyhorse_api_beat(
                 output_dir=output_dir,
+                state_dir=Path(store.state_dir),
                 episode=episode_num,
                 beat=beat,
                 next_beat=beats[beat_index + 1] if beat_index + 1 < len(beats) else None,
@@ -4677,6 +4840,7 @@ async def generate_single_video(
             prop_menu = await _runtime_prop_menu_with_global_props(store, episode_obj, beats)
             prepared = await _prepare_grok_video_api_beat(
                 output_dir=output_dir,
+                state_dir=Path(store.state_dir),
                 episode=episode_num,
                 beat=beat,
                 next_beat=beats[beat_index + 1] if beat_index + 1 < len(beats) else None,
@@ -5762,11 +5926,12 @@ async def cut_grid(
 @router.post("/projects/{project}/episodes/{episode_num}/export/zip")
 async def export_zip(project: str, episode_num: int, user: dict = Depends(get_api_user)):
     """打包指定集的所有资源为 ZIP 文件下载。"""
+    import asyncio
     import zipfile
     import tempfile
 
-    from fastapi.responses import FileResponse
     from novelvideo.export.episode_export import build_srt_content
+    from novelvideo.utils.async_ops import call_blocking, wait_for_task_completion
     from novelvideo.utils.path_resolver import PathResolver
 
     resolved = await _resolve_generation_project(project, user, required_role="viewer")
@@ -5813,21 +5978,41 @@ async def export_zip(project: str, episode_num: int, user: dict = Depends(get_ap
 
     srt_content = await build_srt_content(project_dir, episode_num, beats)
 
-    # 创建临时 ZIP 文件
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    tmp.close()
+    def build_zip_file() -> str:
+        tmp_path = ""
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+            tmp_path = tmp.name
+            tmp.close()
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_STORED) as zf:
+                for file_path, arc_name in files_to_pack:
+                    zf.write(file_path, arc_name)
+                if srt_content:
+                    zf.writestr(
+                        f"{ep_tag}.srt",
+                        srt_content,
+                        compress_type=zipfile.ZIP_DEFLATED,
+                    )
+            return tmp_path
+        except Exception:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
+            raise
 
-    with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_path, arc_name in files_to_pack:
-            zf.write(file_path, arc_name)
-        if srt_content:
-            zf.writestr(f"{ep_tag}.srt", srt_content)
-
-    return FileResponse(
-        path=tmp.name,
-        filename=f"{project_name}_{ep_tag}.zip",
-        media_type="application/zip",
-    )
+    build_task = asyncio.create_task(call_blocking(build_zip_file))
+    tmp_path, cancellation = await wait_for_task_completion(build_task)
+    if cancellation is not None:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise cancellation
+    try:
+        return _TemporaryFileResponse(
+            path=tmp_path,
+            filename=f"{project_name}_{ep_tag}.zip",
+            media_type="application/zip",
+        )
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -5904,7 +6089,10 @@ async def assign_sketch_colors(
                 prop_id = str(item.get("prop_id") or item.get("name") or "").strip()
                 if prop_id in prop_marker_colors:
                     item["marker_color"] = prop_marker_colors[prop_id]
-            await store.update_episode(episode_num, prop_menu=runtime_prop_menu)
+            # Marker colours are written back into the menu this request loaded
+            # earlier, so a whole-row write here discards whatever scene, prop
+            # or identity planning stored meanwhile.
+            await store.patch_episode(episode_num, prop_menu=runtime_prop_menu)
     except Exception:
         pass
 

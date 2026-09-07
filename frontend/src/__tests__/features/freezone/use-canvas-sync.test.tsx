@@ -22,6 +22,8 @@ import {
   queueLocalFreezoneProjection,
   removeLocalFreezoneProjection,
 } from "@/features/freezone/canvasSyncRuntime";
+import { holdCanvasAutosave } from "@/features/freezone/canvasAutosaveHold";
+import { projectionScopedId } from "@/features/freezone/projectionGraphIds";
 import { useShotMetadataStore } from "@/features/freezone/shotMetadataStore";
 import { CANVAS_NODE_TYPES } from "@/features/canvas/domain/canvasNodes";
 import { useCanvasStore } from "@/stores/canvasStore";
@@ -35,9 +37,11 @@ vi.mock("@/api/canvas", async (importOriginal) => {
   };
 });
 
+const setViewportSpy = vi.hoisted(() => vi.fn());
+
 vi.mock("@xyflow/react", () => ({
   useReactFlow: () => ({
-    setViewport: vi.fn(),
+    setViewport: setViewportSpy,
   }),
 }));
 
@@ -50,10 +54,50 @@ describe("useCanvasSync hydrate lifecycle", () => {
       saved: true,
       revision: 2,
     });
+    setViewportSpy.mockClear();
     vi.unstubAllGlobals();
     window.localStorage.clear();
     useCanvasStore.getState().setCanvasData([], []);
     useShotMetadataStore.getState().hydrate({});
+  });
+
+  // Canvas 现在跨项目常驻（_app.tsx 不再按项目重挂 freezone），所以 hydrate 必须
+  // 显式落相机 —— 新建画布存的就是 viewport: null，不落位就沿用上一张画布的坐标
+  // 和缩放，节点可能整个飘出屏幕，lowDetail 档也是错的。
+  it("resets the camera to the default when the canvas has no saved viewport", async () => {
+    vi.mocked(getFreezoneCanvas).mockResolvedValue({
+      nodes: [],
+      edges: [],
+      revision: 1,
+      viewport: null,
+    } as unknown as Awaited<ReturnType<typeof getFreezoneCanvas>>);
+
+    renderHook(() => useCanvasSync("project-a", "user_no_viewport"));
+
+    await waitFor(() => {
+      expect(setViewportSpy).toHaveBeenCalledWith(
+        { x: 0, y: 0, zoom: 1 },
+        { duration: 0 },
+      );
+    });
+  });
+
+  it("still restores a saved viewport when the canvas has one", async () => {
+    vi.mocked(getFreezoneCanvas).mockResolvedValue({
+      nodes: [],
+      edges: [],
+      revision: 1,
+      viewport: { x: 12, y: 34, zoom: 0.4 },
+    } as unknown as Awaited<ReturnType<typeof getFreezoneCanvas>>);
+
+    renderHook(() => useCanvasSync("project-a", "user_with_viewport"));
+
+    await waitFor(() => {
+      expect(setViewportSpy).toHaveBeenCalledWith(
+        { x: 12, y: 34, zoom: 0.4 },
+        { duration: 0 },
+      );
+    });
   });
 
   it("aborts the in-flight hydrate request after the release grace when unmounted", async () => {
@@ -366,7 +410,7 @@ describe("useCanvasSync hydrate lifecycle", () => {
 
   it("clears a saved projection draft when server metadata contains extra fields", async () => {
     const projectionNode = {
-      id: "projection_beat_1_4__projection_group_beat_1_4",
+      id: projectionScopedId("beat:1:4", "projection_group_beat_1_4"),
       type: "groupNode",
       position: { x: 0, y: 0 },
       data: { projection_key: "beat:1:4" },
@@ -1541,7 +1585,7 @@ describe("useCanvasSync hydrate lifecycle", () => {
     });
     expect(hook.result.current.status).toBe("ready");
     expect(useCanvasStore.getState().nodes.map((node) => node.id)).toContain(
-      "projection_beat_1_4__context_beat",
+      projectionScopedId("beat:1:4", "context_beat"),
     );
     expect(useCanvasStore.getState().userEditsSinceHydrate).toBeGreaterThan(0);
 
@@ -1688,7 +1732,7 @@ describe("useCanvasSync hydrate lifecycle", () => {
     expect(vi.mocked(putFreezoneCanvas).mock.calls[0][2].nodes).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          id: "projection_beat_1_4__projection_group_beat_1_4",
+          id: projectionScopedId("beat:1:4", "projection_group_beat_1_4"),
         }),
       ]),
     );
@@ -1699,7 +1743,7 @@ describe("useCanvasSync hydrate lifecycle", () => {
   it("does not restore a stale local draft after a projection save then refresh", async () => {
     vi.useFakeTimers();
     const projectedNode = {
-      id: "projection_beat_1_4__projection_group_beat_1_4",
+      id: projectionScopedId("beat:1:4", "projection_group_beat_1_4"),
       type: "groupNode",
       position: { x: 0, y: 0 },
       data: { projection_key: "beat:1:4" },
@@ -1805,7 +1849,7 @@ describe("useCanvasSync hydrate lifecycle", () => {
   it("does not write a local draft on browser refresh after projection save is settled", async () => {
     vi.useFakeTimers();
     const projectedNode = {
-      id: "projection_beat_1_4__projection_group_beat_1_4",
+      id: projectionScopedId("beat:1:4", "projection_group_beat_1_4"),
       type: "groupNode",
       position: { x: 0, y: 0 },
       data: { projection_key: "beat:1:4" },
@@ -1910,7 +1954,7 @@ describe("useCanvasSync hydrate lifecycle", () => {
   it("does not conflict after moving a saved projection group and refreshing", async () => {
     vi.useFakeTimers();
     const projectionNode = (x: number, y: number) => ({
-      id: "projection_beat_1_4__projection_group_beat_1_4",
+      id: projectionScopedId("beat:1:4", "projection_group_beat_1_4"),
       type: "groupNode",
       position: { x, y },
       data: { projection_key: "beat:1:4" },
@@ -1989,7 +2033,7 @@ describe("useCanvasSync hydrate lifecycle", () => {
       useCanvasStore
         .getState()
         .updateNodePosition(
-          "projection_beat_1_4__projection_group_beat_1_4",
+          projectionScopedId("beat:1:4", "projection_group_beat_1_4"),
           { x: 120, y: 80 },
         );
     });
@@ -2004,7 +2048,7 @@ describe("useCanvasSync hydrate lifecycle", () => {
       base_revision: 8,
       nodes: [
         expect.objectContaining({
-          id: "projection_beat_1_4__projection_group_beat_1_4",
+          id: projectionScopedId("beat:1:4", "projection_group_beat_1_4"),
           position: { x: 120, y: 80 },
         }),
       ],
@@ -2030,7 +2074,7 @@ describe("useCanvasSync hydrate lifecycle", () => {
     expect(second.result.current.error).toBeNull();
     expect(useCanvasStore.getState().nodes).toEqual([
       expect.objectContaining({
-        id: "projection_beat_1_4__projection_group_beat_1_4",
+        id: projectionScopedId("beat:1:4", "projection_group_beat_1_4"),
         position: { x: 120, y: 80 },
       }),
     ]);
@@ -2102,6 +2146,83 @@ describe("useCanvasSync hydrate lifecycle", () => {
     expect(vi.mocked(putFreezoneCanvas).mock.calls[0][2].metadata).toMatchObject({
       projections: {},
     });
+
+    hook.unmount();
+  });
+
+  // 跨项目粘贴：节点先带着源项目的媒体 URL 进 store，后端拷完素材才改写成目标项目
+  // 的地址。hold 期间只写草稿不发 PUT，release 后补一次保存——源项目 URL 不会先入库。
+  it("holds the content PUT while the project's autosave is held and saves once released", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getFreezoneCanvas).mockResolvedValue({
+      nodes: [],
+      edges: [],
+      revision: 3,
+    } as unknown as Awaited<ReturnType<typeof getFreezoneCanvas>>);
+
+    const hook = renderHook(() => useCanvasSync("project-a", "hold_user_eric"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const release = holdCanvasAutosave("project-a");
+    useCanvasStore
+      .getState()
+      .addNode(
+        CANVAS_NODE_TYPES.upload,
+        { x: 10, y: 10 },
+        { imageUrl: "/static/projects/project-b/freezone/_uploads/a.png" },
+      );
+    await act(async () => {
+      vi.advanceTimersByTime(800);
+      await Promise.resolve();
+    });
+    expect(putFreezoneCanvas).not.toHaveBeenCalled();
+
+    // The copy lands and the URL is rewritten before the hold is released.
+    const pastedId = useCanvasStore.getState().nodes[0].id;
+    useCanvasStore.getState().updateNodeData(pastedId, {
+      imageUrl: "/static/projects/project-a/freezone/_uploads/copied_a.png",
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(800);
+      await Promise.resolve();
+    });
+    expect(putFreezoneCanvas).not.toHaveBeenCalled();
+
+    release();
+    await act(async () => {
+      vi.advanceTimersByTime(800);
+      await Promise.resolve();
+    });
+    expect(putFreezoneCanvas).toHaveBeenCalledTimes(1);
+    const payload = JSON.stringify(vi.mocked(putFreezoneCanvas).mock.calls[0][2]);
+    expect(payload).toContain("/static/projects/project-a/freezone/_uploads/copied_a.png");
+    expect(payload).not.toContain("project-b");
+
+    hook.unmount();
+  });
+
+  it("does not save on release when nothing changed during the hold", async () => {
+    vi.useFakeTimers();
+    vi.mocked(getFreezoneCanvas).mockResolvedValue({
+      nodes: [],
+      edges: [],
+      revision: 3,
+    } as unknown as Awaited<ReturnType<typeof getFreezoneCanvas>>);
+
+    const hook = renderHook(() => useCanvasSync("project-a", "hold_idle_user_eric"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const release = holdCanvasAutosave("project-a");
+    release();
+    await act(async () => {
+      vi.advanceTimersByTime(800);
+      await Promise.resolve();
+    });
+    expect(putFreezoneCanvas).not.toHaveBeenCalled();
 
     hook.unmount();
   });

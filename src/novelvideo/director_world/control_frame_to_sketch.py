@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from novelvideo.config import OUTPUT_DIR, STATE_DIR, get_sketch_generation_config
+from novelvideo.egress_context import TrustedEgressContext
 from novelvideo.generators.nanobanana_grid import REGEN_MODE_CONFIGS, NanoBananaGridGenerator
 from novelvideo.generators.pool_indexer import save_grid_and_split
 from novelvideo.project_config import load_project_config_file
@@ -41,6 +42,26 @@ def _character_dicts(store: SQLiteStore, project_dir: Path) -> list[dict[str, An
         item["identities"] = [identity.model_dump() for identity in character.identities]
         characters.append(item)
     return characters
+
+
+def _projected_character_dicts(
+    characters: list[dict[str, Any]], project_dir: Path
+) -> list[dict[str, Any]]:
+    """Rebuild the portrait path the projection deliberately does not carry.
+
+    Portraits are files under the project directory, which the worker already
+    has; sending the path would only duplicate something derivable, and sending
+    the file would be worse.
+    """
+    rebuilt: list[dict[str, Any]] = []
+    for character in characters:
+        item = dict(character)
+        item["portrait_path"] = str(
+            project_dir / "assets" / "characters" / str(item.get("name") or "") / "portrait.png"
+        )
+        item.setdefault("identities", [])
+        rebuilt.append(item)
+    return rebuilt
 
 
 def _mode_key_for_aspect(aspect_ratio: str | None) -> str:
@@ -385,7 +406,28 @@ async def convert_control_frame_to_sketch(
     require_control_frame_path: bool = False,
     candidate_output_path: str | Path | None = None,
     promote: bool = True,
+    projection: Any = None,
+    egress_context: TrustedEgressContext | None = None,
 ) -> dict[str, Any]:
+    """把控制帧转成草图。**会出网**：下游经 NanoBananaGridGenerator 请求图像 provider。
+
+    `egress_context` 声明的是这个事实——`freezone.py:FREEZONE_LEAF_EGRESS` 判本函数
+    为 NETWORK 的依据就是它，没有它签名就在谎称「本函数不出网」。
+
+    它**不**继续往 `generate_grid` 里传：那个方法 39 个形参、没有这一项，穿进去等于
+    对整条内部链路做一次签名扫荡。也不需要——身份已由
+    `task_backend/run_core.py:695` 的 `model_gateway_scope_for_runner(envelope)` 在
+    派发处中心绑定，`nanobanana_grid.py:_call_newapi_image_api_with_egress`（`generate_grid`
+    的 newapi 分支经它出网）在显式参数为 None 时读作用域。
+
+    这条前提在 OI-52 修好之前对本路径是**假的**：`generate_grid` 当时根本不经过任何
+    闸门，组织流量在这里无 claim、无组织凭证。钉住它的是
+    `tests/test_p0g4i_freezone_leaf_classification.py`（作用域可达）与
+    `tests/test_p0g4k_grid_family_image_egress.py`（`generate_grid` 真的读了它），
+    不是默认成立。
+    """
+
+    del egress_context
     user = (user or "").strip()
     project = (project or "").strip()
     if not user or not project:
@@ -422,15 +464,31 @@ async def convert_control_frame_to_sketch(
     rows = int(cfg.get("rows") or 1)
     cols = int(cfg.get("cols") or 1)
 
-    store = SQLiteStore(
-        project_name,
-        output_dir=str(project_dir),
-        state_dir=str(state_project_dir),
-    )
+    store = None
+    if projection is None:
+        store = SQLiteStore(
+            project_name,
+            output_dir=str(project_dir),
+            state_dir=str(state_project_dir),
+        )
     try:
-        await store.initialize()
-        await store.load_graph_state()
-        script = await store.get_script_as_dict(episode)
+        if store is not None:
+            await store.initialize()
+            await store.load_graph_state()
+            script = await store.get_script_as_dict(episode)
+        else:
+            # Everything below reads from the task payload. There is no third
+            # branch: a projection that promised a field and did not send it
+            # raises, because falling back here would make the omission
+            # permanently invisible.
+            script = {
+                "beats": projection.require("beats"),
+                "sketch_colors": projection.require("sketch_colors"),
+                # Added after the first version of the envelope, so read with
+                # .get() -- an older producer simply does not send them.
+                "scene_menu": projection.get("scene_menu") or [],
+                "prop_menu": projection.get("prop_menu") or [],
+            }
         if not script or not script.get("beats"):
             raise ValueError(f"episode {episode} has no beats")
 
@@ -445,7 +503,11 @@ async def convert_control_frame_to_sketch(
         frame_meta_raw = _load_json(frame_meta_path)
         frame_meta = frame_meta_raw if isinstance(frame_meta_raw, dict) else {}
 
-        sketch_colors = dict(script.get("sketch_colors") or store.get_sketch_colors(episode) or {})
+        sketch_colors = dict(
+            script.get("sketch_colors")
+            or (store.get_sketch_colors(episode) if store is not None else {})
+            or {}
+        )
         if not sketch_colors:
             raise ValueError("missing sketch_colors; assign sketch colors before conversion")
         # Do not color-correct the screenshot here. Marker identity/color must be
@@ -453,9 +515,17 @@ async def convert_control_frame_to_sketch(
         # conversion only turns the current control frame into a sketch.
         director_ref = control_frame
 
-        style_config = load_project_config_file(user, project)
-        style = style_config.get("visual_style", "chinese_period_drama")
-        characters = _character_dicts(store, project_dir)
+        if store is not None:
+            style_config = load_project_config_file(user, project)
+            style = style_config.get("visual_style", "chinese_period_drama")
+            characters = _character_dicts(store, project_dir)
+            projected_image_selection = style_config.get("sketch_image_selection")
+        else:
+            style = projection.require("visual_style")
+            characters = _projected_character_dicts(
+                projection.require("characters"), project_dir
+            )
+            projected_image_selection = projection.require("sketch_image_selection")
         character_map = build_character_map_for_grid(
             beats_all,
             characters,
@@ -474,9 +544,9 @@ async def convert_control_frame_to_sketch(
         scene_menu = list(script.get("scene_menu") or [])
         prop_menu = list(script.get("prop_menu") or [])
 
-        director_selection = os.environ.get(
-            "DIRECTOR_CONTROL_SKETCH_IMAGE_SELECTION"
-        ) or style_config.get("sketch_image_selection")
+        director_selection = (
+            os.environ.get("DIRECTOR_CONTROL_SKETCH_IMAGE_SELECTION") or projected_image_selection
+        )
         generator_config = get_sketch_generation_config(
             selection_override=director_selection,
         )
@@ -596,7 +666,8 @@ async def convert_control_frame_to_sketch(
             "generation_time": result.generation_time,
         }
     finally:
-        await store.close()
+        if store is not None:
+            await store.close()
 
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:

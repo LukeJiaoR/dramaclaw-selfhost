@@ -31,17 +31,22 @@ import { Handle, Position, useStore, type NodeProps } from '@xyflow/react';
 import {
   LOD_SHELL_EXEMPT_TYPES,
   isCanvasGestureActive,
+  isCanvasHydrateBurstActive,
   isLowDetailZoom,
   isNodeMediaActive,
   requestShellUpgrade,
 } from '@/features/canvas/application/canvasLod';
 import { useCanvasStore } from '@/stores/canvasStore';
+import { ReferencePickNodeOverlay } from '@/features/canvas/ui/ReferencePickNodeOverlay';
+import { AssetMigrationNodeOverlay } from '@/features/canvas/ui/AssetMigrationNodeOverlay';
 import {
   getLodStill,
   requestLodStill,
   subscribeLodStills,
 } from '@/features/canvas/application/videoFrameCapture';
 import { resolveImageDisplayUrl } from '@/features/canvas/application/imageData';
+import { useNodeBodyVariant } from '@/features/canvas/hooks/useNodeBodyVariantBudget';
+import { withMediaVariant, type MediaVariant } from '@/lib/media-url';
 import {
   nodeHasSourceHandle,
   nodeHasTargetHandle,
@@ -53,7 +58,9 @@ import type { CanvasNodeType } from '@/features/canvas/domain/canvasNodes';
  * 与各组件的 DEFAULT_WIDTH/HEIGHT 对齐；只影响首帧盒子大小，放大跨档后完整组件
  * 渲染会触发 ResizeObserver 重测自动纠正。
  */
-const SHELL_FALLBACK_SIZES: Partial<Record<string, { width: number; height: number }>> = {
+// 导出只为让测试上棘轮：新增节点类型要么在这里登记尺寸，要么进 LOD 豁免名单，
+// 漏了就会拿 400×300 的通用兜底，首屏低缩放下盒子明显不对。
+export const SHELL_FALLBACK_SIZES: Partial<Record<string, { width: number; height: number }>> = {
   uploadNode: { width: 320, height: 350 },
   imageNode: { width: 580, height: 360 },
   imageGenNode: { width: 580, height: 360 },
@@ -68,6 +75,7 @@ const SHELL_FALLBACK_SIZES: Partial<Record<string, { width: number; height: numb
   threeDWorldNode: { width: 340, height: 210 },
   storyboardNode: { width: 800, height: 600 },
   storyboardGenNode: { width: 800, height: 600 },
+  styleNode: { width: 220, height: 124 },
 };
 
 const DEFAULT_SHELL_SIZE = { width: 400, height: 300 };
@@ -81,10 +89,31 @@ type ShellData = {
   isUploading?: boolean;
 };
 
-/** 每种类型能当缩略图用的字段（回落顺序与各组件的展示逻辑一致）。 */
-function resolveShellImage(type: string, data: ShellData): string | null {
+/**
+ * shell 里的图喂哪一档变体，按这一格实际要多少设备像素来挑。
+ *
+ * shell 只在 zoom < 0.35 出现，此时最宽的节点（900px）也只占屏幕 315 CSS px，
+ * 常见的 imageNode 更是 203 px；而这一档恰恰是节点最多的时候——一屏几十上百
+ * 个。解码成本只看源图像素数，所以原图在这里是纯浪费：一张 5504x3072 要付
+ * 16.9MP，换成 320px 变体是 0.06MP。
+ *
+ * 前端只请求生产会预热的 320px thumb。超过预算的节点主体会使用原图；LOD shell
+ * 仍固定回落 thumb，因为它只在低缩放、大量节点同时出现时使用，避免同时解码几十
+ * 上百张完整原图。
+ *
+ * 变体不适用时（blob: 预览、遗留路径、抓帧 data:）withMediaVariant 原样返回，
+ * 行为与改动前一致。shell 不接 onLoad、不测尺寸、不进查看器/导出，所以这里
+ * 没有节点主体那套「先知道真实尺寸才能换」的顾虑。
+ */
+function resolveShellImage(
+  type: string,
+  data: ShellData,
+  variant: MediaVariant,
+): string | null {
   const pick = (...candidates: Array<string | null | undefined>) => {
-    for (const c of candidates) if (c) return resolveImageDisplayUrl(c);
+    for (const c of candidates) {
+      if (c) return withMediaVariant(resolveImageDisplayUrl(c), variant);
+    }
     return null;
   };
   switch (type) {
@@ -113,6 +142,8 @@ function LodShell({ type, id, data, selected, width, height }: {
   const fallback = SHELL_FALLBACK_SIZES[type] ?? DEFAULT_SHELL_SIZE;
   const w = width ?? fallback.width;
   const h = height ?? fallback.height;
+  // 一格盖不住时也继续喂 thumb：shell 的整个前提就是节点太多、不能同时解原图。
+  const variant = useNodeBodyVariant({ width: w, height: h }) ?? 'thumb';
 
   // 视频缩略图：订阅模块级抓帧缓存；节点从未挂载过完整组件时（首屏即低缩放），
   // 这里负责把抓帧任务排进空闲队列，不依赖完整组件出现过。
@@ -127,8 +158,11 @@ function LodShell({ type, id, data, selected, width, height }: {
 
   const imageSrc =
     type === 'videoNode'
-      ? (lodStill ?? (data.previewImageUrl ? resolveImageDisplayUrl(data.previewImageUrl) : null))
-      : resolveShellImage(type, data);
+      ? (lodStill
+          ?? (data.previewImageUrl
+            ? withMediaVariant(resolveImageDisplayUrl(data.previewImageUrl), variant)
+            : null))
+      : resolveShellImage(type, data, variant);
 
   const busy = Boolean(data.isGenerating || data.isUploading);
 
@@ -191,12 +225,16 @@ export function withLodShell(
     //   - 手势进行中新挂载的节点（视口裁剪把它换进来的）从 shell 起步，避免
     //     快速平移时每秒几十次完整挂载造成的稳态掉帧尖刺；
     //   - 缩放升档时视口内的所有 shell 分批升级，摊平原先单次提交的长帧。
+    //   - 换画布 hydrate 首帧挂载的节点（见 canvasLod 的 hydrate burst）：几百个
+    //     节点同一次提交挂完是切画布卡顿的主要来源，先出 shell 再分批补齐。
     // 反方向（完整 → shell）立即生效：降档必须与裁剪开关同一提交（见 Canvas
     // 的 applyLowDetailClass 注释），且换成 shell 本身就便宜。
     const [heldShell, setHeldShell] = useState(
       () =>
         wantShell ||
-        (!exempt && !isActiveSelection && isCanvasGestureActive())
+        (!exempt &&
+          !isActiveSelection &&
+          (isCanvasGestureActive() || isCanvasHydrateBurstActive()))
     );
     if (wantShell && !heldShell) {
       // render 阶段同组件 setState 是 React 认可的「派生状态」写法，立即重渲染。
@@ -208,19 +246,32 @@ export function withLodShell(
       return requestShellUpgrade(() => setHeldShell(false));
     }, [heldShell, wantShell]);
 
+    // 跨项目粘贴的素材占位遮罩、参考拾取遮罩都挂在每个节点上（shell 档也要有）：
+    // `.react-flow__node` 本身是定位元素，遮罩用 inset-0 就精确贴合这个节点的盒子，
+    // 不必在画布层重算 positionAbsolute × zoom。不在拾取态时它渲染 null。
     if (heldShell) {
       return (
-        <LodShell
-          type={type}
-          id={props.id}
-          data={props.data as ShellData}
-          selected={props.selected}
-          width={props.width}
-          height={props.height}
-        />
+        <>
+          <LodShell
+            type={type}
+            id={props.id}
+            data={props.data as ShellData}
+            selected={props.selected}
+            width={props.width}
+            height={props.height}
+          />
+          <AssetMigrationNodeOverlay nodeId={props.id} data={props.data} />
+          <ReferencePickNodeOverlay nodeId={props.id} />
+        </>
       );
     }
-    return <Component {...props} />;
+    return (
+      <>
+        <Component {...props} />
+        <AssetMigrationNodeOverlay nodeId={props.id} data={props.data} />
+        <ReferencePickNodeOverlay nodeId={props.id} />
+      </>
+    );
   };
   Wrapped.displayName = `withLodShell(${type})`;
   return memo(Wrapped);

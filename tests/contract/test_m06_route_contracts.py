@@ -8,7 +8,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from novelvideo.graph_preview import delete_graph_preview, write_graph_preview
+from novelvideo.graph_preview import (
+    delete_graph_preview,
+    load_graph_preview,
+    write_graph_preview,
+)
 from novelvideo.models import CharacterIdentity, NovelCharacter, NovelEpisode, NovelProp, NovelScene
 from novelvideo.project_context import ProjectContext
 
@@ -30,7 +34,9 @@ def _png_bytes() -> bytes:
     from PIL import Image
 
     buf = io.BytesIO()
-    Image.new("RGB", (4, 4), color=(90, 120, 150)).save(buf, format="PNG")
+    # 占位图要满足厂商真实约束（Seedance 参考图边长 >= 300px），否则入队前的
+    # 尺寸校验会先于本测试关心的响应形状把请求 400 掉。
+    Image.new("RGB", (320, 320), color=(90, 120, 150)).save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -224,6 +230,8 @@ def m06_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from novelvideo.api.deps import ProjectResolution
     from novelvideo.api.routes import freezone, ingest
     from novelvideo.freezone.paths import uploads_dir
+    from novelvideo.project_config import set_narrator_reference_audio_in_state_dir
+    from novelvideo.seedance2_i2v.voice_clone import file_sha256
     from novelvideo.utils.path_resolver import (
         canonical_beat_director_env_only_path,
         canonical_beat_selected_background_path,
@@ -247,6 +255,13 @@ def m06_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     mask_image = _write_png(uploads_dir(project_dir) / "mask.png")
     video_file = _write_media(uploads_dir(project_dir) / "clip.mp4", b"video")
     audio_file = _write_media(uploads_dir(project_dir) / "voice.mp3", b"audio")
+    store.project_dir = str(project_dir)
+    store.state_dir = str(state_dir)
+    set_narrator_reference_audio_in_state_dir(
+        state_dir,
+        relative_path=audio_file.relative_to(project_dir).as_posix(),
+        sha256=file_sha256(audio_file),
+    )
     scene_master = _write_png(canonical_scene_master_path(project_dir, _SCENE))
     scene_reverse = _write_png(canonical_scene_reverse_master_path(project_dir, _SCENE))
     selected_background = _write_png(canonical_beat_selected_background_path(project_dir, 1, 1))
@@ -292,7 +307,7 @@ def m06_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         assert project_id == _PROJECT
         return ctx
 
-    async def make_store_for_context(_ctx):
+    async def make_store_for_context(_ctx, **_kwargs):
         return store
 
     async def beat_for_capture(*_args, **_kwargs):
@@ -465,17 +480,11 @@ def test_m06_ingest_ignores_stale_graph_preview_without_success_marker(
     m06_client_factory,
     monkeypatch,
 ):
-    from novelvideo.api.routes import ingest
 
     client, _backend, _task_manager, project_dir, _assets, _store = m06_client_factory(
         "inline"
     )
     (project_dir / "novel.txt").unlink()
-
-    async def fail_if_opened(_ctx):
-        raise AssertionError("an incomplete import must not open Cognee")
-
-    monkeypatch.setattr(ingest, "make_cognee_store_for_context", fail_if_opened)
 
     response = client.get(f"/api/v1/projects/{_PROJECT}/ingest/graph")
     payload = _assert_ok(response)
@@ -484,10 +493,18 @@ def test_m06_ingest_ignores_stale_graph_preview_without_success_marker(
     assert payload["data"]["total_edges"] == 0
 
 
-def test_m06_legacy_graph_is_materialized_once(
+def test_m06_a_missing_graph_preview_reads_as_empty(
     m06_client_factory,
     monkeypatch,
 ):
+    """A project without the sidecar gets no preview, and nothing is built.
+
+    Backfilling on read meant a viewer-role GET opening Ladybug from an API
+    worker and waiting on the project graph lock with no timeout — during a
+    rebuild, for the length of the rebuild, and then returning the empty
+    preview anyway because the rebuild had removed novel.txt. Nothing
+    downstream reads this file; it is one picture on the import page.
+    """
     from novelvideo.api.routes import ingest
 
     client, _backend, _task_manager, project_dir, assets, _store = m06_client_factory(
@@ -495,29 +512,32 @@ def test_m06_legacy_graph_is_materialized_once(
     )
     delete_graph_preview(assets.ctx.state_dir)
     (project_dir / "novel.txt").write_text("已导入小说", encoding="utf-8")
-    calls: list[str] = []
 
-    class LegacyStore:
-        async def materialize_graph_preview(self):
-            calls.append("materialize")
-            snapshot = _graph_snapshot_payload()
-            write_graph_preview(assets.ctx.state_dir, snapshot)
-            return snapshot
+    assert not hasattr(ingest, "make_cognee_store_for_context"), (
+        "the graph route must not be able to construct a Cognee store"
+    )
 
-        async def close(self):
-            calls.append("close")
+    payload = _assert_ok(client.get(f"/api/v1/projects/{_PROJECT}/ingest/graph"))
 
-    async def make_legacy_store(_ctx):
-        return LegacyStore()
+    assert payload["data"]["total_nodes"] == 0
+    assert payload["data"]["total_edges"] == 0
+    # Still absent afterwards: the read is a read.
+    assert load_graph_preview(assets.ctx.state_dir) is None
 
-    monkeypatch.setattr(ingest, "make_cognee_store_for_context", make_legacy_store)
 
-    first = client.get(f"/api/v1/projects/{_PROJECT}/ingest/graph")
-    second = client.get(f"/api/v1/projects/{_PROJECT}/ingest/graph")
+def test_m06_a_written_graph_preview_is_served_from_the_sidecar(
+    m06_client_factory,
+):
+    """The normal path: import writes it, reads never open the graph."""
+    client, _backend, _task_manager, project_dir, assets, _store = m06_client_factory(
+        "inline"
+    )
+    (project_dir / "novel.txt").write_text("已导入小说", encoding="utf-8")
+    write_graph_preview(assets.ctx.state_dir, _graph_snapshot_payload())
 
-    assert _assert_ok(first)["data"]["total_nodes"] == 2
-    assert _assert_ok(second)["data"]["total_nodes"] == 2
-    assert calls == ["materialize", "close"]
+    payload = _assert_ok(client.get(f"/api/v1/projects/{_PROJECT}/ingest/graph"))
+
+    assert payload["data"]["total_nodes"] == 2
 
 
 @pytest.mark.parametrize("backend", ["inline", "celery"])

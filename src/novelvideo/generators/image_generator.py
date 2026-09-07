@@ -25,7 +25,10 @@ from novelvideo.config import (
     normalize_character_image_selection,
 )
 from novelvideo.ports import get_usage_meter
-from novelvideo.shared.billing_errors import is_insufficient_credits_error
+from novelvideo.shared.billing_errors import (
+    is_fatal_billing_error,
+    is_insufficient_credits_error,
+)
 
 
 def _provider_request_id_from_response(response: httpx.Response, result: dict[str, Any]) -> str:
@@ -59,8 +62,6 @@ async def _refund_image_model_call(
     source: str,
     error: str,
 ) -> None:
-    if not reservation_id:
-        return
     try:
         await get_usage_meter().refund_model_call_credit_reservation(
             reservation_id,
@@ -276,6 +277,7 @@ class VolcengineImageGenerator:
         project_dir: str = "",
         reference_image: Optional[str] = None,
         reference_strength: float = 0.7,  # 参考行业最佳实践 70-85%
+        egress_context=None,
     ) -> ImageGenResult:
         """生成图像。
 
@@ -292,6 +294,21 @@ class VolcengineImageGenerator:
         Returns:
             生成结果
         """
+        if egress_context is None:
+            from novelvideo.egress_context import (
+                ambient_organization_egress_context,
+            )
+
+            egress_context = ambient_organization_egress_context()
+        if egress_context is not None:
+            from novelvideo.egress_context import TrustedEgressContext
+            from novelvideo.ports.egress import EgressError
+
+            if type(egress_context) is not TrustedEgressContext:
+                raise TypeError("egress_context must be a TrustedEgressContext")
+            if egress_context.is_organization:
+                raise EgressError("ORG_EGRESS_DENIED")
+
         start_time = time.time()
 
         params = ImageGenParams(
@@ -327,7 +344,7 @@ class VolcengineImageGenerator:
             )
 
         except Exception as e:
-            if is_insufficient_credits_error(e):
+            if is_fatal_billing_error(e):
                 raise
             return ImageGenResult(
                 success=False,
@@ -649,7 +666,7 @@ class VolcengineImageGenerator:
                 source="seedream_image_request_api",
                 error=str(e),
             )
-            if is_insufficient_credits_error(e):
+            if is_fatal_billing_error(e):
                 raise
             return ImageGenResult(
                 success=False,
@@ -803,7 +820,7 @@ class VolcengineImageGenerator:
                 source="seedream_upscale_api",
                 error=str(e),
             )
-            if is_insufficient_credits_error(e):
+            if is_fatal_billing_error(e):
                 raise
             return ImageGenResult(
                 success=False,
@@ -942,7 +959,7 @@ class VolcengineImageGenerator:
                 source="seededit_image_api",
                 error=str(e),
             )
-            if is_insufficient_credits_error(e):
+            if is_fatal_billing_error(e):
                 raise
             return ImageGenResult(
                 success=False,
@@ -958,6 +975,7 @@ class VolcengineImageGenerator:
         count: int = 3,
         style: str = None,
         project_dir: str = "",
+        state_dir: str = "",
     ) -> list[str]:
         """生成角色参考图。
 
@@ -976,7 +994,11 @@ class VolcengineImageGenerator:
         os.makedirs(output_dir, exist_ok=True)
 
         style = style or self.default_style
-        style_preset = get_style_preset(style, project_dir=project_dir)
+        style_preset = get_style_preset(
+            style,
+            project_dir=project_dir,
+            state_dir=state_dir or None,
+        )
         style_keywords = style_preset.get("style_instructions", "")
         negative_prompt = style_preset.get("avoid_instructions", "")
 
@@ -1136,10 +1158,12 @@ async def generate_character_reference_unified(
     prompt_only: bool = False,  # Dry Run 模式：只生成提示词，不调用 API
     model: str = None,  # 模型选择：nanobanana 或 seedream，默认从配置读取
     project_dir: str = "",  # 项目根目录，用于定位 prompts 目录
+    state_dir: str = "",  # 项目状态目录，用于读取 scoped project config
     usage_task_type: str = "character_portrait",
     usage_scope: str = "",
     identity_name: str = "",
     raise_on_error: bool = False,
+    egress_context=None,
 ) -> list[str]:
     """统一的角色参考图生成接口。
 
@@ -1162,6 +1186,15 @@ async def generate_character_reference_unified(
     Returns:
         生成的图片路径列表
     """
+    if egress_context is not None:
+        from novelvideo.egress_context import TrustedEgressContext
+        from novelvideo.ports.egress import EgressError
+
+        if type(egress_context) is not TrustedEgressContext:
+            raise TypeError("egress_context must be a TrustedEgressContext")
+        if egress_context.is_organization and model == "seedream":
+            raise EgressError("ORG_EGRESS_DENIED")
+
     # model 参数优先，否则从配置读取；支持旧值 nanobanana/seedream 和统一 selection key。
     model = normalize_character_image_selection(model or get_character_image_selection())
 
@@ -1180,7 +1213,7 @@ async def generate_character_reference_unified(
         try:
             from novelvideo.generators.nanobanana_character import NanoBananaCharacterGenerator
 
-            generator = NanoBananaCharacterGenerator()
+            generator = NanoBananaCharacterGenerator(egress_context=egress_context)
 
             result = await generator.generate_character_portrait(
                 character_name=character_name,
@@ -1191,6 +1224,7 @@ async def generate_character_reference_unified(
                 ethnicity=ethnicity,
                 prompt_only=prompt_only,
                 project_dir=project_dir,
+                state_dir=state_dir,
                 usage_task_type=usage_task_type,
                 usage_scope=usage_scope,
                 identity_name=identity_name,
@@ -1216,7 +1250,10 @@ async def generate_character_reference_unified(
         try:
             from novelvideo.generators.nanobanana_character import NanoBananaCharacterGenerator
 
-            generator = NanoBananaCharacterGenerator(selection=model)
+            generator = NanoBananaCharacterGenerator(
+                selection=model,
+                egress_context=egress_context,
+            )
 
             result = await generator.generate_character_portrait(
                 character_name=character_name,
@@ -1227,6 +1264,7 @@ async def generate_character_reference_unified(
                 ethnicity=ethnicity,
                 prompt_only=prompt_only,
                 project_dir=project_dir,
+                state_dir=state_dir,
                 usage_task_type=usage_task_type,
                 usage_scope=usage_scope,
                 identity_name=identity_name,
@@ -1258,6 +1296,7 @@ async def generate_character_reference_unified(
                 count=count,
                 style=style,
                 project_dir=project_dir,
+                state_dir=state_dir,
             )
         except ValueError as e:
             print(f"[Character] Seedream 配置错误: {e}，使用 Mock")
@@ -1294,11 +1333,13 @@ async def generate_identity_image_unified(
     dry_run: bool = False,
     model: str = None,  # 模型选择：nanobanana 或 seedream，默认从配置读取
     project_dir: str = "",  # 项目根目录，用于定位 prompts 目录
+    state_dir: str = "",  # 项目状态目录，用于读取 scoped project config
     costume_image_path: str = "",  # 服装参考图路径
     usage_task_type: str = "identity_image",
     usage_scope: str = "",
     identity_name: str = "",
     raise_on_error: bool = False,
+    egress_context=None,
 ) -> dict:
     """基于角色基准图生成身份参考图（Identity Locking）。
 
@@ -1320,6 +1361,15 @@ async def generate_identity_image_unified(
         dict: {"success": bool, "prompt": str, "prompt_file": str} (dry_run 模式返回 prompt)
               或 bool (兼容旧代码)
     """
+    if egress_context is not None:
+        from novelvideo.egress_context import TrustedEgressContext
+        from novelvideo.ports.egress import EgressError
+
+        if type(egress_context) is not TrustedEgressContext:
+            raise TypeError("egress_context must be a TrustedEgressContext")
+        if egress_context.is_organization and model == "seedream":
+            raise EgressError("ORG_EGRESS_DENIED")
+
     # model 参数优先，否则从配置读取；支持旧值 nanobanana/seedream 和统一 selection key。
     model = normalize_character_image_selection(model or get_character_image_selection())
 
@@ -1327,7 +1377,7 @@ async def generate_identity_image_unified(
         try:
             from novelvideo.generators.nanobanana_character import NanoBananaCharacterGenerator
 
-            generator = NanoBananaCharacterGenerator()
+            generator = NanoBananaCharacterGenerator(egress_context=egress_context)
             result = await generator.generate_identity_with_reference(
                 character_name=character_name,
                 identity_prompt=identity_prompt,
@@ -1338,6 +1388,7 @@ async def generate_identity_image_unified(
                 style=style,
                 dry_run=dry_run,
                 project_dir=project_dir,
+                state_dir=state_dir,
                 costume_image_path=costume_image_path,
                 usage_task_type=usage_task_type,
                 usage_scope=usage_scope,
@@ -1367,7 +1418,10 @@ async def generate_identity_image_unified(
         try:
             from novelvideo.generators.nanobanana_character import NanoBananaCharacterGenerator
 
-            generator = NanoBananaCharacterGenerator(selection=model)
+            generator = NanoBananaCharacterGenerator(
+                selection=model,
+                egress_context=egress_context,
+            )
             result = await generator.generate_identity_with_reference(
                 character_name=character_name,
                 identity_prompt=identity_prompt,
@@ -1378,6 +1432,7 @@ async def generate_identity_image_unified(
                 style=style,
                 dry_run=dry_run,
                 project_dir=project_dir,
+                state_dir=state_dir,
                 costume_image_path=costume_image_path,
                 usage_task_type=usage_task_type,
                 usage_scope=usage_scope,
@@ -1415,9 +1470,11 @@ async def generate_identity_image_unified(
         style=style,
         model=model,
         project_dir=project_dir,
+        state_dir=state_dir,
         usage_task_type=usage_task_type,
         usage_scope=usage_scope,
         identity_name=identity_name,
+        egress_context=egress_context,
     )
     if paths:
         import shutil

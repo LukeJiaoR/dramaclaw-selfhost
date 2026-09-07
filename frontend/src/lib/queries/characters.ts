@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Elastic-2.0
 // Copyright (c) 2026 ClaymoreLab
 import { useMemo } from "react";
-import {
-  useQueries,
-  useQuery,
-  useMutation,
-  useQueryClient,
-} from "@tanstack/react-query";
-import type { QueryFunctionContext } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { jsonWithBackendError } from "@/lib/api-errors";
-import { api } from "@/lib/api";
+import { api, uploadApi } from "@/lib/api";
 import { p } from "@/lib/api-path";
 import { queryKeys } from "@/lib/query-keys";
+import { invalidateAssetReferences } from "@/lib/queries/asset-references";
 import type { ErrorResponse, OkResponse, TaskResponse } from "@/types/api";
 import type {
   Character,
@@ -30,14 +25,40 @@ export type CharacterUpdateResponse = {
   renamed_from?: string;
 };
 
-export function useCharacters(project: string) {
+export function useCharacters(project: string, enabled = true) {
   return useQuery({
     queryKey: queryKeys.characters(project),
     queryFn: ({ signal }) =>
       api
-        .get(p`api/v1/projects/${project}/characters`, { signal })
+        .get(p`api/v1/projects/${project}/characters`, {
+          signal,
+          searchParams: { summary: "true" },
+        })
         .json<OkResponse<Character[]>>(),
-    enabled: !!project,
+    enabled: enabled && !!project,
+  });
+}
+
+/** Full filesystem-derived state for only the character currently being edited. */
+export function useCharacterDetails(
+  project: string,
+  name: string | null,
+  enabled = true,
+) {
+  const characterName = name?.trim() ?? "";
+  return useQuery({
+    queryKey: queryKeys.characterDetails(project, characterName),
+    queryFn: ({ signal }) =>
+      api
+        .get(p`api/v1/projects/${project}/characters`, {
+          signal,
+          searchParams: {
+            summary: "false",
+            names: characterName,
+          },
+        })
+        .json<OkResponse<Character[]>>(),
+    enabled: enabled && !!project && !!characterName,
   });
 }
 
@@ -69,7 +90,18 @@ export function useUpdateCharacter(project: string, name: string) {
       api
         .patch(p`api/v1/projects/${project}/characters/${name}`, { json: data })
         .json<OkResponse<CharacterUpdateResponse>>(),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.characters(project) }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: queryKeys.characters(project) });
+      // 改名走 _cascade_character_rename，它 UPDATE beats 的
+      // detected_identities_json 和 visual_description——也就是反向引用索引的两个
+      // 来源。资产引用有自己的 project 级 key，characters 的失效碰不到它，卡片会
+      // 拿着旧 identity id 的计数继续显示。episodes 前缀顺带覆盖 beats，那些行确
+      // 实被重写了。后端用 renamed_from 明确告诉我们级联跑没跑，就按它判。
+      if (res.data?.renamed_from) {
+        invalidateAssetReferences(qc, project);
+        qc.invalidateQueries({ queryKey: queryKeys.episodes(project) });
+      }
+    },
   });
 }
 
@@ -153,7 +185,7 @@ export function useUploadPortrait(project: string, name: string) {
     mutationFn: async (file: File) => {
       const formData = new FormData();
       formData.append("file", file);
-      return api
+      return uploadApi
         .post(p`api/v1/projects/${project}/characters/${name}/portrait/upload`, { body: formData })
         .json<OkResponse<{ portrait_url: string }>>();
     },
@@ -297,7 +329,7 @@ export function useUploadCharacterVoiceSample(project: string, name: string) {
     mutationFn: async ({ slot, file }: { slot: string; file: File }) => {
       const formData = new FormData();
       formData.append("file", file, file.name);
-      return api
+      return uploadApi
         .post(
           p`api/v1/projects/${project}/characters/${name}/voice-samples/${slot}/upload`,
           { body: formData },
@@ -426,58 +458,64 @@ export function useCharacterIdentities(project: string, name: string) {
 }
 
 /**
- * Maps `identity_id` → owning character name by fanning out the per-character
- * identity lists. Used to resolve a `?type=identity&id=` deep link to the
- * character that owns it (the identity list is otherwise lazy-loaded per
- * selected character). React Query dedupes these with the per-card fetches.
+ * Maps `identity_id` → owning character name, to resolve a `?type=identity&id=`
+ * deep link to the character that owns it.
+ *
+ * Built from `identity_ids` on the character list — one request, the same one
+ * the page already makes. This used to fan out `/characters/{name}/identities`
+ * for every character in the project, unconditionally on mount: a project with
+ * 100 characters fired 100 requests on every visit to the assets page, whether
+ * or not a deep link was present, to build a lookup table that is usually never
+ * read. Identity *details* are still lazy per selected character; only the ids
+ * ride along with the list.
  */
-export function useIdentityOwnerIndex(project: string) {
-  const charactersRes = useQuery({
-    queryKey: queryKeys.characters(project),
-    queryFn: ({ signal }) =>
-      api
-        .get(p`api/v1/projects/${project}/characters`, { signal })
-        .json<OkResponse<Character[]>>(),
-    enabled: !!project,
-  });
+export function useIdentityOwnerIndex(project: string, enabled = true) {
+  const charactersRes = useCharacters(project, enabled);
 
-  const names = useMemo(
-    () => (charactersRes.data?.data ?? []).map((c) => c.name),
-    [charactersRes.data?.data],
-  );
-
-  const identityQueries = useQueries({
-    queries: names.map((name) => ({
-      queryKey: queryKeys.identities(project, name),
-      queryFn: ({ signal }: QueryFunctionContext) =>
-        api
-          .get(p`api/v1/projects/${project}/characters/${name}/identities`, {
-            signal,
-          })
-          .json<OkResponse<Identity[]>>(),
-      enabled: !!project && !!name,
-    })),
-  });
-
-  const dataSignature = identityQueries.map((q) => q.dataUpdatedAt).join(",");
-  const identitiesByCharacter = identityQueries.map((q) => q.data?.data);
+  const characters = charactersRes.data?.data;
 
   const ownerById = useMemo(() => {
     const acc = new Map<string, string>();
-    identitiesByCharacter.forEach((identities, i) => {
-      const name = names[i];
-      if (!identities) return;
-      for (const identity of identities) {
-        acc.set(identity.identity_id, name);
+    for (const character of characters ?? []) {
+      for (const identityId of character.identity_ids ?? []) {
+        acc.set(identityId, character.name);
       }
-    });
+    }
     return acc;
-  }, [names, dataSignature]);
+  }, [characters]);
 
   return {
     ownerOf: (identityId: string) => ownerById.get(identityId) ?? null,
-    isLoading: charactersRes.isLoading || identityQueries.some((q) => q.isLoading),
+    isLoading: charactersRes.isLoading,
   };
+}
+
+/**
+ * Identity create/delete changes which ids a character owns, and that set is
+ * also projected into the character list payload as `identity_ids` — which is
+ * what `useIdentityOwnerIndex` resolves `?type=identity&id=` deep links
+ * against. Invalidating only the identities key leaves that map holding a set
+ * that no longer matches, so a link to a just-created identity resolves to no
+ * owner while the page stays mounted.
+ *
+ * Rename counts as a membership change too, even though it neither adds nor
+ * removes an entry. `identity_id` is a derived key, not a stable handle:
+ * `update_character_identity` rebuilds it as `${char.name}_${new_iname}`
+ * whenever `identity_name` is in the payload. The old id therefore stops
+ * existing and the list's `identity_ids` still names it, so a deep link to the
+ * new id resolves to no owner until the page remounts.
+ *
+ * Edits that genuinely leave the id alone (appearance, face prompt, age, body
+ * type, image generation) do not come through here — refetching the character
+ * list for those would be waste.
+ */
+function invalidateIdentityMembership(
+  qc: ReturnType<typeof useQueryClient>,
+  project: string,
+  name: string,
+): void {
+  qc.invalidateQueries({ queryKey: queryKeys.identities(project, name) });
+  qc.invalidateQueries({ queryKey: queryKeys.characters(project) });
 }
 
 export function useCreateIdentity(project: string, name: string) {
@@ -485,7 +523,7 @@ export function useCreateIdentity(project: string, name: string) {
   return useMutation({
     mutationFn: (data: { identity_name: string; age_group?: string; appearance_details?: string }) =>
       api.post(p`api/v1/projects/${project}/characters/${name}/identities`, { json: data }).json<OkResponse<Identity>>(),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.identities(project, name) }),
+    onSuccess: () => invalidateIdentityMembership(qc, project, name),
   });
 }
 
@@ -506,7 +544,16 @@ export function useUpdateIdentity(project: string, name: string) {
       };
     }) =>
       api.patch(p`api/v1/projects/${project}/characters/${name}/identities/${identityId}`, { json: data }).json<OkResponse<Identity>>(),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.identities(project, name) }),
+    onSuccess: (_res, { data }) => {
+      // A rename rewrites identity_id, so the character list's identity_ids
+      // goes stale with it. Anything else edits in place and the list is
+      // already correct.
+      if (data.identity_name !== undefined) {
+        invalidateIdentityMembership(qc, project, name);
+        return;
+      }
+      qc.invalidateQueries({ queryKey: queryKeys.identities(project, name) });
+    },
   });
 }
 
@@ -515,7 +562,7 @@ export function useDeleteIdentity(project: string, name: string) {
   return useMutation({
     mutationFn: (identityId: string) =>
       api.delete(p`api/v1/projects/${project}/characters/${name}/identities/${identityId}`).json<OkResponse<unknown>>(),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.identities(project, name) }),
+    onSuccess: () => invalidateIdentityMembership(qc, project, name),
   });
 }
 
@@ -556,7 +603,7 @@ export function useUploadIdentityImage(project: string, name: string) {
     mutationFn: async ({ identityName, file }: { identityName: string; file: File }) => {
       const formData = new FormData();
       formData.append("file", file);
-      return api
+      return uploadApi
         .post(p`api/v1/projects/${project}/characters/${name}/identities/${identityName}/upload`, { body: formData })
         .json<OkResponse<{ image_url: string }>>();
     },
@@ -570,7 +617,7 @@ export function useUploadCostumeImage(project: string, name: string) {
     mutationFn: async ({ identityId, file }: { identityId: string; file: File }) => {
       const formData = new FormData();
       formData.append("file", file);
-      return api
+      return uploadApi
         .post(p`api/v1/projects/${project}/characters/${name}/identities/${identityId}/costume/upload`, { body: formData })
         .json<OkResponse<{ costume_image_url: string }>>();
     },
@@ -606,7 +653,7 @@ export function useUploadIdentityPortrait(project: string, name: string) {
     mutationFn: async ({ identityId, file }: { identityId: string; file: File }) => {
       const formData = new FormData();
       formData.append("file", file);
-      return api
+      return uploadApi
         .post(p`api/v1/projects/${project}/characters/${name}/identities/${identityId}/portrait/upload`, { body: formData })
         .json<OkResponse<{ portrait_image_url: string }>>();
     },

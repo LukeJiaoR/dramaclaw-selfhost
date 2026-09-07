@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -18,14 +19,18 @@ from novelvideo.api.routes import freezone as freezone_routes
 from novelvideo.api.routes import model_gateway
 from novelvideo.official_defaults import OFFICIAL_NEWAPI_BASE_URL
 from novelvideo.model_gateway_settings import (
+    EffectiveMediaRelayConfig,
+    EffectiveNewApiConfig,
     MODE_CUSTOM,
     MODE_HYBRID,
     MODE_OFFICIAL,
     build_newapi_database_status,
     build_model_gateway_status,
     get_effective_cognee_embedding_config,
+    get_effective_media_relay_config,
     get_effective_newapi_config,
     get_ce_media_model_catalog,
+    get_newapi_embedding_model_config,
     get_official_media_model_catalog,
     get_newapi_media_model_mappings,
     get_newapi_provider_channels,
@@ -59,6 +64,42 @@ from novelvideo.newapi_provisioner import (
     update_provider_channel_credentials,
     upsert_channel,
 )
+
+
+def _newer_bundled_catalog_version(offset: int = 1) -> str:
+    bundled = json.loads(
+        Path(model_gateway_settings.__file__)
+        .with_name("official_media_models.json")
+        .read_text(encoding="utf-8")
+    )
+    parts = str(bundled["catalogVersion"]).split(".")
+    parts[-1] = str(int(parts[-1]) + offset)
+    return ".".join(parts)
+
+
+def test_bundled_catalog_includes_seedance_25_capabilities():
+    bundled = json.loads(
+        Path(model_gateway_settings.__file__)
+        .with_name("official_media_models.json")
+        .read_text(encoding="utf-8")
+    )
+
+    model = bundled["mediaModels"]["seedance-2.5"]
+    assert model["upstreamModel"] == "seedance-2.5"
+    assert model["mediaType"] == "video"
+    assert model["config"]["supportedModes"] == [
+        "text_to_video",
+        "image_reference",
+        "all_reference",
+        "video_edit",
+        "first_last_frame",
+    ]
+    assert model["config"]["referenceImageMax"] == 30
+    assert model["config"]["referenceVideoMax"] == 10
+    assert model["config"]["referenceAudioMax"] == 10
+    assert model["config"]["maxDuration"] == 30
+    assert model["config"]["referenceVideoTotalMaxSeconds"] == 30
+    assert model["config"]["referenceAudioTotalMaxSeconds"] == 30
 
 
 def test_generic_comfyui_i2v_defaults_to_widescreen():
@@ -162,6 +203,74 @@ def _isolate_settings_db(monkeypatch: pytest.MonkeyPatch, tmp_path):
         "NEWAPI_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
+
+
+def test_effective_newapi_config_uses_request_scoped_explicit_config_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _isolate_settings_db(monkeypatch, tmp_path)
+    explicit = EffectiveNewApiConfig(
+        mode=MODE_OFFICIAL,
+        source="request",
+        base_url="https://request.example/v1",
+        api_key="sk-request-only",
+    )
+    environment_before = dict(os.environ)
+    monkeypatch.setattr(
+        model_gateway_settings,
+        "_read_all",
+        lambda: pytest.fail("explicit config must not read SQLite"),
+    )
+
+    result = get_effective_newapi_config(explicit_config=explicit)
+
+    assert result is explicit
+    assert dict(os.environ) == environment_before
+    assert not (tmp_path / "state").exists()
+
+
+def test_effective_media_relay_config_uses_request_scoped_explicit_config_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _isolate_settings_db(monkeypatch, tmp_path)
+    explicit = EffectiveMediaRelayConfig(
+        source="request",
+        provider="aliyun_oss",
+        ttl_seconds=60,
+        endpoint="https://relay.example",
+        bucket="tenant-bucket",
+        access_key_id="request-ak",
+        access_key_secret="request-sk",
+    )
+    environment_before = dict(os.environ)
+    monkeypatch.setattr(
+        model_gateway_settings,
+        "_read_all",
+        lambda: pytest.fail("explicit config must not read SQLite"),
+    )
+
+    result = get_effective_media_relay_config(explicit_config=explicit)
+
+    assert result is explicit
+    assert dict(os.environ) == environment_before
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize(
+    ("resolver", "explicit_config"),
+    [
+        (get_effective_newapi_config, {"api_key": "forged"}),
+        (get_effective_media_relay_config, {"access_key_secret": "forged"}),
+    ],
+)
+def test_effective_config_rejects_untyped_explicit_override(
+    resolver,
+    explicit_config,
+) -> None:
+    with pytest.raises(TypeError, match="explicit_config"):
+        resolver(explicit_config=explicit_config)
 
 
 def test_comfyui_provider_channel_defaults_to_channel_type_63(monkeypatch, tmp_path):
@@ -461,18 +570,80 @@ def test_legacy_pydantic_factory_uses_ee_deployment_gateway(monkeypatch, tmp_pat
     monkeypatch.setattr(config, "NEWAPI_BASE_URL", "https://ee-gateway.example/v1")
     captured: dict[str, object] = {}
 
+    class FakeModel:
+        async def request(self, *_args):
+            return "newapi-response"
+
     def fake_model(model_name, **kwargs):
         captured.update(model_name=model_name, **kwargs)
-        return "newapi-model"
+        return FakeModel()
 
     monkeypatch.setattr(config, "_newapi_text_openai_model", fake_model)
 
-    result = config.get_pydantic_model(model_name_override="DC-legacy-agent-LLM")
+    model = config.get_pydantic_model(model_name_override="DC-legacy-agent-LLM")
 
-    assert result == "newapi-model"
+    assert captured == {}
+    result = asyncio.run(model.request([], None, object()))
+
+    assert result == "newapi-response"
     assert captured["model_name"] == "DC-legacy-agent-LLM"
     assert captured["api_key"] == "sk-ee-secret"
     assert captured["base_url"] == "https://ee-gateway.example/v1"
+
+
+def test_ee_media_model_mappings_do_not_open_ce_settings(monkeypatch, tmp_path):
+    _isolate_settings_db(monkeypatch, tmp_path)
+    monkeypatch.setenv("ST_EDITION", "ee")
+    monkeypatch.setenv("ST_CONTROL_PLANE_DSN", "postgresql://control-plane")
+    monkeypatch.setattr(
+        model_gateway_settings,
+        "_connect",
+        lambda: pytest.fail("EE must not open CE settings.db"),
+    )
+
+    assert get_newapi_media_model_mappings() == {}
+    assert not (tmp_path / "state").exists()
+
+
+def test_ee_platform_video_paths_do_not_call_ce_media_model_accessor(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_settings_db(monkeypatch, tmp_path)
+    monkeypatch.setenv("ST_EDITION", "ee")
+    monkeypatch.setenv("ST_CONTROL_PLANE_DSN", "postgresql://control-plane")
+    monkeypatch.setenv("NEWAPI_API_KEY", "sk-ee-secret")
+    monkeypatch.setenv("NEWAPI_BASE_URL", "https://ee-gateway.example/v1")
+    monkeypatch.setattr(config, "NEWAPI_API_KEY", "sk-ee-secret")
+    monkeypatch.setattr(config, "NEWAPI_BASE_URL", "https://ee-gateway.example/v1")
+    monkeypatch.setattr(
+        model_gateway_settings,
+        "get_newapi_media_model_mappings",
+        lambda: pytest.fail("EE video paths must not call the CE accessor"),
+    )
+
+    generator = NewApiVideoGenerator(model="seedance-2.0")
+    options = newapi_video_backend_options()
+
+    assert generator.api_key == "sk-ee-secret"
+    assert generator.base_url == "https://ee-gateway.example/v1"
+    assert "newapi_seedance-2.0" in options
+
+
+def test_ee_model_gateway_settings_reader_does_not_open_sqlite(monkeypatch, tmp_path):
+    _isolate_settings_db(monkeypatch, tmp_path)
+    monkeypatch.setenv("ST_EDITION", "ee")
+    monkeypatch.setenv("ST_CONTROL_PLANE_DSN", "postgresql://control-plane")
+    monkeypatch.setattr(
+        model_gateway_settings,
+        "_connect",
+        lambda: pytest.fail("EE must not open CE settings.db"),
+    )
+
+    assert model_gateway_settings.get_model_gateway_settings() == {
+        "model_gateway_mode": MODE_OFFICIAL
+    }
+    assert not (tmp_path / "state").exists()
 
 
 def test_cognee_newapi_resolution_prefers_saved_gateway(monkeypatch, tmp_path):
@@ -693,7 +864,7 @@ def test_ee_cannot_mutate_ce_model_gateway_settings(monkeypatch, tmp_path):
     )
 
     assert response.status_code == 403
-    assert "only available in CE" in response.json()["detail"]
+    assert response.json()["detail"] == "ORG_SERVICE_EGRESS_DENIED"
 
 
 def test_ce_runtime_refresh_never_mutates_process_environment(monkeypatch, tmp_path):
@@ -1464,6 +1635,79 @@ def test_model_gateway_config_route_masks_effective_key(monkeypatch, tmp_path):
     assert "sk-official-secret" not in response.text
 
 
+def test_ee_model_gateway_config_skips_ce_provisioner_and_settings(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_settings_db(monkeypatch, tmp_path)
+    monkeypatch.setenv("ST_EDITION", "ee")
+    monkeypatch.setenv("ST_CONTROL_PLANE_DSN", "postgresql://control-plane")
+    monkeypatch.setenv("NEWAPI_BASE_URL", "https://ee-gateway.example/v1")
+    monkeypatch.setenv("NEWAPI_API_KEY", "sk-ee-secret")
+    monkeypatch.setattr(model_gateway.app_config, "NEWAPI_API_KEY", "sk-ee-secret")
+    monkeypatch.setattr(
+        model_gateway,
+        "build_provisioner_status",
+        lambda: pytest.fail("EE must not build CE provisioner status"),
+    )
+    monkeypatch.setattr(
+        model_gateway_settings,
+        "_connect",
+        lambda: pytest.fail("EE must not open CE settings.db"),
+    )
+    app = FastAPI()
+    app.include_router(model_gateway.router)
+
+    response = TestClient(app).get("/model-gateway/config")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["effective"]["baseUrl"] == "https://ee-gateway.example/v1"
+    assert data["provisioner"] == {
+        "enabled": False,
+        "adminBaseUrl": "",
+        "dbConfigured": False,
+        "database": {
+            "configured": False,
+            "available": False,
+            "source": "unavailable",
+        },
+        "adminUsername": "",
+        "relayTokenName": "",
+        "providers": {},
+        "providerChannels": [],
+        "mediaModels": {},
+        "embeddingModel": {},
+        "relayBaseUrl": "",
+    }
+    assert not (tmp_path / "state").exists()
+
+
+def test_ce_model_gateway_config_uses_provisioner_builder(monkeypatch, tmp_path):
+    _isolate_settings_db(monkeypatch, tmp_path)
+    expected = {
+        "enabled": True,
+        "adminBaseUrl": "http://new-api:3000",
+        "dbConfigured": True,
+        "database": {"configured": True},
+        "adminUsername": "root",
+        "relayTokenName": "ce-runtime",
+        "providers": {"openrouter": {}},
+        "providerChannels": [],
+        "mediaModels": {},
+        "embeddingModel": {},
+        "relayBaseUrl": "http://new-api:3000/v1",
+    }
+    monkeypatch.setattr(model_gateway, "build_provisioner_status", lambda: expected)
+    app = FastAPI()
+    app.include_router(model_gateway.router)
+
+    response = TestClient(app).get("/model-gateway/config")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["provisioner"] == expected
+
+
 def test_model_gateway_config_excludes_closed_source_provider_presets(
     monkeypatch, tmp_path
 ):
@@ -1531,9 +1775,10 @@ def test_official_media_catalog_preferences_and_remote_update(monkeypatch, tmp_p
     _isolate_settings_db(monkeypatch, tmp_path)
     source_url = "https://catalog.example.test/official_media_models.json"
     monkeypatch.setenv("OFFICIAL_MEDIA_CATALOG_URL", source_url)
+    remote_version = _newer_bundled_catalog_version()
     payload = {
         "version": 1,
-        "catalogVersion": "2026.08.14.2",
+        "catalogVersion": remote_version,
         "name": "Test official media models",
         "mediaModels": {
             "test-video": {
@@ -1573,7 +1818,7 @@ def test_official_media_catalog_preferences_and_remote_update(monkeypatch, tmp_p
     assert checked.status_code == 200, checked.text
     assert checked.json()["data"]["updated"] is True
     assert current.json()["data"]["source"] == "remote"
-    assert current.json()["data"]["catalogVersion"] == "2026.08.14.2"
+    assert current.json()["data"]["catalogVersion"] == remote_version
     assert current.json()["data"]["modelCount"] == 1
 
 
@@ -1596,7 +1841,7 @@ def test_official_media_catalog_manifest_verifies_hash_and_revalidates_etag(
     monkeypatch.setenv("OFFICIAL_MEDIA_CATALOG_MANIFEST_URL", manifest_url)
     payload = {
         "version": 1,
-        "catalogVersion": "2026.08.14.3",
+        "catalogVersion": _newer_bundled_catalog_version(2),
         "name": "Test official media models",
         "mediaModels": {
             "test-video": {
@@ -2191,6 +2436,110 @@ def test_custom_newapi_provider_channels_route_persists_and_masks_keys(
     ]
     assert "sk-ali-upstream-secret" not in config_response.text
     assert "sk-deepseek-upstream-secret" not in config_response.text
+
+
+def test_custom_newapi_provider_channels_route_removes_final_channel(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_settings_db(monkeypatch, tmp_path)
+    monkeypatch.setenv("NEWAPI_PROVISIONER_ENABLED", "true")
+
+    app = FastAPI()
+    app.include_router(model_gateway.router)
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/model-gateway/custom/newapi/provider-channels",
+        json={
+            "channels": [
+                {
+                    "provider": "openrouter",
+                    "upstreamKey": "sk-openrouter-secret",
+                }
+            ]
+        },
+    )
+    assert create_response.status_code == 200
+    save_newapi_media_model_mappings(
+        {
+            "speech-preview": {
+                "provider": "openrouter",
+                "upstreamModel": "speech-upstream",
+                "mediaType": "audio",
+            }
+        }
+    )
+    save_newapi_embedding_model_config(
+        provider="openrouter",
+        upstream_model="embedding-upstream",
+        dimension=1024,
+    )
+
+    delete_response = client.post(
+        "/model-gateway/custom/newapi/provider-channels",
+        json={"channels": [], "preserveUnmentioned": False},
+    )
+    assert delete_response.status_code == 200
+    assert delete_response.json()["data"]["channels"] == []
+    assert delete_response.json()["data"]["mediaModels"] == {}
+    assert delete_response.json()["data"]["embeddingModel"] is None
+
+    config_response = client.get("/model-gateway/config")
+    assert config_response.status_code == 200
+    provisioner = config_response.json()["data"]["provisioner"]
+    assert provisioner["providerChannels"] == []
+    assert provisioner["mediaModels"] == {}
+    assert provisioner["embeddingModel"] == {}
+
+
+def test_provider_channel_replacement_only_cascades_removed_provider(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_settings_db(monkeypatch, tmp_path)
+    save_newapi_provider_channels(
+        [
+            {"provider": "openrouter", "upstreamKey": "sk-openrouter"},
+            {"provider": "fal", "upstreamKey": "sk-fal"},
+        ]
+    )
+    save_newapi_media_model_mappings(
+        {
+            "openrouter-image": {
+                "provider": "openrouter",
+                "upstreamModel": "openrouter/image",
+                "mediaType": "image",
+            },
+            "fal-video": {
+                "provider": "fal",
+                "upstreamModel": "fal/video",
+                "mediaType": "video",
+            },
+        }
+    )
+    save_newapi_embedding_model_config(
+        provider="openrouter",
+        upstream_model="openrouter/embedding",
+        dimension=1024,
+    )
+
+    save_newapi_provider_channels(
+        [{"provider": "fal", "upstreamKey": ""}],
+        preserve_unmentioned=False,
+    )
+
+    channels = get_newapi_provider_channels()
+    assert [channel["provider"] for channel in channels] == ["fal"]
+    assert channels[0]["upstreamKey"] == "sk-fal"
+    assert get_newapi_media_model_mappings() == {
+        "fal-video": {
+            "provider": "fal",
+            "upstreamModel": "fal/video",
+            "mediaType": "video",
+        }
+    }
+    assert get_newapi_embedding_model_config() == {}
 
 
 def test_comfyui_provider_channel_writes_workflows_to_newapi(
@@ -3000,11 +3349,19 @@ def test_official_media_model_catalog_uses_ce_export_shape():
     videos = get_official_media_model_catalog("video")
 
     assert len(images) == 6
-    assert len(videos) == 8
+    assert len(videos) == 11
     assert [entry["id"] for entry in videos[:2]] == [
-        "seedance-2.0-fast",
-        "seedance-2.0",
+        "wan3.0-video-prime",
+        "wan3.0-video",
     ]
+    wan = videos[0]
+    assert wan["referenceFileMax"] == 1
+    assert wan["referenceLinkMax"] == 1
+    assert "pdf" in wan["referenceFileTypes"]
+    seedance_25 = next(entry for entry in videos if entry["id"] == "seedance-2.5")
+    assert seedance_25["apiModel"] == "newapi_seedance-2.5"
+    assert seedance_25["resolutionOptions"] == ["480p", "720p", "1080p"]
+    assert seedance_25["ratioOptions"][-1] == "auto"
     seedream = next(entry for entry in images if entry["id"] == "seedream-5.0-pro")
     assert seedream["gatewayModel"] == "seedream-5.0-pro"
     assert seedream["resolutionOptions"] == ["1k", "2k"]

@@ -122,6 +122,7 @@ export function IdentityPickerDialog({
   onChange,
   onPlan,
   planPending,
+  planDisabledReason,
   planCostDisplay,
   planPromotion,
 }: {
@@ -134,6 +135,7 @@ export function IdentityPickerDialog({
   onChange: (next: string[], defaultMap: DefaultIdentityMap) => void;
   onPlan: () => void;
   planPending: boolean;
+  planDisabledReason?: string | null;
   planCostDisplay?: string | null;
   planPromotion?: CreditPromotionDisplay | null;
 }) {
@@ -198,7 +200,7 @@ export function IdentityPickerDialog({
         <div className="max-h-[56vh] space-y-5 overflow-y-auto pr-1">
           {characters.length === 0 ? (
             <p className="py-8 text-center text-sm text-muted-foreground">
-              {t("identityPicker.empty")}
+              {planDisabledReason || t("identityPicker.empty")}
             </p>
           ) : (
             characters.map((char) => (
@@ -219,7 +221,8 @@ export function IdentityPickerDialog({
             variant="outline"
             size="sm"
             onClick={onPlan}
-            disabled={planPending}
+            disabled={planPending || Boolean(planDisabledReason)}
+            title={planDisabledReason || t("identityPicker.aiPlan")}
             className="mr-auto h-8 gap-1.5 rounded-[8px] border-white/12 bg-white/[0.05] px-3 text-sm font-normal text-foreground/82 shadow-none hover:border-white/24 hover:bg-white/[0.08] hover:text-foreground [&_svg]:text-foreground/75"
           >
             {planPending ? (

@@ -10,6 +10,20 @@ from novelvideo.project_context import ProjectContext
 from novelvideo.task_backend.cancel import await_envelope_with_cancel_watch
 from novelvideo.task_backend.registry import register_project_task_runner
 from novelvideo.task_state import get_task_manager
+from novelvideo.egress_context import (
+    TRUSTED_EGRESS_CONTEXT_KEY,
+    TrustedEgressContext,
+    TrustedRunnerEnvelope,
+)
+
+
+def _image_egress_context(envelope: dict[str, Any]) -> TrustedEgressContext | None:
+    if type(envelope) is not TrustedRunnerEnvelope:
+        return None
+    context = envelope.get(TRUSTED_EGRESS_CONTEXT_KEY)
+    if type(context) is not TrustedEgressContext:
+        raise TypeError("trusted runner envelope is missing egress context")
+    return context
 
 
 def run_scene_reference_asset(
@@ -47,6 +61,7 @@ async def _run_scene_reference_asset(
     scope = envelope.get("scope")
     output_dir = Path(str(payload.get("output_dir") or ctx.output_dir))
     manager = get_task_manager()
+    egress_context = _image_egress_context(envelope)
 
     if kind not in {"master", "spatial_layout", "reverse_master"}:
         raise ValueError(f"Unsupported scene reference kind: {kind}")
@@ -63,7 +78,11 @@ async def _run_scene_reference_asset(
         )
 
     update(0.10, "加载场景数据...")
-    store = CogneeStore(ctx.owner_project_label, output_dir=str(output_dir))
+    store = CogneeStore(
+        ctx.owner_project_label,
+        output_dir=str(output_dir),
+        state_dir=str(ctx.state_dir),
+    )
     await store.initialize()
     try:
         scene = await store.sqlite_store.get_scene(scene_name)
@@ -80,6 +99,7 @@ async def _run_scene_reference_asset(
             username=ctx.owner_username,
             project=ctx.project_name,
             project_dir=str(output_dir),
+            state_dir=str(ctx.state_dir),
         )
         style_prompt = str(preset.get("style_instructions", "") or "").strip()
         avoid_instructions = str(preset.get("avoid_instructions", "") or "").strip()
@@ -105,10 +125,13 @@ async def _run_scene_reference_asset(
                 style_prompt=style_prompt,
                 avoid_instructions=avoid_instructions,
                 base_scene=base_scene,
+                egress_context=egress_context,
             )
         if kind == "spatial_layout":
             rel_path = str(Path(output_path).relative_to(output_dir))
             await store.sqlite_store.update_scene(scene_name, spatial_layout_image=rel_path)
+        else:
+            await store.sqlite_store.touch_scene_asset(scene_name)
         return {
             "scene_name": scene_name,
             "kind": kind,

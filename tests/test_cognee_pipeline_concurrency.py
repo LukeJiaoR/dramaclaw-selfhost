@@ -401,7 +401,9 @@ async def test_episode_runner_persists_agent_plan_only_to_sqlite(monkeypatch):
         FakePlanner,
     )
 
-    ctx = SimpleNamespace(output_dir="/tmp/output")
+    # A real ProjectContext always carries state_dir; the runner reads it to
+    # resolve the project's knowledge pipeline.
+    ctx = SimpleNamespace(output_dir="/tmp/output", state_dir="/tmp/state")
     result = await graph_build._run_build_episodes(
         {"payload": {"config": {"target_episodes": 1}}},
         ctx,

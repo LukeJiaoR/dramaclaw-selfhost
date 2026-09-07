@@ -47,6 +47,12 @@ COMMON_REVERSE_ENV_ALLOWLIST: tuple[tuple[re.Pattern[str], str], ...] = (
         "Official media catalog publishing CI input, not application runtime configuration.",
     ),
     (re.compile(r"^ST_EDITION$"), "Launcher/test gate env, not operator template config."),
+    (
+        re.compile(r"^ST_ORG_(?:EGRESS_MODE|GATEWAY_API_KEY|GATEWAY_BASE_URL)$"),
+        "Process-local handoff written by the parent when it launches a model child "
+        "(task_backend/subprocesses.build_model_child_env); never operator-set, and "
+        "setting it externally has no effect because the parent rebuilds the child env.",
+    ),
     (re.compile(r"^DRAMACLAW_CE_ROOT$"), "Audit script discovery override, not runtime app config."),
     (
         re.compile(
@@ -118,7 +124,8 @@ COMMON_REVERSE_ENV_ALLOWLIST: tuple[tuple[re.Pattern[str], str], ...] = (
             r"NOVELVIDEO_RUNTIME_DIR|NOVELVIDEO_STATE_DIR|NOVELVIDEO_TASK_STARTING_TIMEOUT|"
             r"NOVELVIDEO_UI_HOST|NOVELVIDEO_UI_PORT|NOVELVIDEO_WORKERS|"
             r"NOVELVIDEO_VERBOSE|NOVELVIDEO_ENABLE_LOGFIRE|"
-            r"NOVELVIDEO_LOGFIRE_SERVICE|ST_HERMES_.*|ST_LITESTREAM_ENABLED|ST_LOCAL_USERNAME|"
+            r"NOVELVIDEO_LOGFIRE_SERVICE|ST_CANVAS_LOCK_TIMING|ST_HERMES_.*|"
+            r"ST_LITESTREAM_ENABLED|ST_LOCAL_USERNAME|"
             r"ST_PROJECT_TASK_TIMEOUT_S|ST_SPLAT_TRANSFORM_BIN)$"
         ),
         "Local runtime/dev override with code default; not required in committed templates.",

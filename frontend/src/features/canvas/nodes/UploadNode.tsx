@@ -20,6 +20,7 @@ import {
 } from '@xyflow/react';
 import { Camera, Image as ImageIcon, Loader2, Upload } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import i18n from '@/i18n';
 import { toast } from 'sonner';
 
 import {
@@ -35,7 +36,7 @@ import {
 } from '@/features/canvas/application/imageNodeSizing';
 import {
   isNodeUsingDefaultDisplayName,
-  resolveNodeDisplayName,
+  localizeNodeDisplayName,
 } from '@/features/canvas/domain/nodeDisplay';
 import { canvasEventBus } from '@/features/canvas/application/canvasServices';
 import { stashExternalFile } from '@/features/canvas/application/pendingExternalFiles';
@@ -51,11 +52,18 @@ import {
   canvasNodeFrameClass,
 } from '@/features/canvas/ui/nodeFrameStyles';
 import {
+  nodeBodyImageMeasurement,
+  nodeBodyImageSrc,
+  nodeBodyRecordDescribesImage,
+  planNaturalSizeRecordWrite,
   prepareNodeImageFromFile,
+  readNodeNaturalSize,
   resolveImageDisplayUrl,
   shouldUseOriginalImageByZoom,
   withImageCacheBust,
 } from '@/features/canvas/application/imageData';
+import { useNaturalSizeRecordTrust } from '@/features/canvas/hooks/useNaturalSizeRecordTrust';
+import { useNodeBodyVariantBudget } from '@/features/canvas/hooks/useNodeBodyVariantBudget';
 import { uploadLocalImageToBackend } from '@/features/canvas/application/uploadToolOutput';
 import { CanvasNodeImage } from '@/features/canvas/ui/CanvasNodeImage';
 import { DirectorControlBundleBadge } from '@/features/canvas/ui/DirectorControlBundleBadge';
@@ -127,9 +135,10 @@ function blobToDataUrl(blob: Blob): Promise<string> {
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === 'string') resolve(reader.result);
-      else reject(new Error('无法读取导演世界截图'));
+      else reject(new Error(i18n.t('node.threeDWorld.directorCaptureReadFailed')));
     };
-    reader.onerror = () => reject(reader.error ?? new Error('无法读取导演世界截图'));
+    reader.onerror = () =>
+      reject(reader.error ?? new Error(i18n.t('node.threeDWorld.directorCaptureReadFailed')));
     reader.readAsDataURL(blob);
   });
 }
@@ -138,7 +147,7 @@ function imageSize(dataUrl: string): Promise<{ width: number; height: number }> 
   return new Promise((resolve, reject) => {
     const image = new Image();
     image.onload = () => resolve({ width: image.naturalWidth || 1, height: image.naturalHeight || 1 });
-    image.onerror = () => reject(new Error('无法解析导演世界截图尺寸'));
+    image.onerror = () => reject(new Error(i18n.t('node.threeDWorld.directorCaptureSizeFailed')));
     image.src = dataUrl;
   });
 }
@@ -182,7 +191,7 @@ function snapshotMarkerFromDirectorLayerItem(item: unknown): ThreeDSceneSnapshot
       };
   const position = placement.space === 'world' ? placement.position : [0, 0, 0] as [number, number, number];
   return {
-    label: typeof data.label === 'string' ? data.label : '导演元素',
+    label: typeof data.label === 'string' ? data.label : i18n.t('node.threeDWorld.directorElement'),
     color: typeof data.color === 'string' ? data.color : '#38bdf8',
     placement,
     position,
@@ -301,10 +310,10 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
     }
 
     if (imageOnly && isNodeUsingDefaultDisplayName(CANVAS_NODE_TYPES.upload, data)) {
-      return '上传图片';
+      return t('node.upload.uploadImage');
     }
-    return resolveNodeDisplayName(CANVAS_NODE_TYPES.upload, data);
-  }, [data, imageOnly, useUploadFilenameAsNodeTitle]);
+    return localizeNodeDisplayName(CANVAS_NODE_TYPES.upload, data, t);
+  }, [data, imageOnly, t, useUploadFilenameAsNodeTitle]);
   const hasMainlineContext = hasMainlineContexts(
     (data as { mainline_context?: unknown }).mainline_context,
   );
@@ -653,14 +662,14 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
     async (_blob: Blob, meta: ThreeDDirectorCaptureMeta) => {
       const projectId = readUrl().project;
       if (!meta.captureBundle) {
-        throw new Error('导演合成图缺少 combined/env_only/frame_meta');
+        throw new Error(t('node.threeDWorld.combinedBundleMissing'));
       }
       if (!projectId) {
-        throw new Error('缺少项目，无法保存画布导演合成图');
+        throw new Error(t('node.threeDWorld.combinedNoProject'));
       }
       const bundle = await uploadDirectorCaptureBundle(projectId, id, meta.captureBundle);
       const imageUrl = bundle.urls?.combined ?? '';
-      if (!imageUrl) throw new Error('画布导演合成图缺少图片地址');
+      if (!imageUrl) throw new Error(t('node.threeDWorld.combinedUrlMissing'));
       updateNodeData(id, {
         imageUrl,
         previewImageUrl: withImageCacheBust(imageUrl, Date.now()),
@@ -673,7 +682,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
         uploadError: null,
       });
     },
-    [id, sourceBeat, sourceEpisode, updateNodeData],
+    [id, sourceBeat, sourceEpisode, t, updateNodeData],
   );
 
   const handleDirectorOutputCanvasNode = useCallback(
@@ -706,7 +715,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
                 uploadedUrl: bundle.urls?.combined ?? '',
                 width: combinedSize.width,
                 height: combinedSize.height,
-                label: '导演合成图',
+                label: t('node.threeDWorld.combinedLabel'),
                 metadata: {
                   ...baseMetadata,
                   render_mode: 'combined',
@@ -717,17 +726,17 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
                 uploadedUrl: bundle.urls?.env_only ?? '',
                 width: envOnlySize.width,
                 height: envOnlySize.height,
-                label: '纯背景图',
+                label: t('node.threeDWorld.envOnlyLabel'),
                 metadata: {
                   ...baseMetadata,
                   render_mode: 'env_only',
                 },
               },
             ],
-            { cols: 2, groupName: '导演世界输出' },
+            { cols: 2, groupName: t('node.threeDWorld.captureGroupName') },
           );
           updateNodeData(id, {
-            uploadError: groupId ? null : '导演世界截图输出到画布失败',
+            uploadError: groupId ? null : t('node.threeDWorld.captureOutputFailed'),
           });
           if (groupId) {
             toast.success(t('viewer.threeD.outputToCanvasNodeSuccess'));
@@ -746,7 +755,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
             uploadedUrl,
             width: size.width,
             height: size.height,
-            label: '导演世界导出',
+            label: t('node.threeDWorld.directorExportLabel'),
             metadata: {
               viewer: 'director_world',
               render_mode: meta.kind,
@@ -756,7 +765,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
           },
         ]);
         updateNodeData(id, {
-          uploadError: groupId ? null : '导演世界截图输出到画布失败',
+          uploadError: groupId ? null : t('node.threeDWorld.captureOutputFailed'),
         });
         if (groupId) {
           toast.success(t('viewer.threeD.outputToCanvasNodeSuccess'));
@@ -773,17 +782,98 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
     clearTransientPreview();
   }, [clearTransientPreview]);
 
-  const imageSource = useMemo(() => {
-    if (transientPreviewUrl) {
-      return transientPreviewUrl;
-    }
+  // 已记录的原图像素尺寸；决定主体图能不能喂降采样副本（见 nodeBodyImageSrc）。
+  const recordedNaturalSize = useMemo(() => readNodeNaturalSize(data), [data]);
+
+  // 记录归属的是哪张图。上传节点的图会被换掉——重新上传、全景抓拍回填、导演控件
+  // 覆盖，这几条路都只改 imageUrl/previewImageUrl，不动记录。所以换图当下就先不
+  // 信任记录，这一轮退回原图重测。只认换图，不认缩放：preferOriginalImage 翻转时
+  // 下面那一支会挑到另一个字段，但那是同一个节点的两种画法。
+  const recordSubject = useMemo(() => {
+    const picked = data.previewImageUrl || data.imageUrl;
+    if (!picked) return null;
+    const committedAt = (data as { committed_at?: unknown }).committed_at;
+    return `${picked}\u0000${typeof committedAt === 'string' ? committedAt : ''}`;
+  }, [data]);
+
+  const { distrusted, distrustRecord, trustAgain } = useNaturalSizeRecordTrust(recordSubject);
+  const bodyVariantBudget = useNodeBodyVariantBudget({
+    width: resolvedWidth,
+    height: resolvedHeight,
+  });
+
+  // 本地刚选的文件用 blob: 直出，不走变体：那是本机内存里的东西，后端没有它的
+  // 副本，也马上会被上传完成的稳定图换掉（clearTransientPreview）。
+  const bodyImage = useMemo(() => {
+    if (transientPreviewUrl) return null;
     const picked = preferOriginalImage
       ? data.imageUrl || data.previewImageUrl
       : data.previewImageUrl || data.imageUrl;
-    return picked
-      ? resolveImageDisplayUrl(withImageCacheBust(picked, data.committed_at))
-      : null;
-  }, [data.committed_at, data.imageUrl, data.previewImageUrl, transientPreviewUrl, preferOriginalImage]);
+    if (!picked) return null;
+    const resolved = resolveImageDisplayUrl(withImageCacheBust(picked, data.committed_at));
+    // 节点主体把整幅原图解码进几百 CSS px 的盒子里；变体只在真实尺寸已知、且没
+    // 放大到细看那一档时启用，详见 nodeBodyImageSrc 的注释。
+    return nodeBodyImageSrc(resolved, recordedNaturalSize, {
+      preferOriginal: preferOriginalImage || distrusted,
+      requiredEdge: bodyVariantBudget,
+    });
+  }, [
+    bodyVariantBudget,
+    data.committed_at,
+    data.imageUrl,
+    data.previewImageUrl,
+    distrusted,
+    preferOriginalImage,
+    recordedNaturalSize,
+    transientPreviewUrl,
+  ]);
+
+  const imageSource = transientPreviewUrl ?? bodyImage?.src ?? null;
+
+  /**
+   * 把这张图的真实像素尺寸记进节点数据。
+   *
+   * 记录空着，主体图就只能一直喂原图（nodeBodyImageSrc 在 natural 为 null 时直接
+   * 交回原图）。上传节点此前从来没有写过这组数，于是变体对它整个是关着的——用户
+   * 拖进来的原图往往是这张画布上最大的一张。这里补上：加载完成即量、即写。
+   *
+   * 上传节点不跟着图的比例自动改尺寸（用户拖多大就是多大），所以没有「比例变了」
+   * 「显示尺寸对不上」这两个触发点，这次写回纯粹是补记事实，不该进撤销栈。
+   */
+  const recordNaturalSize = useCallback((image: HTMLImageElement) => {
+    // 瞬时 blob: 预览：稳定图随后会把它换掉，那一轮才有变体上下文可判。
+    if (!bodyImage) return;
+    // 记录描述的不是这张图：降采样副本上量不出源图真尺寸。先退回原图重测。
+    if (
+      bodyImage.downscaled
+      && !nodeBodyRecordDescribesImage(image, recordedNaturalSize, bodyImage.maxEdge ?? 0)
+    ) {
+      distrustRecord();
+      return;
+    }
+    // 放大档挑的是 imageUrl，那可能是与记录归属的 previewImageUrl 完全不同的另一
+    // 张图；拿它去纠正记录，是把错的换成另一个错的。
+    const measuringRecordSubject = !preferOriginalImage;
+    if (measuringRecordSubject) {
+      trustAgain();
+    }
+    const measured = nodeBodyImageMeasurement(image, bodyImage, recordedNaturalSize);
+    if (!(measured.width > 0 && measured.height > 0)) return;
+    const recordWrite = planNaturalSizeRecordWrite({
+      aspectRatioChanged: false,
+      displaySizeMismatch: false,
+      record: recordedNaturalSize,
+      measured,
+      measuringRecordSubject,
+      sizeLockedByUser: false,
+    });
+    if (!recordWrite.persist) return;
+    updateNodeData(
+      id,
+      { imageNaturalWidth: measured.width, imageNaturalHeight: measured.height },
+      { recordHistory: recordWrite.recordHistory },
+    );
+  }, [bodyImage, distrustRecord, id, preferOriginalImage, recordedNaturalSize, trustAgain, updateNodeData]);
 
   useEffect(() => {
     updateNodeInternals(id);
@@ -831,7 +921,7 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
               handlePickFile();
             }}
             onPointerDown={(event) => event.stopPropagation()}
-            title={imageOnly ? '上传图片' : (t('node.upload.hint') ?? '上传资源')}
+            title={imageOnly ? t('node.upload.uploadImage') : t('node.upload.hint')}
             className={NODE_SIDE_ACTION_BUTTON_CLASS}
           >
             {data.isUploading ? (
@@ -839,7 +929,13 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
             ) : (
               <Upload className={NODE_SIDE_ACTION_ICON_CLASS} />
             )}
-            <span>{data.isUploading ? '上传中' : imageOnly ? '上传图片' : '上传资源'}</span>
+            <span>
+              {data.isUploading
+                ? t('node.upload.uploading')
+                : imageOnly
+                  ? t('node.upload.uploadImage')
+                  : t('node.upload.uploadAsset')}
+            </span>
           </button>
         </NodeSideActionRail>
       )}
@@ -854,7 +950,10 @@ export const UploadNode = memo(({ id, data, selected, width, height }: UploadNod
             viewerSourceUrl={data.imageUrl ? resolveImageDisplayUrl(data.imageUrl) : null}
             alt={t('node.upload.uploadedAlt')}
             className="h-full w-full object-contain"
-            onLoad={handleImageLoad}
+            onLoad={(event) => {
+              recordNaturalSize(event.currentTarget);
+              handleImageLoad(event);
+            }}
           />
         </div>
       ) : (

@@ -54,6 +54,7 @@ import {
   Wand2,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import type { TFn } from "@/lib/i18n-types";
 
 import { toast } from "sonner";
 
@@ -330,9 +331,15 @@ function beatContextText(ctx: BeatMainlineContext): string {
   ].filter(Boolean).join("\n");
 }
 
-function beatContextNodeData(ctx: BeatMainlineContext): Record<string, unknown> {
+function beatContextNodeData(
+  ctx: BeatMainlineContext,
+  t: TFn,
+): Record<string, unknown> {
   return {
-    displayName: `镜头上下文 · EP${ctx.episode}/B${ctx.beat}`,
+    displayName: t("canvas.nodeToolbar.beatContextName", {
+      episode: ctx.episode,
+      beat: ctx.beat,
+    }),
     content: beatContextText(ctx),
     projectId: ctx.projectId,
     episode: ctx.episode,
@@ -486,6 +493,9 @@ export const NodeActionToolbar = memo(
     // renders, so reading `node.id` at the call site fails to type-check.
     const nodeId = node.id;
     const isUngroupableGroup = isGroupNode(node) && !isProtectedProjectionGroupNode(node);
+    // 主线投影组只锁拓扑（不能解组），几何类操作（背景色 / 排列）照常给：后端算出的
+    // 布局不合意时，用户得有补救手段——组框本身是只读的，没有这两项就真的动不了。
+    const isAdjustableGroup = isGroupNode(node);
     // 同 nodeId:在 node 仍是完整类型时捕获组背景色。下方过宽的类型守卫会把 node
     // 收窄成 never,到 ungroup 按钮渲染处再读 node.data 会编译失败(tsc -b)。
     const groupBackgroundColor = isGroupNode(node)
@@ -1042,7 +1052,7 @@ export const NodeActionToolbar = memo(
             x: node.position.x + nodeWidth + 80,
             y: node.position.y,
           },
-          beatContextNodeData(extractableBeatContext),
+          beatContextNodeData(extractableBeatContext, t),
         );
         setSelectedNode(contextNodeId);
         requestFocusNode(contextNodeId);
@@ -1056,6 +1066,7 @@ export const NodeActionToolbar = memo(
         node.width,
         requestFocusNode,
         setSelectedNode,
+        t,
       ],
     );
 
@@ -1106,7 +1117,7 @@ export const NodeActionToolbar = memo(
                 key="mainline-lock-pill"
                 className="rounded-full bg-amber-500/15 px-3 py-1.5 text-sm text-amber-100"
               >
-                主线投影 · 锁定
+                {t("canvas.nodeToolbar.mainlineLocked")}
               </span>
             )}
             {isPresetLocked && workbenchTarget && (
@@ -1120,18 +1131,20 @@ export const NodeActionToolbar = memo(
                 }}
               >
                 <FolderOpen className="h-3.5 w-3.5" />
-                {openingWorkbench ? "打开中..." : "打开工作台"}
+                {openingWorkbench
+                  ? t("canvas.nodeToolbar.openingWorkbench")
+                  : t("canvas.nodeToolbar.openWorkbench")}
               </UiChipButton>
             )}
             {extractableBeatContext && node.type !== CANVAS_NODE_TYPES.beatContext && (
               <UiChipButton
                 key="extract-beat-context"
                 className={TOOLBAR_TEXT_BUTTON_CLASS}
-                title="创建或定位这个素材对应的镜头上下文节点；不会自动连线"
+                title={t("canvas.nodeToolbar.beatContextHint")}
                 onClick={handleEnsureBeatContextNode}
               >
                 <Link2 className="h-3.5 w-3.5" />
-                镜头上下文
+                {t("canvas.nodeToolbar.beatContext")}
               </UiChipButton>
             )}
             {/* AI 改图按钮暂时隐藏（保留代码，等需求恢复时取消注释）
@@ -1953,8 +1966,8 @@ export const NodeActionToolbar = memo(
                           ? videoData.displayName
                           : "video";
                     const baseName = rawName.replace(/\.[^/.]+$/, "");
-                    const audioTitle = `${baseName}_背景音`;
-                    const silentTitle = `${baseName}_无声`;
+                    const audioTitle = `${baseName}_${t("canvas.nodeToolbar.audioSuffix")}`;
+                    const silentTitle = `${baseName}_${t("canvas.nodeToolbar.silentSuffix")}`;
 
                     const audioPos = findNodePosition(node.id, 480, 180);
                     const audioNodeId = addNode(
@@ -2334,7 +2347,7 @@ export const NodeActionToolbar = memo(
                   </DropdownMenu>
                 );
               })()}
-            {!isImageEdit && isUngroupableGroup && (() => {
+            {!isImageEdit && isAdjustableGroup && (() => {
               const groupColor = groupBackgroundColor;
               return (
                 <>
@@ -2343,7 +2356,7 @@ export const NodeActionToolbar = memo(
                       <UiChipButton
                         key="group-color"
                         className={TOOLBAR_TEXT_BUTTON_CLASS}
-                        title="组背景色"
+                        title={t("canvas.nodeToolbar.groupBackground")}
                         onClick={(event) => event.stopPropagation()}
                       >
                         {groupColor ? (
@@ -2354,7 +2367,7 @@ export const NodeActionToolbar = memo(
                         ) : (
                           <Palette className="h-3.5 w-3.5" />
                         )}
-                        背景色
+                        {t("canvas.nodeToolbar.backgroundColor")}
                         <ChevronDown className="h-3 w-3" />
                       </UiChipButton>
                     </DropdownMenuTrigger>
@@ -2367,7 +2380,7 @@ export const NodeActionToolbar = memo(
                       <div className="grid grid-cols-5 gap-1.5 p-1.5">
                         <button
                           type="button"
-                          title="无"
+                          title={t("canvas.nodeToolbar.noColor")}
                           onClick={() => updateNodeData(nodeId, { backgroundColor: null })}
                           className={`relative flex h-6 w-6 items-center justify-center rounded-full border bg-transparent transition-transform hover:scale-110 ${
                             groupColor ? 'border-white/25' : 'border-white ring-1 ring-white/60'
@@ -2379,7 +2392,7 @@ export const NodeActionToolbar = memo(
                           <button
                             key={preset.key}
                             type="button"
-                            title={preset.label}
+                            title={t(preset.labelKey)}
                             onClick={() =>
                               updateNodeData(nodeId, { backgroundColor: preset.value })
                             }
@@ -2399,11 +2412,11 @@ export const NodeActionToolbar = memo(
                       <UiChipButton
                         key="group-arrange"
                         className={TOOLBAR_TEXT_BUTTON_CLASS}
-                        title="排列方式"
+                        title={t("canvas.nodeToolbar.arrangeMode")}
                         onClick={(event) => event.stopPropagation()}
                       >
                         <LayoutGrid className="h-3.5 w-3.5" />
-                        排列
+                        {t("canvas.multiSelect.arrange")}
                         <ChevronDown className="h-3 w-3" />
                       </UiChipButton>
                     </DropdownMenuTrigger>
@@ -2417,34 +2430,36 @@ export const NodeActionToolbar = memo(
                         className={TOOLBAR_MENU_ITEM_CLASS}
                         onSelect={() => arrangeGroupChildren(nodeId, 'grid')}
                       >
-                        网格
+                        {t("canvas.nodeToolbar.arrangeGrid")}
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         className={TOOLBAR_MENU_ITEM_CLASS}
                         onSelect={() => arrangeGroupChildren(nodeId, 'horizontal')}
                       >
-                        横向排列
+                        {t("canvas.nodeToolbar.arrangeHorizontal")}
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         className={TOOLBAR_MENU_ITEM_CLASS}
                         onSelect={() => arrangeGroupChildren(nodeId, 'vertical')}
                       >
-                        纵向排列
+                        {t("canvas.nodeToolbar.arrangeVertical")}
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
-                  <UiChipButton
-                    key="group-ungroup"
-                    className={`${TOOLBAR_TEXT_BUTTON_CLASS} hover:!border-amber-400/60 hover:!bg-amber-500/20 hover:!text-amber-200`}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      closeDownloadMenu();
-                      ungroupNode(nodeId);
-                    }}
-                  >
-                    <Unlink2 className="h-3.5 w-3.5" />
-                    {t("nodeToolbar.ungroup")}
-                  </UiChipButton>
+                  {isUngroupableGroup && (
+                    <UiChipButton
+                      key="group-ungroup"
+                      className={`${TOOLBAR_TEXT_BUTTON_CLASS} hover:!border-amber-400/60 hover:!bg-amber-500/20 hover:!text-amber-200`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        closeDownloadMenu();
+                        ungroupNode(nodeId);
+                      }}
+                    >
+                      <Unlink2 className="h-3.5 w-3.5" />
+                      {t("nodeToolbar.ungroup")}
+                    </UiChipButton>
+                  )}
                 </>
               );
             })()}
@@ -2508,10 +2523,10 @@ export const NodeActionToolbar = memo(
                     nodeId: node.id,
                   });
                 }}
-                title="把当前节点的内容写回主流程资产"
+                title={t("canvas.nodeToolbar.commitHint")}
               >
                 <Send className="h-3.5 w-3.5" />
-                提交
+                {t("freezone.commit.submit")}
               </UiChipButton>
             )}
           </UiPanel>
