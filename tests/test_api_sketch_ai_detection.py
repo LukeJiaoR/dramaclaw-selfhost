@@ -424,3 +424,41 @@ def test_detect_identities_marks_missing_ai_panel_result_as_no_character_and_no_
     assert body["data"]["prop_detections"] == {"1": ["__NO_PROP__"]}
     assert store.identity_writes == {1: ["__NO_CHARACTER__"]}
     assert store.prop_writes == {1: ["__NO_PROP__"]}
+
+
+def test_detect_identities_preserves_semantic_prop_when_color_detection_is_empty(
+    monkeypatch, tmp_path
+):
+    from novelvideo.agents import global_video_optimizer
+    from novelvideo.api.routes import generation
+
+    store = _DetectStore(
+        [{"beat_number": 1, "visual_description": "Hero拿起[[羊皮笔记本]]。"}]
+    )
+    _write_sketch(tmp_path, 1)
+    client = _client(monkeypatch, tmp_path, store, [])
+
+    async def fake_runtime_prop_menu(*_args, **_kwargs):
+        return [{"prop_id": "羊皮笔记本", "marker_color": ""}]
+
+    async def fake_empty_detect_identities_by_ai(**_kwargs):
+        return {1: []}
+
+    monkeypatch.setattr(
+        generation,
+        "_runtime_prop_menu_with_global_props",
+        fake_runtime_prop_menu,
+    )
+    monkeypatch.setattr(
+        global_video_optimizer,
+        "detect_identities_by_ai",
+        fake_empty_detect_identities_by_ai,
+    )
+
+    response = client.post("/api/v1/projects/demo/episodes/1/sketches/detect-identities")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["data"]["prop_detections"] == {"1": ["羊皮笔记本"]}
+    assert store.prop_writes == {1: ["羊皮笔记本"]}

@@ -2062,12 +2062,24 @@ class CogneeStore:
                     if identity_id:
                         allowed_identity_ids.add(identity_id)
 
+        # Prop marker validity is an episode-planning concern.  ``marker_color``
+        # lives on PropMenuItem, not NovelProp/the global ``props`` table.  The
+        # old lookup asked NovelProp for that nonexistent field, which made the
+        # allowed set permanently empty and turned valid ``[[prop]]`` markers
+        # into ``__NO_PROP__`` while persisting newly generated beats.
         allowed_prop_ids = {
-            str(getattr(prop, "name", "") or "").strip()
-            for prop in await self.sqlite_store.list_props()
-            if str(getattr(prop, "name", "") or "").strip()
-            and str(getattr(prop, "marker_color", "") or "").strip()
+            str(getattr(item, "prop_id", "") or "").strip()
+            for item in (getattr(episode, "prop_menu", []) or [])
+            if str(getattr(item, "prop_id", "") or "").strip()
         }
+        if not allowed_prop_ids:
+            # Legacy episodes may have no menu yet.  Preserve compatibility for
+            # explicit markers that resolve to an existing global prop.
+            allowed_prop_ids = {
+                str(getattr(prop, "name", "") or "").strip()
+                for prop in await self.sqlite_store.list_props()
+                if str(getattr(prop, "name", "") or "").strip()
+            }
         return allowed_identity_ids, allowed_prop_ids
 
     def _complete_generated_beat_refs(

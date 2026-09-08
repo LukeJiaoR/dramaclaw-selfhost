@@ -6138,6 +6138,7 @@ async def detect_sketch_identities(
     from novelvideo.models import (
         NO_CHARACTER_MARKER,
         NO_PROP_MARKER,
+        complete_detected_refs_from_visual_description,
         real_detected_identities,
         real_detected_props,
         split_detected_marker_keys,
@@ -6296,6 +6297,17 @@ async def detect_sketch_identities(
         identity_detections: dict[int, list[str]] = {}
         prop_detections: dict[int, list[str]] = {}
         allowed_prop_ids = set(prop_color_map)
+        semantic_prop_ids = {
+            str(item.get("prop_id") or item.get("name") or "").strip()
+            for item in runtime_prop_menu
+            if isinstance(item, dict)
+            and str(item.get("prop_id") or item.get("name") or "").strip()
+        }
+        beats_by_number = {
+            int(beat.get("beat_number", 0) or 0): beat
+            for beat in beats
+            if int(beat.get("beat_number", 0) or 0) > 0
+        }
         for beat_number, keys in detections.items():
             det_ids, det_props = split_detected_marker_keys(
                 keys,
@@ -6303,6 +6315,21 @@ async def detect_sketch_identities(
                 characters,
                 allowed_prop_ids=allowed_prop_ids,
             )
+            # AI detection can only see color-bound global props.  Keep an
+            # explicit, valid [[prop]] semantic reference even when the prop is
+            # local or its marker color was not detected; otherwise this pass
+            # destructively overwrites the script's prop match with NO_PROP.
+            if semantic_prop_ids:
+                beat = beats_by_number.get(beat_number) or {}
+                _ignored_identities, det_props = (
+                    complete_detected_refs_from_visual_description(
+                        visual_description=str(
+                            beat.get("visual_description", "") or ""
+                        ),
+                        detected_props=det_props,
+                        allowed_prop_ids=semantic_prop_ids,
+                    )
+                )
             identity_detections[beat_number] = det_ids or [NO_CHARACTER_MARKER]
             prop_detections[beat_number] = det_props or [NO_PROP_MARKER]
 
