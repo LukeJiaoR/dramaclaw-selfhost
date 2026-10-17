@@ -17,6 +17,7 @@ export const BUILTIN_VISUAL_STYLES: readonly { value: string; labelKey: string }
   { value: "post_apocalyptic", labelKey: "ingest.visualStyles.postApocalyptic" },
   { value: "realistic", labelKey: "ingest.visualStyles.realistic" },
   { value: "republican_era_drama", labelKey: "ingest.visualStyles.republicanEraDrama" },
+  { value: "epic_scifi_live_action", labelKey: "ingest.visualStyles.epicScifiLiveAction" },
 ];
 
 export const BUILTIN_STYLE_LABEL_KEYS: Record<string, string> = Object.fromEntries(

@@ -110,6 +110,7 @@ def test_live_action_style_tags_describe_grade_finish():
         "chinese_period_drama": "CINEMATIC FILMIC REALISM, WARM SOFT GRADE",
         "republican_era_drama": "VINTAGE FADED FILM, WARM NOSTALGIC GRADE",
         "post_apocalyptic": "DESATURATED GRITTY REALISM, HARSH LIGHT",
+        "epic_scifi_live_action": "CINEMATIC PHOTOREALISM, RESTRAINED FILMIC GRADE",
     }
     grade_words = {
         "CLEAN",
@@ -186,6 +187,7 @@ def test_topic_flavored_presets_defer_to_explicit_story_content():
         "chinese_period_drama",
         "republican_era_drama",
         "post_apocalyptic",
+        "epic_scifi_live_action",
         "guoman_fantasy",
     ]
 
@@ -201,3 +203,55 @@ def test_topic_flavored_presets_defer_to_explicit_story_content():
             "do not override" in instructions
             or "over these default style flavors" in instructions
         ), f"{style_id} must prevent default flavor from overriding explicit content"
+
+
+def test_epic_scifi_preset_is_self_contained_and_preserves_story_content():
+    path = Path("src/novelvideo/styles/presets/epic_scifi_live_action.json")
+    data = json.loads(path.read_text())
+
+    assert set(data) == {
+        "id", "name", "style_instructions", "avoid_instructions",
+        "style_tag", "label", "style_family", "animation_subtype",
+    }
+    assert data["id"] == path.stem
+    assert data["style_family"] == "live_action"
+    assert data["animation_subtype"] == ""
+    assert all(data[key] for key in data if key != "animation_subtype")
+    instructions = data["style_instructions"].lower()
+    for phrase in (
+        "photorealistic live-action", "restrained color grading",
+        "grounded physical materials", "monumental composition",
+        "when supported by the scene", "when the story calls for science fiction",
+        "reference images", "do not override them with the style preset",
+        "do not infer a desert setting, a nationality, an era, futuristic props, or a costume",
+        "preserve explicit non-human subjects",
+    ):
+        assert phrase in instructions
+    assert "lord of light" not in json.dumps(data).lower()
+    assert "dune" not in json.dumps(data).lower()
+
+
+def test_epic_scifi_preset_has_frontend_option_and_localized_names():
+    data = json.loads(Path("src/novelvideo/styles/presets/epic_scifi_live_action.json").read_text())
+    options = Path("frontend/src/lib/visual-styles.ts").read_text()
+    assert '{ value: "epic_scifi_live_action", labelKey: "ingest.visualStyles.epicScifiLiveAction" }' in options
+    for locale, field in (("en", "name"), ("zh", "label")):
+        translations = json.loads(Path(f"frontend/public/locales/{locale}/translation.json").read_text())
+        assert translations["ingest"]["visualStyles"]["epicScifiLiveAction"] == data[field]
+
+
+def test_epic_scifi_preset_reaches_prompt_builder_without_inheritance():
+    from novelvideo.config import get_style_preset
+    from novelvideo.generators.prompt_builder import StyleConfig
+
+    style_id = "epic_scifi_live_action"
+    data = json.loads(Path(f"src/novelvideo/styles/presets/{style_id}.json").read_text())
+    runtime = get_style_preset(style_id)
+    config = StyleConfig(style_name=style_id)
+
+    assert runtime["style_instructions"] == data["style_instructions"]
+    assert config.style_keywords == data["style_instructions"]
+    assert config.avoid_keywords == data["avoid_instructions"]
+    assert config.panel_tag == data["style_tag"]
+    assert config.style_family == "live_action"
+    assert config.animation_subtype == ""

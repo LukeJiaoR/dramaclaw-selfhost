@@ -1,0 +1,10 @@
+{
+  "id": "epic_scifi_live_action",
+  "name": "Epic Sci-Fi Live Action",
+  "style_instructions": "Create a photorealistic live-action cinematic image with a large-format lens feel, natural perspective, motivated directional lighting, controlled highlights, deep but readable shadows, and subtle film grain. Use restrained color grading and grounded physical materials with believable weight, surface texture, wear, and light response; retain the materials and condition specified by the story. Favor monumental composition, clear silhouettes, negative space, and a strong sense of scale when supported by the scene, while preserving intimate framing and readable action when needed. When the story calls for science fiction, render its technology as physically convincing and integrated into the photographed world. Apply this style only to cinematography, rendering finish, and composition. Follow the beat, scene, character, and prop descriptions and reference images for exact identity, facial features, ethnicity, nationality, age, era, location, wardrobe, architecture, technology, materials, and action; do not override them with the style preset. Do not infer a desert setting, a nationality, an era, futuristic props, or a costume from this style alone. Preserve explicit non-human subjects and their described anatomy.",
+  "avoid_instructions": "Avoid anime, cartoon, illustration, painterly rendering, a visibly synthetic 3D-rendered look, plastic or waxy human skin, excessive beauty retouching, oversaturated neon grading, crushed unreadable shadows, blown highlights, overprocessed HDR, and unintended anatomy defects. No added text, watermarks, or labels on the image.",
+  "style_tag": "CINEMATIC PHOTOREALISM, RESTRAINED FILMIC GRADE",
+  "label": "史诗科幻·真人电影",
+  "style_family": "live_action",
+  "animation_subtype": ""
+}
