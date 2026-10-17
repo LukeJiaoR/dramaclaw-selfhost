@@ -53,7 +53,6 @@ from novelvideo.shared.billing_errors import (
     BillingRuleNotConfiguredError,
     InsufficientCreditsError,
 )
-from novelvideo.stage_asset_tasks import resolve_scene_360_image_model
 from novelvideo.task_backend.limits import ProjectUserTaskLimitExceeded
 from novelvideo.task_state import get_task_manager
 
@@ -386,6 +385,21 @@ def _write_canvas_with_node(tmp_path: Path, canvas_id: str, node: dict) -> None:
         ),
         encoding="utf-8",
     )
+
+
+@pytest.fixture
+def hub_image_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model availability is explicit; a selfhost default never bypasses the catalog."""
+    async def catalog(media_type: str, *, requester_user_id: str):
+        assert requester_user_id == "owner_1"
+        assert media_type == "image"
+        return [{
+            "id": "provider_hub_image",
+            "providerId": "provider_hub",
+            "apiModel": PROVIDER_HUB_IMAGE_MODEL,
+        }]
+
+    monkeypatch.setattr(freezone_routes, "_scoped_media_model_catalog", catalog)
 
 
 def _patch_celery_edit_enqueue(
@@ -3534,11 +3548,33 @@ def test_split_provider_and_model_accepts_newapi_selection_key() -> None:
     assert model == NEWAPI_IMAGE_MODEL
 
 
-def test_freezone_preserves_official_default_and_accepts_provider_hub() -> None:
-    assert FREEZONE_DEFAULT_IMAGE_MODEL == "newapi_gpt_image2"
-    assert _resolve_freezone_image_provider(None) == "newapi"
+def test_freezone_preserves_selfhost_hub_default_and_explicit_providers() -> None:
+    assert FREEZONE_DEFAULT_IMAGE_MODEL == "provider_hub_image"
+    assert _resolve_freezone_image_provider(None) == "provider_hub"
     assert _resolve_freezone_image_provider("provider_hub") == "provider_hub"
     assert _resolve_freezone_image_provider("newapi") == "newapi"
+
+
+@pytest.mark.asyncio
+async def test_selfhost_hub_default_does_not_bypass_visible_catalog(monkeypatch) -> None:
+    async def newapi_only_catalog(media_type: str, *, requester_user_id: str):
+        assert media_type == "image"
+        assert requester_user_id == "owner_1"
+        return [{
+            "id": "newapi_gpt_image2", "providerId": "newapi",
+            "apiModel": NEWAPI_IMAGE_MODEL,
+        }]
+
+    monkeypatch.setattr(freezone_routes, "_scoped_media_model_catalog", newapi_only_catalog)
+    with pytest.raises(HTTPException) as exc_info:
+        await freezone_routes._resolve_catalog_request(
+            "image", FREEZONE_DEFAULT_IMAGE_MODEL, None, requester_user_id="owner_1"
+        )
+    assert exc_info.value.status_code == 409
+    _schema, _params, entry = await freezone_routes._resolve_catalog_request(
+        "image", "newapi_gpt_image2", None, requester_user_id="owner_1"
+    )
+    assert entry["providerId"] == "newapi"
 
 
 def test_erase_prompt_mentions_masked_region_and_cleanup() -> None:
@@ -3550,7 +3586,7 @@ def test_erase_prompt_mentions_masked_region_and_cleanup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_masked_redraw_uses_default_official_model(
+async def test_masked_redraw_uses_default_provider_hub_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3585,8 +3621,8 @@ async def test_masked_redraw_uses_default_official_model(
 
     assert result["ok"] is True
     assert captured["task_type"] == "freezone_mask_edit"
-    assert captured["provider"] == "newapi"
-    assert captured["model"] == NEWAPI_IMAGE_MODEL
+    assert captured["provider"] == "provider_hub"
+    assert captured["model"] == PROVIDER_HUB_IMAGE_MODEL
     assert captured["quality"] == "low"
     assert captured["billing"]["feature_key"] == "freezone.image_edit"
     assert captured["billing"]["operation"] == "erase"
@@ -4915,6 +4951,7 @@ async def test_scene_360_endpoint_caps_mainline_image_size_to_2k(
         body=freezone_routes.FreezoneScene360Request(
             reference_url="/api/v1/projects/proj_freezone/media/assets/scenes/小区/master.png",
             image_size="4K",
+            model="newapi_gpt_image2",
             canvas_id="canvas_a",
             node_id="node_scene_360",
             quality="low",
@@ -5949,8 +5986,8 @@ async def test_skill_run_frame_accepts_plain_canvas_image_as_sketch_input(
     assert captured["payload"]["billing"] == {
         "feature_key": "mainline.render_regen",
         "pricing_kind": "image",
-        "pricing_model": freezone_routes.IMAGE_GENERATION_SELECTIONS["newapi_gpt_image2"]["model"],
-        "pricing_params": {"size": "1K", "quality": "medium"},
+        "pricing_model": freezone_routes.IMAGE_GENERATION_SELECTIONS["provider_hub_image"]["model"],
+        "pricing_params": {"size": "1K"},
     }
     assert captured["payload"]["config"]["canvas_sketch_paths"]["8"].endswith(
         "/freezone/plain_sketch.png"
@@ -6104,8 +6141,8 @@ async def test_skill_run_normalizes_project_media_url_before_dispatch(
     assert captured["payload"]["billing"] == {
         "feature_key": "mainline.sketch_regen",
         "pricing_kind": "image",
-        "pricing_model": freezone_routes.IMAGE_GENERATION_SELECTIONS["newapi_gpt_image2"]["model"],
-        "pricing_params": {"size": "1K", "quality": "low"},
+        "pricing_model": freezone_routes.IMAGE_GENERATION_SELECTIONS["provider_hub_image"]["model"],
+        "pricing_params": {"size": "1K"},
     }
     assert captured["episode"] == 1
     assert captured["beat_num"] == 8
@@ -7475,8 +7512,8 @@ async def test_skill_run_sketch_accepts_director_combined_background(
     assert captured["payload"]["billing"] == {
         "feature_key": "mainline.director_control_to_sketch",
         "pricing_kind": "image",
-        "pricing_model": freezone_routes.IMAGE_GENERATION_SELECTIONS["newapi_gpt_image2"]["model"],
-        "pricing_params": {"size": "1K", "quality": "low"},
+        "pricing_model": freezone_routes.IMAGE_GENERATION_SELECTIONS["provider_hub_image"]["model"],
+        "pricing_params": {"size": "1K"},
     }
     assert captured["episode"] == 1
     assert captured["beat_num"] == 8
@@ -7575,8 +7612,8 @@ async def test_skill_run_sketch_prefers_director_combined_over_background(
     assert captured["payload"]["billing"] == {
         "feature_key": "mainline.director_control_to_sketch",
         "pricing_kind": "image",
-        "pricing_model": freezone_routes.IMAGE_GENERATION_SELECTIONS["newapi_gpt_image2"]["model"],
-        "pricing_params": {"size": "1K", "quality": "low"},
+        "pricing_model": freezone_routes.IMAGE_GENERATION_SELECTIONS["provider_hub_image"]["model"],
+        "pricing_params": {"size": "1K"},
     }
     assert captured["episode"] == 1
     assert captured["beat_num"] == 8
@@ -8032,8 +8069,8 @@ async def test_skill_run_scene_360_uses_reverse_master_and_scene_slot_target(
     assert captured["task_type"] == "stage_asset"
     assert captured["payload"]["scene_name"] == "小区"
     assert captured["payload"]["step"] == "pano_from_master"
-    assert captured["payload"]["params"]["provider"] == "newapi"
-    assert captured["payload"]["params"]["model"] == NEWAPI_IMAGE_MODEL
+    assert captured["payload"]["params"]["provider"] == "provider_hub"
+    assert captured["payload"]["params"]["model"] == PROVIDER_HUB_IMAGE_MODEL
     assert captured["payload"]["params"]["image_size"] == "2K"
     assert captured["payload"]["params"]["update_manifest"] is False
     assert captured["payload"]["params"]["master_path"].endswith(
@@ -9332,6 +9369,7 @@ async def test_freezone_upscale_resolves_original_ratio_before_model_call(
 
 @pytest.mark.asyncio
 async def test_template_edit_projection_preserves_source_aspect_ratio(
+    hub_image_catalog: None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9375,6 +9413,7 @@ async def test_template_edit_projection_preserves_source_aspect_ratio(
 
 @pytest.mark.asyncio
 async def test_template_edit_light_correction_preserves_source_aspect_ratio(
+    hub_image_catalog: None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9410,6 +9449,7 @@ async def test_template_edit_light_correction_preserves_source_aspect_ratio(
 
 @pytest.mark.asyncio
 async def test_template_edit_story_pitch_four_grid_preserves_source_aspect_ratio(
+    hub_image_catalog: None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9444,6 +9484,7 @@ async def test_template_edit_story_pitch_four_grid_preserves_source_aspect_ratio
 
 @pytest.mark.asyncio
 async def test_template_edit_multi_camera_grid_preserves_source_aspect_ratio(
+    hub_image_catalog: None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9478,6 +9519,7 @@ async def test_template_edit_multi_camera_grid_preserves_source_aspect_ratio(
 
 @pytest.mark.asyncio
 async def test_template_edit_storyboard_25_grid_preserves_source_aspect_ratio(
+    hub_image_catalog: None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
