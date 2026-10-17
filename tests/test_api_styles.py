@@ -513,3 +513,34 @@ def test_config_style_helpers_do_not_fallback_to_hardcoded_presets(monkeypatch):
         config.get_style_labels()
     with pytest.raises(RuntimeError, match="style service unavailable"):
         config.list_available_styles()
+
+
+def test_epic_scifi_live_action_preset_is_listed_and_loads_complete_config():
+    import json
+    from pathlib import Path
+
+    from novelvideo.services.style_service import StyleService
+
+    style_id = "epic_scifi_live_action"
+    expected = json.loads(Path(f"src/novelvideo/styles/presets/{style_id}.json").read_text())
+    response = _client().get("/styles")
+    assert response.status_code == 200
+    listed = next(style for style in response.json()["data"] if style["id"] == style_id)
+    assert listed["label"] == "史诗科幻·真人电影"
+    assert listed["name"] == "Epic Sci-Fi Live Action"
+    assert listed["type"] == "preset"
+    assert listed["style_family"] == "live_action"
+    assert listed["animation_subtype"] == ""
+
+    response = _client().get(f"/styles/{style_id}")
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    detail = response.json()["data"]
+    for field, value in expected.items():
+        assert detail[field] == value
+    assert detail["is_preset"] is True
+    assert detail["base"] is None
+    assert StyleService.get_style_branch(style_id) == ("live_action", "")
+    runtime = StyleService.get_style_or_default(style_id).to_legacy_dict()
+    for field in ("style_instructions", "avoid_instructions", "style_tag", "style_family"):
+        assert runtime[field] == expected[field]

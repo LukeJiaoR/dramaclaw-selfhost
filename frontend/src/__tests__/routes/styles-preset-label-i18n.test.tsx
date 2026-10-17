@@ -3,7 +3,7 @@
 import type { ComponentType } from "react";
 import type { Style } from "@/types/style";
 
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
@@ -68,7 +68,12 @@ beforeAll(async () => {
     resources: {
       en: {
         translation: {
-          ingest: { visualStyles: { anime: "Anime Style" } },
+          ingest: {
+            visualStyles: {
+              anime: "Anime Style",
+              epicScifiLiveAction: "Epic Sci-Fi Live Action",
+            },
+          },
           common: { refresh: "Refresh", loading: "Loading", save: "Save", cancel: "Cancel" },
           styles: {
             labelField: "UI Label",
@@ -90,13 +95,15 @@ function renderStyles() {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const view = () => (
     <QueryClientProvider client={queryClient}>
       <I18nextProvider i18n={i18n}>
         <Component />
       </I18nextProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const result = render(view());
+  return { ...result, rerenderStyles: () => result.rerender(view()) };
 }
 
 async function openStyleDirective(user: ReturnType<typeof userEvent.setup>) {
@@ -176,5 +183,45 @@ describe("built-in preset labels in the style editor", () => {
     renderStyles();
 
     expect(await screen.findByLabelText("UI Label")).toHaveValue("我的风格");
+  });
+
+  it("keeps the epic preset usable when its list preview is unavailable", async () => {
+    styleQueryState.detail = {
+      id: "epic_scifi_live_action",
+      name: "Epic Sci-Fi Live Action",
+      label: "史诗科幻·真人电影",
+      type: "preset",
+      style_instructions: "photorealistic live-action cinematography",
+    } as Style;
+    const user = userEvent.setup();
+    renderStyles();
+
+    const item = await screen.findByRole("button", { name: /epic_scifi_live_action/ });
+    const preview = within(item).getByRole("img");
+    expect(preview).toHaveAttribute("src", expect.stringContaining("epic_scifi_live_action/preview"));
+    fireEvent.error(preview);
+
+    expect(within(item).queryByRole("img")).not.toBeInTheDocument();
+    expect(item.querySelector(".lucide-paintbrush")).toBeInTheDocument();
+    expect(item).toHaveTextContent("Epic Sci-Fi Live Action");
+    await user.click(item);
+    expect(await screen.findByLabelText("UI Label")).toHaveValue("Epic Sci-Fi Live Action");
+  });
+
+  it("tries an updated custom preview after an earlier image fails", async () => {
+    styleQueryState.detail = {
+      id: "my_style",
+      name: "My Style",
+      type: "custom",
+      preview_url: "/previews/old.png",
+    } as Style;
+    const { rerenderStyles } = renderStyles();
+    const item = await screen.findByRole("button", { name: /my_style/ });
+    fireEvent.error(within(item).getByRole("img"));
+    expect(within(item).queryByRole("img")).not.toBeInTheDocument();
+
+    styleQueryState.detail = { ...styleQueryState.detail, preview_url: "/previews/new.png" };
+    rerenderStyles();
+    expect(within(item).getByRole("img")).toHaveAttribute("src", "/previews/new.png");
   });
 });

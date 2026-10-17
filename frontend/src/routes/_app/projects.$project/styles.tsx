@@ -292,6 +292,7 @@ function StyleListItem({
   const display =
     preset && presetLabelKey ? t(presetLabelKey) : style.label || style.name;
   const previewSrc = preset ? stylePreviewUrl(style.id) : style.preview_url;
+  const [failedPreviewSrc, setFailedPreviewSrc] = useState<string | null>(null);
   return (
     <button
       type="button"
@@ -305,11 +306,13 @@ function StyleListItem({
           : "border-transparent bg-transparent",
       )}
     >
-      {previewSrc ? (
+      {previewSrc && previewSrc !== failedPreviewSrc ? (
         <img
+          key={previewSrc}
           src={previewSrc}
           alt={display}
           loading="lazy"
+          onError={() => setFailedPreviewSrc(previewSrc)}
           className="size-9 shrink-0 rounded-[6px] border border-white/10 object-cover"
         />
       ) : (
