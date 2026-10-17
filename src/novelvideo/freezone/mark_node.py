@@ -18,7 +18,7 @@ from novelvideo.freezone.vision_gateway import (
 from novelvideo.egress_context import TrustedEgressContext
 from novelvideo.official_defaults import DEFAULT_FREEZONE_VISION_MODEL
 
-FREEZONE_MARK_PROVIDER = "provider_hub"
+FREEZONE_MARK_PROVIDER = "newapi"
 
 
 def build_mark_detection_task(
@@ -139,10 +139,8 @@ async def detect_freezone_mark(
         box_height=box_height,
     )
     chosen = (provider or FREEZONE_MARK_PROVIDER).lower()
-    if chosen == "newapi":
-        chosen = "provider_hub"
-    if chosen != "provider_hub":
-        raise ValueError("Freezone mark detection only supports the Provider Hub gateway")
+    if chosen not in {"newapi", "provider_hub"}:
+        raise ValueError("Freezone mark detection only supports the NewAPI gateway")
     full_image = image_path.read_bytes()
     from novelvideo.freezone.presets import (
         complete_freezone_vision_egress,

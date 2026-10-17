@@ -8,9 +8,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Header } from "@/components/layout/header";
 
-const runtimeState = vi.hoisted(() => ({ authRequired: true, isCe: false }));
+const runtimeState = vi.hoisted(() => ({ authRequired: true, isCe: false, phoneVisible: false }));
 const authState = vi.hoisted(() => ({ username: "local", logout: vi.fn() }));
 const resetUserSessionStateMock = vi.hoisted(() => vi.fn());
+const securityState = vi.hoisted(() => ({
+  data: undefined as
+    | undefined
+    | { password_configured: boolean; phone: string | null; phone_masked: string | null },
+}));
 const brandingState = vi.hoisted(() => ({
   enabled: null as boolean | null,
   data: undefined as undefined | {
@@ -27,10 +32,20 @@ vi.mock("@/lib/reset-region-state", () => ({
 vi.mock("@/lib/runtime-config", () => ({
   authRequired: () => runtimeState.authRequired,
   isCeRuntime: () => runtimeState.isCe,
+  phoneOtpEntryVisible: () => runtimeState.phoneVisible,
 }));
 
 vi.mock("@/lib/queries/model-gateway", () => ({
   useModelGatewayConfig: () => ({ data: undefined }),
+}));
+
+vi.mock("@/components/settings/settings-dialog", () => ({
+  SettingsDialog: ({ open }: { open: boolean }) =>
+    open ? <div role="dialog">Settings dialog</div> : null,
+}));
+
+vi.mock("@/lib/queries/auth", () => ({
+  useAccountSecurity: () => securityState,
 }));
 
 vi.mock("@/lib/queries/org-branding", () => ({
@@ -59,10 +74,13 @@ vi.mock("react-i18next", () => ({
     t: (key: string) =>
       ({
         "app.logoHomeTooltip": "Home",
+        "header.settings": "Settings",
         "header.account.open": "Open account",
         "header.notifications": "Announcement Center",
         "header.account.changeAvatar": "Change avatar",
         "header.account.changePassword": "Change password",
+        "header.account.setPassword": "Set password",
+        "header.account.phoneBinding.title": "Bind phone",
         "header.account.selectLanguage": "Select language",
         "header.account.languageChinese": "Chinese",
         "header.account.languageEnglish": "English",
@@ -137,11 +155,13 @@ describe("Header runtime gating", () => {
   beforeEach(() => {
     runtimeState.authRequired = true;
     runtimeState.isCe = false;
+    runtimeState.phoneVisible = false;
     authState.username = "local";
     authState.logout.mockReset();
     resetUserSessionStateMock.mockReset();
     brandingState.enabled = null;
     brandingState.data = undefined;
+    securityState.data = undefined;
   });
 
   it("reads branding only for an authenticated EE session and renders it in the home link", () => {
@@ -171,6 +191,16 @@ describe("Header runtime gating", () => {
     expect(brandingState.enabled).toBe(false);
   });
 
+  it("keeps the settings entry available in EE runtime", () => {
+    runtimeState.isCe = false;
+
+    renderHeader();
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+
+    expect(screen.getByRole("dialog")).toHaveTextContent("Settings dialog");
+  });
+
   it("renders logout in the account panel when runtime requires auth", async () => {
     renderHeader();
 
@@ -178,6 +208,38 @@ describe("Header runtime gating", () => {
 
     expect(await screen.findByText("Log out")).toBeInTheDocument();
     expect(screen.getByText("Change password")).toBeInTheDocument();
+  });
+
+  it("shows a masked phone and first-password action for a passwordless account", async () => {
+    securityState.data = {
+      password_configured: false,
+      phone: "+8613800138000",
+      phone_masked: "138****8000",
+    };
+    renderHeader();
+
+    fireEvent.mouseEnter(screen.getByLabelText("Open account").parentElement!);
+
+    expect(await screen.findByText("138****8000")).toBeInTheDocument();
+    expect(screen.getByText("Set password")).toBeInTheDocument();
+  });
+
+  it.each([false, true])("gates first phone binding on phone entry visibility (%s)", async (visible) => {
+    runtimeState.phoneVisible = visible;
+    securityState.data = { password_configured: true, phone: null, phone_masked: null };
+    renderHeader();
+    fireEvent.mouseEnter(screen.getByLabelText("Open account").parentElement!);
+    await screen.findByText("Log out");
+    expect(screen.queryByText("Bind phone") !== null).toBe(visible);
+  });
+
+  it("does not offer replacing an existing phone", async () => {
+    runtimeState.phoneVisible = true;
+    securityState.data = { password_configured: true, phone: "+8613800138000", phone_masked: "138****8000" };
+    renderHeader();
+    fireEvent.mouseEnter(screen.getByLabelText("Open account").parentElement!);
+    await screen.findByText("Log out");
+    expect(screen.queryByText("Bind phone")).not.toBeInTheDocument();
   });
 
   it("moves the announcement entry from the header actions into the account panel", async () => {

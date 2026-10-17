@@ -5,14 +5,16 @@ import io
 import logging
 import os
 import re
-from contextlib import suppress
+import uuid
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 from novelvideo.api.auth import get_api_user, require_scope
+from novelvideo.api.responses import TemporaryFileResponse
+from novelvideo.api.upload_workers import run_asset_upload_operation
 from novelvideo.api.deps import (
     get_user_base_dir,
     get_state_dir,
@@ -28,6 +30,7 @@ from novelvideo.api.schemas import (
     VideoComposeRequest,
     TTSGenerateRequest,
     TTSPreviewRequest,
+    SystemVoicePrepareRequest,
     SketchGenerateRequest,
     GridRegenerateRequest,
     BeatsRegenerateRequest,
@@ -92,15 +95,7 @@ from novelvideo.services.background_anchor_service import (
 from novelvideo.utils.path_resolver import PathResolver, compute_identity_path, compute_portrait_path
 
 
-class _TemporaryFileResponse(FileResponse):
-    """Delete the response file after ASGI delivery, including failed or cancelled sends."""
-
-    async def __call__(self, scope, receive, send) -> None:
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            with suppress(OSError):
-                Path(self.path).unlink(missing_ok=True)
+_TemporaryFileResponse = TemporaryFileResponse
 
 router = APIRouter()
 
@@ -548,41 +543,50 @@ def _register_uploaded_pool_image(
     from novelvideo.generators.pool_indexer import (
         add_cell_with_dedup,
         build_pool_index,
-        load_pool_index,
-        save_pool_index,
+        _state_pool_index_path,
+        _load_pool_index_for_update,
+        _save_pool_index_unlocked,
+        index_file_lock,
     )
 
     grids_dir = project_dir / "grids" / f"ep{episode_num:03d}"
-    pool = load_pool_index(grids_dir) or build_pool_index(grids_dir, episode_num)
-    upload_dir = grids_dir / image_type
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    cell_path = upload_dir / f"beat_{beat_num:02d}_t{timestamp}.png"
-    image.save(cell_path, format="PNG")
+    with index_file_lock(_state_pool_index_path(grids_dir)):
+        index_path, pool = _load_pool_index_for_update(grids_dir)
+        pool = pool or build_pool_index(grids_dir, episode_num)
+        upload_dir = grids_dir / image_type
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        cell_path = upload_dir / f"beat_{beat_num:02d}_t{timestamp}.png"
+        canonical_dir = project_dir / (
+            "sketches" if image_type == "sketch" else "frames"
+        ) / f"ep{episode_num:03d}"
+        canonical_dir.mkdir(parents=True, exist_ok=True)
+        image.save(canonical_dir / f"beat_{beat_num:02d}.png", format="PNG")
+        image.save(cell_path, format="PNG")
 
-    pool_image = add_cell_with_dedup(
-        pool,
-        cell_path,
-        grids_dir,
-        beat_num,
-        timestamp,
-        img_type=image_type,
-        mode="upload",
-        grid_index=0,
-        cell_index=0,
-        grid_path="",
-        row=0,
-        col=0,
-    )
-    if pool_image is None:
-        pool_id = f"beat_{beat_num:02d}_t{timestamp}_{image_type}"
-        assignment_path = None
-    else:
-        pool_id = pool_image.id
-        assignment_path = pool_image.cell_path
-    if image_type != "sketch" and assignment_path:
-        pool.beat_assignments[str(beat_num)] = assignment_path
-    save_pool_index(pool, grids_dir)
+        pool_image = add_cell_with_dedup(
+            pool,
+            cell_path,
+            grids_dir,
+            beat_num,
+            timestamp,
+            img_type=image_type,
+            mode="upload",
+            grid_index=0,
+            cell_index=0,
+            grid_path="",
+            row=0,
+            col=0,
+        )
+        if pool_image is None:
+            pool_id = f"beat_{beat_num:02d}_t{timestamp}_{image_type}"
+            assignment_path = None
+        else:
+            pool_id = pool_image.id
+            assignment_path = pool_image.cell_path
+        if image_type != "sketch" and assignment_path:
+            pool.beat_assignments[str(beat_num)] = assignment_path
+        _save_pool_index_unlocked(pool, index_path)
     return pool_id
 
 
@@ -2219,6 +2223,12 @@ async def generate_sketches(
 
     dispatch_grid_indices = list(range(len(grid_plan))) if generate_all_grids else [body.grid_index]
     if ctx is not None:
+        batch_size = len(dispatch_grid_indices)
+        batch_id = (
+            f"sketch-grid-{episode_num}-{uuid.uuid4().hex}"
+            if generate_all_grids and batch_size > 1
+            else ""
+        )
         queued_tasks = []
         rejected: list[dict[str, Any]] = []
         for position, grid_index in enumerate(dispatch_grid_indices):
@@ -2240,6 +2250,15 @@ async def generate_sketches(
                         "output_dir": output_dir,
                         "config": {**base_config, "grid_index": grid_index},
                         "billing": billing,
+                        **(
+                            {
+                                "batch_id": batch_id,
+                                "batch_size": batch_size,
+                                "display_name": f"第 {episode_num} 集草图批次",
+                            }
+                            if batch_id
+                            else {}
+                        ),
                     },
                 )
             except _FANOUT_ACTIVE_LIMIT_ERRORS as exc:
@@ -2418,6 +2437,59 @@ def _voice_prereq_error_response(errors: list[str]) -> dict:
         "ok": False,
         "code": "voice_prereq_required",
         "error": f"{preview}{suffix}",
+    }
+
+
+@router.post("/projects/{project}/episodes/{episode_num}/audio/system-voices/prepare")
+async def prepare_system_voices_for_agent(
+    project: str,
+    episode_num: int,
+    body: SystemVoicePrepareRequest,
+    user: dict = Depends(get_api_user),
+):
+    """Prepare missing system voice references for the outer Hermes assistant only."""
+
+    agent_kind = str(user.get("agent_kind") or "").strip()
+    if agent_kind not in {"hermes", "local_mcp"}:
+        raise HTTPException(status_code=403, detail="system voice setup is agent-only")
+    if not body.confirmed:
+        return {
+            "ok": False,
+            "code": "system_voice_confirmation_required",
+            "error": "使用系统声线前需要用户明确确认",
+        }
+
+    resolved = await _resolve_generation_project(project, user, required_role="editor")
+    ctx = resolved.ctx
+    if ctx is None:
+        return {
+            "ok": False,
+            "code": "project_context_required",
+            "error": "系统声线准备需要 project context",
+        }
+
+    queued = await get_task_backend().enqueue_project_task(
+        ctx,
+        product_surface="mainline",
+        task_type="system_voice_setup",
+        queue_kind="default",
+        episode=episode_num,
+        payload={
+            "episode": episode_num,
+            "output_dir": resolved.output_dir,
+            "state_dir": resolved.state_dir,
+        },
+    )
+    return {
+        "ok": True,
+        "task_type": "system_voice_setup",
+        "task_id": queued.task_state.task_id,
+        "task_key": project_task_state_key(
+            "system_voice_setup", ctx.project_id, episode_num
+        ),
+        "backend": queued.backend,
+        "queue": queued.queue,
+        "message": f"第 {episode_num} 集系统声线准备已进入队列",
     }
 
 
@@ -3316,6 +3388,19 @@ async def regenerate_beats(
     if detection_error:
         return {"ok": False, "error": detection_error}
 
+    sketch_paths = PathResolver(output_dir, episode_num)
+    missing_sketches = [
+        beat_num
+        for beat_num in body.beat_indices
+        if not sketch_paths.sketch(beat_num).is_file()
+    ]
+    if missing_sketches:
+        missing_labels = ", ".join(f"#{beat_num}" for beat_num in missing_sketches)
+        raise HTTPException(
+            422,
+            f"Render 前请先为 beat {missing_labels} 生成或上传草图。",
+        )
+
     character_map = await _build_character_map(
         store,
         selected_beats,
@@ -3369,6 +3454,8 @@ async def regenerate_beats(
                 "output_dir": output_dir,
                 "config": {**config, "mode_key": mode_key},
                 "billing": billing,
+                **({"batch_id": body.batch_id} if body.batch_id else {}),
+                **({"batch_size": body.batch_size} if body.batch_size else {}),
             },
         )
         return {
@@ -4938,7 +5025,13 @@ async def generate_single_video(
             queue_kind="video",
             episode=episode_num,
             beat_num=beat_num,
-            payload={"config": config, "output_dir": output_dir, "billing": billing},
+            payload={
+                "config": config,
+                "output_dir": output_dir,
+                "billing": billing,
+                **({"batch_id": body.batch_id} if body.batch_id else {}),
+                **({"batch_size": body.batch_size} if body.batch_size else {}),
+            },
         )
         return {
             "ok": True,
@@ -5055,7 +5148,7 @@ async def list_grids(project: str, episode_num: int, user: dict = Depends(get_ap
     )
 
     grids_dir = project_dir / "grids" / f"ep{episode_num:03d}"
-    pool = load_pool_index(grids_dir)
+    pool = await run_asset_upload_operation(load_pool_index, grids_dir)
     if not pool:
         return {"ok": True, "data": None}
 
@@ -5171,7 +5264,7 @@ async def get_beat_sketch_candidates(
             local_path=current_path,
         )
 
-    pool = load_pool_index(grids_dir)
+    pool = await run_asset_upload_operation(load_pool_index, grids_dir)
     if not pool:
         return {
             "ok": True,
@@ -5271,11 +5364,11 @@ async def select_pool_image(
         compute_beat_content_hash,
         is_pool_image_stale,
         load_pool_index,
-        save_pool_index,
+        assign_beat_image,
     )
 
     grids_dir = project_dir / "grids" / f"ep{episode_num:03d}"
-    pool = load_pool_index(grids_dir)
+    pool = await run_asset_upload_operation(load_pool_index, grids_dir)
     if not pool:
         return {"ok": False, "error": "No pool index found. Generate grids first."}
 
@@ -5335,18 +5428,16 @@ async def select_pool_image(
         )
     else:
         frames_dir = project_dir / "frames" / f"ep{episode_num:03d}"
-        frames_dir.mkdir(parents=True, exist_ok=True)
         dest = frames_dir / f"beat_{beat_num:02d}.png"
-        shutil.copy2(str(cell_full), str(dest))
-        pool.beat_assignments[str(beat_num)] = cell_path
+        await run_asset_upload_operation(
+            assign_beat_image, grids_dir, beat_num, cell_path, image_type
+        )
         rel = f"frames/ep{episode_num:03d}/beat_{beat_num:02d}.png"
         data["frame_url"] = make_static_url_for_context(
             resolved.ctx,
             rel,
             local_path=dest,
         )
-
-    save_pool_index(pool, grids_dir)
 
     return {
         "ok": True,
@@ -5371,11 +5462,10 @@ async def upload_beat_sketch(
         return {"ok": False, "error": str(exc)}
 
     sketches_dir = project_dir / "sketches" / f"ep{episode_num:03d}"
-    sketches_dir.mkdir(parents=True, exist_ok=True)
     sketch_path = sketches_dir / f"beat_{beat_num:02d}.png"
-    image.save(sketch_path, format="PNG")
 
-    pool_id = _register_uploaded_pool_image(
+    pool_id = await run_asset_upload_operation(
+        _register_uploaded_pool_image,
         project_dir=project_dir,
         episode_num=episode_num,
         beat_num=beat_num,
@@ -5415,11 +5505,10 @@ async def upload_beat_render(
         return {"ok": False, "error": str(exc)}
 
     frames_dir = project_dir / "frames" / f"ep{episode_num:03d}"
-    frames_dir.mkdir(parents=True, exist_ok=True)
     frame_path = frames_dir / f"beat_{beat_num:02d}.png"
-    image.save(frame_path, format="PNG")
 
-    pool_id = _register_uploaded_pool_image(
+    pool_id = await run_asset_upload_operation(
+        _register_uploaded_pool_image,
         project_dir=project_dir,
         episode_num=episode_num,
         beat_num=beat_num,
@@ -5624,48 +5713,29 @@ async def upload_grid(
     if suffix == "jpeg":
         suffix = "jpg"
 
-    from datetime import datetime
-    from novelvideo.generators.pool_indexer import (
-        build_pool_index,
-        load_pool_index,
-        register_grid_entry,
-        save_pool_index,
+    from novelvideo.api.upload_workers import (
+        asset_resource_lock,
+        run_asset_upload_operation,
     )
+    from novelvideo.generators.pool_indexer import persist_uploaded_grid
 
     grids_dir = project_dir / "grids" / f"ep{episode_num:03d}"
-    upload_dir = grids_dir / "custom"
-    upload_dir.mkdir(parents=True, exist_ok=True)
     filename = _uploaded_grid_filename(grid_type, mode_key, parsed_beats, suffix)
-    grid_path = upload_dir / filename
-    grid_path.write_bytes(content)
-    grid_rel = grid_path.relative_to(grids_dir).as_posix()
-
-    pool = load_pool_index(grids_dir) or build_pool_index(grids_dir, episode_num)
-    entry = pool.find_grid(grid_type, mode_key, parsed_beats) if parsed_beats else None
-    if entry is None:
-        entry = register_grid_entry(
-            pool=pool,
-            grid_type=grid_type,
-            mode_key=mode_key,
-            beat_nums=parsed_beats,
-            preset="custom",
-            grid_path=grid_rel,
-            prompt_path="",
+    # All scopes in this episode share the same index. Keep the async lock until
+    # the worker has committed or rolled back, including repeated cancellation.
+    async with asset_resource_lock(("grid-upload", str(grids_dir))):
+        grid_path = await run_asset_upload_operation(
+            persist_uploaded_grid,
+            grids_dir,
+            episode_num,
+            grid_index,
+            grid_type,
+            mode_key,
+            parsed_beats,
+            filename,
+            content,
         )
-    else:
-        entry.grid_path = grid_rel
-        entry.preset = "custom"
-        entry.generated_at = datetime.now()
-
-    for image in pool.images:
-        if image.type != grid_type or image.grid_index != grid_index:
-            continue
-        if parsed_beats and image.original_beat not in parsed_beats:
-            continue
-        image.grid_path = grid_rel
-        image.mode = mode_key
-
-    save_pool_index(pool, grids_dir)
+    grid_rel = grid_path.relative_to(grids_dir).as_posix()
 
     return {
         "ok": True,
@@ -5709,7 +5779,7 @@ async def export_grid_prompt(
     from novelvideo.generators.pool_indexer import load_pool_index
 
     grids_dir = project_dir / "grids" / f"ep{episode_num:03d}"
-    pool = load_pool_index(grids_dir)
+    pool = await run_asset_upload_operation(load_pool_index, grids_dir)
     if not pool:
         return {"ok": False, "error": "No pool index found. Generate grids first."}
 
@@ -5776,7 +5846,7 @@ async def sketch_grid_preview(
         return {"ok": False, "error": "beat_numbers is required"}
 
     paths = build_beat_sketch_paths(ep_grids_dir, beat_numbers)
-    pool = load_pool_index(ep_grids_dir)
+    pool = await run_asset_upload_operation(load_pool_index, ep_grids_dir)
     if pool:
         latest_pool_paths: dict[int, tuple[float, str]] = {}
         for img in pool.images:
@@ -5865,7 +5935,7 @@ async def cut_grid(
     grid_image_path = None
     from novelvideo.generators.pool_indexer import load_pool_index
 
-    pool = load_pool_index(episode_grids_dir)
+    pool = await run_asset_upload_operation(load_pool_index, episode_grids_dir)
     entry = _find_pool_grid_entry(
         pool,
         grid_type=body.grid_type,

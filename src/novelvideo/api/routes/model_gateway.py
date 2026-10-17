@@ -10,20 +10,28 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from novelvideo import config as app_config
+from novelvideo.chat.codex_app_server import restart_shared_codex_runtime_when_idle
 from novelvideo.model_gateway_settings import (
+    AGENT_LLM_MODE_INHERIT,
+    AGENT_LLM_MODE_THIRD_PARTY,
     MODE_CUSTOM,
+    CUSTOM_LLM_MODE_ADVANCED,
+    CUSTOM_LLM_MODE_RELAYCLAW_BRAINCLAW,
     MODE_OFFICIAL,
     MODE_HYBRID,
     build_media_relay_status,
     build_model_gateway_status,
+    get_model_gateway_settings,
     get_effective_media_relay_config,
     get_official_media_catalog_update_status,
     normalize_relay_base_url,
     normalize_api_key,
     parse_comfyui_channel_workflows,
     save_media_relay_config,
+    save_agent_llm_config,
     save_official_media_catalog_auto_update,
     save_official_newapi_key,
+    save_relayclaw_brainclaw_key,
     save_custom_newapi_gateway,
     save_newapi_database_config,
     save_newapi_embedding_model_config,
@@ -34,19 +42,20 @@ from novelvideo.model_gateway_settings import (
     get_newapi_provider_channel,
     get_newapi_provider_channels,
     set_model_gateway_mode,
+    set_custom_llm_mode,
 )
 from novelvideo.official_media_catalog_remote import (
     check_official_media_catalog_update,
 )
 from novelvideo.model_gateway_runtime import refresh_model_gateway_runtime
+from novelvideo.service_operation_gate import (
+    ServiceOperationExcluded,
+    require_legacy_local_service_operation,
+)
 from novelvideo.provider_hub_admin import (
     is_provider_hub_gateway,
     sync_provider_hub_channel_payload,
     update_provider_hub_service_credentials,
-)
-from novelvideo.service_operation_gate import (
-    ServiceOperationExcluded,
-    require_legacy_local_service_operation,
 )
 from novelvideo.shared.runtime_env import is_ce_effective
 from novelvideo.media_model_request_schema import validate_media_model_catalog_config
@@ -57,6 +66,7 @@ from novelvideo.newapi_provisioner import (
     delete_channel_by_name,
     ensure_newapi_setup,
     ensure_admin_access_token,
+    fetch_provider_channel_models,
     get_provisioner_config,
     list_channel_types,
     mask_token,
@@ -68,6 +78,14 @@ from novelvideo.newapi_provisioner import (
 )
 
 router = APIRouter(prefix="/model-gateway")
+
+
+def _refresh_runtime_after_gateway_write() -> dict[str, Any]:
+    """Refresh caches and invalidate the effective Agent route on every worker."""
+
+    runtime = refresh_model_gateway_runtime()
+    runtime["codexAppServer"] = restart_shared_codex_runtime_when_idle()
+    return runtime
 
 
 OFFICIAL_ONLY_MEDIA_MODEL_NAMES = {
@@ -167,6 +185,22 @@ class OfficialMediaCatalogPreferencesBody(BaseModel):
     auto_update: bool = Field(alias="autoUpdate")
 
 
+class BrainClawGatewayBody(BaseModel):
+    new_api_base_url: str | None = Field(default=None, alias="newApiBaseUrl")
+    new_api_api_key: str | None = Field(default=None, alias="newApiApiKey")
+
+
+class CustomLlmModeBody(BaseModel):
+    mode: str
+
+
+class AgentLlmConfigBody(BaseModel):
+    mode: str
+    base_url: str | None = Field(default=None, alias="baseUrl")
+    api_key: str | None = Field(default=None, alias="apiKey")
+    model: str | None = None
+
+
 class MediaRelayConfigBody(BaseModel):
     provider: str = "aliyun_oss"
     ttl_seconds: int = Field(default=1800, alias="ttlSeconds")
@@ -258,6 +292,13 @@ class SyncProviderChannelBody(BaseModel):
     provider: str
     upstream_key: str | None = Field(default=None, alias="upstreamKey")
     base_url: str | None = Field(default=None, alias="baseUrl")
+
+
+class ProviderChannelModelsBody(BaseModel):
+    new_api_base_url: str | None = Field(default=None, alias="newApiBaseUrl")
+    database: NewApiDatabaseBody | None = None
+    provider: str
+    type: int | None = None
 
 
 class MediaModelConfigBody(BaseModel):
@@ -569,7 +610,7 @@ async def enable_official_gateway() -> dict[str, Any]:
             detail="official NewAPI gateway is not configured",
         )
     set_model_gateway_mode(MODE_OFFICIAL)
-    runtime = refresh_model_gateway_runtime()
+    runtime = _refresh_runtime_after_gateway_write()
     return {
         "ok": True,
         "data": build_model_gateway_status(
@@ -595,7 +636,7 @@ async def enable_custom_gateway() -> dict[str, Any]:
             status_code=400, detail="local NewAPI gateway is not configured"
         )
     set_model_gateway_mode(MODE_CUSTOM)
-    runtime = refresh_model_gateway_runtime()
+    runtime = _refresh_runtime_after_gateway_write()
     return {
         "ok": True,
         "data": build_model_gateway_status(
@@ -622,7 +663,7 @@ async def enable_hybrid_gateway() -> dict[str, Any]:
             detail="local and official NewAPI gateways must both be configured",
         )
     set_model_gateway_mode(MODE_HYBRID)
-    runtime = refresh_model_gateway_runtime()
+    runtime = _refresh_runtime_after_gateway_write()
     return {
         "ok": True,
         "data": build_model_gateway_status(
@@ -643,7 +684,158 @@ async def save_official_gateway_config(body: OfficialGatewayBody) -> dict[str, A
     if not api_key:
         raise HTTPException(status_code=400, detail="newApiApiKey is required")
     save_official_newapi_key(api_key=api_key, activate=True)
-    runtime = refresh_model_gateway_runtime()
+    runtime = _refresh_runtime_after_gateway_write()
+    return {
+        "ok": True,
+        "data": build_model_gateway_status(
+            official_base_url=app_config.OFFICIAL_NEWAPI_BASE_URL,
+            official_api_key=app_config.NEWAPI_API_KEY,
+        ),
+        "runtime": runtime,
+    }
+
+
+@router.post("/agent/config")
+async def save_agent_gateway_config(body: AgentLlmConfigBody) -> dict[str, Any]:
+    """Save the CE Agent route independently from media gateway selection."""
+    try:
+        require_ce_gateway_management()
+    except PermissionError as exc:
+        raise _permission_error(exc) from exc
+    if body.mode not in {AGENT_LLM_MODE_INHERIT, AGENT_LLM_MODE_THIRD_PARTY}:
+        raise HTTPException(status_code=400, detail="unsupported Agent LLM mode")
+
+    if body.mode == AGENT_LLM_MODE_THIRD_PARTY:
+        settings = get_model_gateway_settings()
+        saved_base_url = normalize_relay_base_url(
+            settings.get("agent_llm_base_url", "")
+        )
+        base_url = normalize_relay_base_url(body.base_url or saved_base_url)
+        api_key = normalize_api_key(body.api_key)
+        model = str(body.model or settings.get("agent_llm_model", "")).strip()
+        endpoint_changed = bool(body.base_url) and base_url != saved_base_url
+        has_saved_key = bool(normalize_api_key(settings.get("agent_llm_api_key", "")))
+        if not base_url:
+            raise HTTPException(status_code=400, detail="baseUrl is required")
+        if not model:
+            raise HTTPException(status_code=400, detail="model is required")
+        if not api_key and (not has_saved_key or endpoint_changed):
+            raise HTTPException(status_code=400, detail="apiKey is required")
+        save_agent_llm_config(
+            mode=body.mode,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+        )
+    else:
+        save_agent_llm_config(mode=body.mode)
+
+    runtime = _refresh_runtime_after_gateway_write()
+    return {
+        "ok": True,
+        "data": build_model_gateway_status(
+            official_base_url=app_config.OFFICIAL_NEWAPI_BASE_URL,
+            official_api_key=app_config.NEWAPI_API_KEY,
+        ),
+        "runtime": runtime,
+    }
+
+
+@router.post("/custom/brainclaw/config")
+async def save_custom_brainclaw_config(
+    body: BrainClawGatewayBody,
+) -> dict[str, Any]:
+    """Save the BrainClaw endpoint for Custom mode (does not switch the active mode)."""
+    try:
+        require_ce_gateway_management()
+    except PermissionError as exc:
+        raise _permission_error(exc) from exc
+    current = build_model_gateway_status(
+        official_base_url=app_config.OFFICIAL_NEWAPI_BASE_URL,
+        official_api_key=app_config.NEWAPI_API_KEY,
+    )
+    api_key = normalize_api_key(body.new_api_api_key)
+    base_url = normalize_relay_base_url(body.new_api_base_url)
+    # A custom endpoint must carry its own key. The previous condition accepted
+    # a non-empty apiKeyPreview as proof one existed, but the preview falls back
+    # to the official key — so saving a custom URL with an empty key was
+    # accepted, and every later request sent the official RelayClaw credential
+    # to that host.
+    from novelvideo.model_gateway_settings import _is_official_relay_url
+
+    target_is_official = _is_official_relay_url(base_url or current["brainclaw"]["baseUrl"])
+    has_dedicated_key = bool(current["brainclaw"].get("dedicatedKeyConfigured"))
+    if not api_key and not has_dedicated_key and not target_is_official:
+        raise HTTPException(
+            status_code=400,
+            detail="newApiApiKey is required for a custom BrainClaw endpoint")
+    if not api_key and not current["brainclaw"]["apiKeyPreview"]:
+        raise HTTPException(status_code=400, detail="newApiApiKey is required")
+    if body.new_api_base_url is not None and not base_url:
+        raise HTTPException(status_code=400, detail="newApiBaseUrl is required")
+    save_relayclaw_brainclaw_key(
+        api_key=api_key,
+        base_url=base_url,
+    )
+    runtime = _refresh_runtime_after_gateway_write()
+    return {
+        "ok": True,
+        "data": build_model_gateway_status(
+            official_base_url=app_config.OFFICIAL_NEWAPI_BASE_URL,
+            official_api_key=app_config.NEWAPI_API_KEY,
+        ),
+        "runtime": runtime,
+    }
+
+
+@router.post("/custom/brainclaw/enable")
+async def enable_custom_brainclaw() -> dict[str, Any]:
+    try:
+        require_ce_gateway_management()
+    except PermissionError as exc:
+        raise _permission_error(exc) from exc
+    status = build_model_gateway_status(
+        official_base_url=app_config.OFFICIAL_NEWAPI_BASE_URL,
+        official_api_key=app_config.NEWAPI_API_KEY,
+    )
+    if not status["brainclaw"]["configured"]:
+        raise HTTPException(
+            status_code=400, detail="RelayClaw API key is not configured"
+        )
+    set_custom_llm_mode(CUSTOM_LLM_MODE_RELAYCLAW_BRAINCLAW)
+    runtime = _refresh_runtime_after_gateway_write()
+    return {
+        "ok": True,
+        "data": build_model_gateway_status(
+            official_base_url=app_config.OFFICIAL_NEWAPI_BASE_URL,
+            official_api_key=app_config.NEWAPI_API_KEY,
+        ),
+        "runtime": runtime,
+    }
+
+
+@router.post("/custom/llm-mode")
+async def save_custom_llm_routing_mode(body: CustomLlmModeBody) -> dict[str, Any]:
+    try:
+        require_ce_gateway_management()
+    except PermissionError as exc:
+        raise _permission_error(exc) from exc
+    if body.mode not in {
+        CUSTOM_LLM_MODE_RELAYCLAW_BRAINCLAW,
+        CUSTOM_LLM_MODE_ADVANCED,
+    }:
+        raise HTTPException(status_code=400, detail="unsupported custom LLM mode")
+    if body.mode == CUSTOM_LLM_MODE_RELAYCLAW_BRAINCLAW:
+        status = build_model_gateway_status(
+            official_base_url=app_config.OFFICIAL_NEWAPI_BASE_URL,
+            official_api_key=app_config.NEWAPI_API_KEY,
+        )
+        if not status["brainclaw"]["configured"]:
+            raise HTTPException(
+                status_code=400, detail="RelayClaw API key is not configured"
+            )
+    set_custom_llm_mode(body.mode)
+    runtime = _refresh_runtime_after_gateway_write()
     return {
         "ok": True,
         "data": build_model_gateway_status(
@@ -765,7 +957,7 @@ async def init_custom_newapi(body: NewApiInitBody = NewApiInitBody()) -> dict[st
             activate=True,
         )
         _save_request_database_config(cfg, body.database)
-        runtime = refresh_model_gateway_runtime()
+        runtime = _refresh_runtime_after_gateway_write()
     except PermissionError as exc:
         raise _permission_error(exc) from exc
     except ValueError as exc:
@@ -967,6 +1159,48 @@ async def get_custom_newapi_channel_types() -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"ok": True, "data": {"items": items}}
+
+
+@router.post("/custom/newapi/provider-channel/models")
+async def get_custom_newapi_provider_channel_models(
+    body: ProviderChannelModelsBody,
+) -> dict[str, Any]:
+    try:
+        require_ce_gateway_management()
+    except PermissionError as exc:
+        raise _permission_error(exc) from None
+    provider = body.provider.strip().lower()
+    if not provider:
+        raise HTTPException(status_code=400, detail="provider is required")
+    if body.type is not None and body.type <= 0:
+        raise HTTPException(status_code=400, detail="type must be positive")
+
+    def discover() -> dict[str, Any]:
+        cfg = _get_provisioner_config_from_request(body.new_api_base_url, body.database)
+        saved_channel = get_newapi_provider_channel(provider) or {}
+        channel_type = body.type or int(saved_channel.get("type") or 0) or None
+        admin = ensure_admin_access_token(cfg)
+        return fetch_provider_channel_models(
+            cfg, admin, provider=provider, channel_type=channel_type
+        )
+
+    try:
+        data = await asyncio.to_thread(discover)
+    except LookupError:
+        raise HTTPException(
+            status_code=404, detail="provider channel not found; save and sync it first"
+        ) from None
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504, detail="NewAPI provider model discovery timed out"
+        ) from None
+    except Exception:
+        # Configuration, admin-token checks and channel lookup can also contain
+        # credentials in their exceptions. Keep all management failures opaque.
+        raise HTTPException(
+            status_code=502, detail="NewAPI provider model discovery failed"
+        ) from None
+    return {"ok": True, "data": data}
 
 
 @router.post("/custom/newapi/provider-channel/sync")

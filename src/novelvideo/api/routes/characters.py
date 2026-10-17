@@ -13,8 +13,6 @@ from urllib.parse import quote, urlencode
 from fastapi import APIRouter, Depends, UploadFile, File, Query
 from fastapi.responses import JSONResponse
 
-logger = logging.getLogger("novelvideo.api.characters")
-
 from novelvideo.api.asset_metadata import newest_updated_at, tree_updated_at
 from novelvideo.api.auth import get_api_user
 from novelvideo.api.upload_workers import (
@@ -90,6 +88,8 @@ from novelvideo.seedance2_i2v.character_voice_storage import (
 )
 from novelvideo.sqlite_store import SQLiteStore
 from novelvideo.voice_design import generate_voice_design_audio, optimize_voice_description
+
+logger = logging.getLogger("novelvideo.api.characters")
 
 router = APIRouter()
 
@@ -1481,23 +1481,9 @@ async def generate_character_voice_sample(
         return {"ok": False, "error": f"Character '{name}' not found"}
     if slot not in VOICE_SAMPLE_SLOTS:
         return {"ok": False, "error": f"Unsupported voice slot: {slot}"}
-    try:
-        content = await generate_voice_design_audio(
-            description=body.description,
-            preview_text=body.preview_text,
-        )
-        rel_path, sha256, updated_at = persist_character_voice_file(
-            project_dir=project_dir,
-            character_name=name,
-            slot=slot,
-            filename="ai-voice.mp3",
-            content=content,
-        )
-    except (RuntimeError, ValueError) as exc:
-        return {"ok": False, "error": str(exc)}
-    return {
-        "ok": True,
-        "data": await _apply_character_voice_update(
+    async def finalize_voice_update(result):
+        rel_path, sha256, updated_at = result
+        return await _apply_character_voice_update(
             ctx=ctx,
             project_dir=project_dir,
             character=character,
@@ -1507,8 +1493,29 @@ async def generate_character_voice_sample(
             sha256=sha256,
             updated_at=updated_at,
             voice_prompt=body.description.strip(),
-        ),
-    }
+        )
+
+    try:
+        content = await generate_voice_design_audio(
+            description=body.description,
+            preview_text=body.preview_text,
+        )
+        key = character_voice_resource_key(
+            project_dir=project_dir, character_name=name, slot=slot
+        )
+        async with voice_resource_lock(key):
+            data = await run_voice_media_operation(
+                persist_character_voice_file,
+                project_dir=project_dir,
+                character_name=name,
+                slot=slot,
+                filename="ai-voice.mp3",
+                content=content,
+                finalize=finalize_voice_update,
+            )
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "data": data}
 
 
 @router.post("/projects/{project}/characters/{name}/voice-samples/{slot}/optimize-prompt")

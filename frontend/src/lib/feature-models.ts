@@ -64,7 +64,10 @@ export const FEATURE_MODEL_GROUPS: readonly FeatureModelGroup[] = [
   },
   {
     key: "sceneLibrary",
-    features: [{ id: "SCENE_BUILD", defaultModel: "DC-scene-builder-LLM" }],
+    features: [
+      { id: "CHARACTER_BUILD", defaultModel: "DC-character-builder-LLM" },
+      { id: "SCENE_BUILD", defaultModel: "DC-scene-builder-LLM" },
+    ],
   },
   {
     key: "freezone",
@@ -72,6 +75,7 @@ export const FEATURE_MODEL_GROUPS: readonly FeatureModelGroup[] = [
       { id: "FREEZONE_TRANSLATION", defaultModel: "DC-freezone-translator-LLM" },
       { id: "FREEZONE_TEXT_WRITER", defaultModel: "DC-freezone-text-writer-LLM" },
       { id: "FREEZONE_STORY_SCRIPT", defaultModel: "DC-freezone-story-script-writer-LLM" },
+      { id: "FREEZONE_RECIPE_COMPILER", defaultModel: "DC-freezone-recipe-compiler-LLM" },
       {
         id: "FREEZONE_VISION",
         defaultModel: "DC-freezone-vision-LLM",
@@ -114,7 +118,7 @@ export const FEATURE_MODEL_GROUPS: readonly FeatureModelGroup[] = [
         requiresVision: true,
       },
       {
-        id: "SCENE_OVERLAP",
+        id: "SCENE_OVERLAP_ANALYSIS",
         defaultModel: "DC-scene-overlap-analyzer-LLM",
         requiresVision: true,
       },
@@ -152,6 +156,7 @@ export const FEATURE_MODEL_PRODUCT_GROUPS: readonly FeatureModelGroup[] = [
       productFeature("FREEZONE_TRANSLATION"),
       productFeature("FREEZONE_TEXT_WRITER"),
       productFeature("FREEZONE_STORY_SCRIPT"),
+      productFeature("FREEZONE_RECIPE_COMPILER"),
       productFeature("FREEZONE_VISION"),
       productFeature("STAGING_PROP"),
     ],
@@ -160,7 +165,10 @@ export const FEATURE_MODEL_PRODUCT_GROUPS: readonly FeatureModelGroup[] = [
     key: "xialiao",
     features: [productFeature("CONTENT_REWRITER"), productFeature("SCREENPLAY_NORMALIZER")],
   },
-  { key: "xiatan", features: [productFeature("SCENE_BUILD")] },
+  {
+    key: "xiatan",
+    features: [productFeature("CHARACTER_BUILD"), productFeature("SCENE_BUILD")],
+  },
   {
     key: "xiajing",
     features: [
@@ -178,7 +186,7 @@ export const FEATURE_MODEL_PRODUCT_GROUPS: readonly FeatureModelGroup[] = [
       productFeature("EPISODE_SCENE_RECONCILE"),
       productFeature("NARRATED_SCENE_ASSET"),
       productFeature("BLOCK_WORLD"),
-      productFeature("SCENE_OVERLAP"),
+      productFeature("SCENE_OVERLAP_ANALYSIS"),
       productFeature("SCENE_SPATIAL_CONTRACT"),
     ],
   },

@@ -341,6 +341,12 @@ function normalizeFeatureModelSettings(
     }
   }
 
+  // Preserve persisted selfhost choices after the upstream route rename.
+  if (!featureModels.SCENE_OVERLAP_ANALYSIS && featureModels.SCENE_OVERLAP) {
+    featureModels.SCENE_OVERLAP_ANALYSIS = featureModels.SCENE_OVERLAP;
+  }
+  delete featureModels.SCENE_OVERLAP;
+
   const mediaModels: Record<string, MediaModelEntry> = {};
   const rawMediaModels = (input as { mediaModels?: unknown } | null | undefined)?.mediaModels;
   if (rawMediaModels && typeof rawMediaModels === 'object') {
@@ -946,7 +952,7 @@ export const useSettingsStore = create<SettingsState>()(
     }),
     {
       name: 'settings-storage',
-      version: 18,
+      version: 19,
       // Quota-safe persistence: on a QuotaExceededError, prune stale freezone
       // canvas keys (via the registered reclaimer) and retry once instead of
       // letting the whole store fail to hydrate/persist.

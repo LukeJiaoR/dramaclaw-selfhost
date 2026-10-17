@@ -7,8 +7,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import anyio
 from fastapi import APIRouter, Depends, Query, Request
-from sse_starlette.sse import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
@@ -16,6 +16,10 @@ from novelvideo.api.auth import (
     get_api_user,
     get_api_user_or_query,
     verify_credential_for_request,
+)
+from novelvideo.api.sse_shutdown import (
+    shutdown_aware_sse_response,
+    wait_interval_or_shutdown,
 )
 from novelvideo.i18n_message import has_localizable_log, log_lines_text
 from novelvideo.ports import get_project_access, get_task_backend
@@ -66,6 +70,7 @@ _TASK_TYPE_LABELS = {
     "audio_generation": "生成音频",
     "indextts2_audio_generation": "生成音频",
     "audio_generation_indextts2": "生成音频",
+    "system_voice_setup": "准备系统声线",
     "freezone_video_gen": "自由区视频",
     "stage_asset": "场景资产",
     "freezone_gen": "虾画生成",
@@ -74,12 +79,14 @@ _TASK_TYPE_LABELS = {
     "freezone_extract": "视频抽帧",
     "freezone_analyze": "视频分析",
     "freezone_video_story": "视频解读",
+    "freezone_video_breakdown": "逐帧拉片",
     "freezone_video_erase": "视频擦除",
     "freezone_video_upscale": "视频放大",
     "freezone_audio_separate": "音频分离",
     "freezone_video_compose": "视频合成",
     "freezone_text_translate": "字幕翻译",
     "freezone_text_generate": "AI 文本生成",
+    "freezone_skill_import": "外部 Skill 转换",
     "freezone_story_script": "生成故事脚本",
     "freezone_script_to_video_plan": "脚本转视频计划",
     "freezone_audio_speech": "生成语音",
@@ -449,7 +456,7 @@ async def stream_project_tasks(
         user=user, project_id=project, required_role="viewer"
     )
 
-    async def event_generator():
+    async def event_generator(shutdown: anyio.Event):
         mgr = get_task_manager()
         last: dict[str, tuple[str, float, str]] = {}
         last_heartbeat = asyncio.get_event_loop().time()
@@ -515,9 +522,10 @@ async def stream_project_tasks(
                 }
                 last_heartbeat = now
 
-            await asyncio.sleep(interval)
+            if await wait_interval_or_shutdown(shutdown, interval):
+                return
 
-    return EventSourceResponse(event_generator())
+    return shutdown_aware_sse_response(event_generator)
 
 
 @router.get("/projects/{project}/tasks/{task_type}/{episode}/stream")
@@ -536,7 +544,7 @@ async def stream_project_task(
         user=user, project_id=project, required_role="viewer"
     )
 
-    async def event_generator():
+    async def event_generator(shutdown: anyio.Event):
         last_progress = -1.0
         last_task = ""
         last_auth_check = asyncio.get_event_loop().time()
@@ -573,7 +581,8 @@ async def stream_project_task(
                 if not_found_deadline is None:
                     not_found_deadline = now + _TASK_NOT_FOUND_GRACE_S
                 if now < not_found_deadline:
-                    await asyncio.sleep(interval)
+                    if await wait_interval_or_shutdown(shutdown, interval):
+                        return
                     continue
                 yield {
                     "event": "error",
@@ -612,9 +621,10 @@ async def stream_project_task(
             if is_terminal:
                 return
 
-            await asyncio.sleep(interval)
+            if await wait_interval_or_shutdown(shutdown, interval):
+                return
 
-    return EventSourceResponse(event_generator())
+    return shutdown_aware_sse_response(event_generator)
 
 
 @router.delete("/projects/{project}/tasks/{task_type}/{episode}")

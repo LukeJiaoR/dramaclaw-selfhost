@@ -35,6 +35,8 @@ class ProjectRecord:
     created_at: str = ""
     updated_at: str = ""
     purged_at: str | None = None
+    storage_org_id: str | None = None
+    storage_org_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,14 @@ class ProjectRegistry(Protocol):
 
 
 class ProjectAccess(Protocol):
+    """Authoritative project authorization.
+
+    Providers may additionally expose ``effective_media_read_role(project,
+    principals)`` returning only viewer/None. Media handlers opt into that
+    optional cached capability; older providers fall back to the methods here.
+    It must never be used to authorize mutations or background work.
+    """
+
     async def resolve_requester_principals(self, user_id: str) -> list[Principal]: ...
 
     async def effective_project_role(

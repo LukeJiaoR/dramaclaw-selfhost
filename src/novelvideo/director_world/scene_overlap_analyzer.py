@@ -15,7 +15,12 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont
 
 from novelvideo.config import OUTPUT_DIR
-from novelvideo.llm_gateway import call_llm_gateway
+from novelvideo.director_world.scene_analysis_gateway import (
+    OVERLAP_MODEL_ENV,
+    OVERLAP_MODEL,
+    analyze_scene_references,
+    resolve_scene_analysis_model,
+)
 
 # Demo defaults for standalone/manual runs. In production stage_asset_tasks
 # always passes absolute --master/--reverse/--output-dir, so these are never used.
@@ -25,7 +30,7 @@ DEFAULT_SCENE_DIR = PROJECT_DIR / "assets/scenes" / DEFAULT_SCENE_NAME
 DEFAULT_MASTER = DEFAULT_SCENE_DIR / "master.png"
 DEFAULT_REVERSE = DEFAULT_SCENE_DIR / "reverse_master.png"
 DEFAULT_OUTPUT_DIR = DEFAULT_SCENE_DIR / "overlap_continuation_test"
-DEFAULT_MODEL = "DC-scene-overlap-analyzer-LLM"
+DEFAULT_MODEL = OVERLAP_MODEL
 
 
 def load_env() -> None:
@@ -234,24 +239,16 @@ but still classify the join.
 """.strip()
 
 
-async def ask_openrouter(
-    *,
-    image_path: Path,
-    prompt: str,
-    api_key: str,
-    model: str,
-    base_url: str | None = None,
+async def ask_gateway(
+    *, image_path: Path, prompt: str, model: str | None = None
 ) -> str:
-    return await call_llm_gateway(
+    return await analyze_scene_references(
+        image_path=image_path,
         prompt=prompt,
-        image_paths=[image_path],
+        model_env=OVERLAP_MODEL_ENV,
+        default_model=DEFAULT_MODEL,
         model=model,
-        api_key_override=api_key or None,
-        base_url_override=base_url,
-        temperature=0.0,
         max_tokens=2200,
-        response_format={"type": "json_object"},
-        timeout_seconds=120.0,
     )
 
 
@@ -427,6 +424,9 @@ async def run(args: argparse.Namespace, *, egress_context=None) -> None:
 
     require_direct_model_egress_allowed(egress_context)
     load_env()
+    args.model = resolve_scene_analysis_model(
+        OVERLAP_MODEL_ENV, DEFAULT_MODEL, args.model
+    )
     master = repo_path(args.master)
     reverse = repo_path(args.reverse)
     output_dir = repo_path(args.output_dir)
@@ -446,14 +446,10 @@ async def run(args: argparse.Namespace, *, egress_context=None) -> None:
         prompt, encoding="utf-8"
     )
 
-    raw_text = await ask_openrouter(
+    raw_text = await ask_gateway(
         image_path=sheet_path,
         prompt=prompt,
-        api_key=args.api_key,
         model=args.model,
-        base_url=(args.base_url or "https://openrouter.ai/api/v1")
-        if args.api_key
-        else None,
     )
     (output_dir / "overlap_continuation_raw_response.txt").write_text(
         raw_text, encoding="utf-8"
@@ -490,11 +486,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reverse", default=str(DEFAULT_REVERSE))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument(
-        "--model",
-        default=os.environ.get("SCENE_OVERLAP_MODEL", DEFAULT_MODEL),
+        "--model", default=os.environ.get("SCENE_OVERLAP_ANALYSIS_MODEL", "")
     )
-    parser.add_argument("--api-key", default="")
-    parser.add_argument("--base-url", default="")
     parser.add_argument("--edge-ratio", type=float, default=0.36)
     return parser.parse_args()
 

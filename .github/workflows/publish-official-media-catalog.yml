@@ -18,6 +18,8 @@ concurrency:
 
 jobs:
   publish:
+    # These destinations belong to upstream, never to a selfhost fork.
+    if: ${{ github.repository == 'dramaclaw/dramaclaw' }}
     runs-on: ubuntu-latest
     environment: official-media-catalog
     steps:

@@ -51,7 +51,12 @@ def enqueue_harness(monkeypatch: pytest.MonkeyPatch, tmp_path):
         )
 
     async def fake_single_beat_config(**kwargs):
-        return {"beats": [{"beat_number": 1}], "style": "chinese_period_drama"}
+        return {
+            "beats": [{"beat_number": 1}],
+            "style": "chinese_period_drama",
+            "mode_key": kwargs["mode_key"],
+            "image_generation_selection": "newapi_gpt_image2",
+        }
 
     async def fake_store_for_context(ctx):
         return _FakeStore()
@@ -89,7 +94,7 @@ async def _enqueue_frame(harness) -> dict:
         project_dir=harness.project_dir,
         episode=1,
         beat=1,
-        beat_payload={"beat_number": 1},
+        beat_payload={"beat_number": 1, "detected_identities": ["__NO_CHARACTER__"]},
         sketch_url="/x/bg.png",
         reference_urls=[],
     )

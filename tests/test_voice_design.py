@@ -38,7 +38,7 @@ async def test_optimize_voice_description_uses_dedicated_gateway_model(monkeypat
 
     assert result == "青年男性，清亮偏低的声线，语速从容，咬字清晰。"
     assert captured["model_env"] == "VOICE_PROMPT_OPTIMIZER_MODEL"
-    assert captured["default_model"] == "DC-voice-prompt-optimizer-LLM"
+    assert captured["default_model"] == "brainclaw"
     assert "角色：祁南" in str(captured["task"])
     assert "今晚必须离开这里" in str(captured["task"])
 
@@ -49,3 +49,11 @@ async def test_optimize_voice_description_rejects_empty_input():
 
     with pytest.raises(ValueError, match="请先填写声线描述"):
         await optimize_voice_description(description=" ", subject_context="旁白")
+
+
+def test_voice_model_defaults_preserve_official_and_advanced_modes():
+    from novelvideo.official_defaults import (
+        ADVANCED_TEXT_MODEL_BY_ENV, DEFAULT_TEXT_MODEL_BY_ENV,
+    )
+    assert DEFAULT_TEXT_MODEL_BY_ENV["VOICE_PROMPT_OPTIMIZER_MODEL"] == "brainclaw"
+    assert ADVANCED_TEXT_MODEL_BY_ENV["VOICE_PROMPT_OPTIMIZER_MODEL"] == "DC-voice-prompt-optimizer-LLM"

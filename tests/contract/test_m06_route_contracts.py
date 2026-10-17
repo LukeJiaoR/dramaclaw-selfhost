@@ -335,6 +335,13 @@ def m06_client_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(freezone, "compute_slot_impact", compute_impact)
     monkeypatch.setattr(freezone, "build_beat_preset_context", build_beat_context)
 
+    async def prepare_video_upscale(**_kwargs):
+        # This route-contract fixture uses placeholder media bytes; stream probing is
+        # covered by the video-upscale tests rather than this task-response test.
+        return video_file, {}, {}, {}
+
+    monkeypatch.setattr(freezone, "_prepare_video_upscale", prepare_video_upscale)
+
     assets = SimpleNamespace(
         image_url=f"/static/{_USER}/{_PROJECT}/freezone/_uploads/source.png",
         mask_url=f"/static/{_USER}/{_PROJECT}/freezone/_uploads/mask.png",
@@ -679,6 +686,13 @@ def _freezone_task_cases(client: TestClient, assets: SimpleNamespace):
             ),
         ),
         (
+            "freezone_video_breakdown",
+            client.post(
+                f"/api/v1/projects/{p}/freezone/video-breakdown",
+                json={"video_url": video, "max_frames": 3},
+            ),
+        ),
+        (
             "freezone_video_gen",
             client.post(
                 f"/api/v1/projects/{p}/freezone/video/gen",
@@ -800,7 +814,7 @@ def test_m06_freezone_task_backend_responses_are_ce_ee_isomorphic(
     client, task_backend, _task_manager, _project_dir, assets, _store = m06_client_factory(backend)
 
     cases = _freezone_task_cases(client, assets)
-    assert len(cases) == 29
+    assert len(cases) == 30
     for task_type, response in cases:
         assert response.status_code == 200, response.text
         _assert_freezone_http_task_shape(response.json(), task_type=task_type)

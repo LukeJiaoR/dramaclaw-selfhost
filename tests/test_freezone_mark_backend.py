@@ -61,7 +61,7 @@ async def test_mark_detection_uses_shared_freezone_vision_model(
     assert result == {
         "label": "老人",
         "note": "主体人物",
-        "provider": "provider_hub",
+        "provider": "newapi",
         "model": "DC-freezone-vision-LLM",
     }
     assert len(captured["images"]) == 2
