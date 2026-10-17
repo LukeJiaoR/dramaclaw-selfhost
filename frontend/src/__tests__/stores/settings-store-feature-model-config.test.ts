@@ -7,6 +7,7 @@ import {
   syncQuickProfileFromAdvancedSettings,
 } from "@/components/settings/settings-dialog";
 import type { NewApiChannelType } from "@/lib/queries/model-gateway";
+import { FEATURE_MODEL_GROUPS, FEATURE_MODEL_PRODUCT_GROUPS } from "@/lib/feature-models";
 import {
   DEFAULT_FEATURE_MODEL_SETTINGS,
   normalizeMediaModelEntries,
@@ -14,6 +15,28 @@ import {
 } from "@/stores/settingsStore";
 
 type QuickProfile = Parameters<typeof syncQuickProfileFromAdvancedSettings>[0];
+
+describe("Custom settings feature model visibility", () => {
+  it("includes character extraction among the displayed text model rows", () => {
+    const textFeatures = FEATURE_MODEL_PRODUCT_GROUPS.flatMap((group) =>
+      group.features.filter((feature) => !feature.requiresVision && feature.id !== "COGNEE"),
+    );
+    expect(textFeatures).toContainEqual({
+      id: "CHARACTER_BUILD",
+      defaultModel: "DC-character-builder-LLM",
+    });
+  });
+
+  it("exposes every registered feature except the separately configured Cognee model", () => {
+    const displayedIds = FEATURE_MODEL_PRODUCT_GROUPS.flatMap((group) =>
+      group.features.map((feature) => feature.id),
+    );
+    const configurableIds = FEATURE_MODEL_GROUPS.flatMap((group) =>
+      group.features.filter((feature) => feature.id !== "COGNEE").map((feature) => feature.id),
+    );
+    expect([...displayedIds].sort()).toEqual([...configurableIds].sort());
+  });
+});
 
 function quickProfileFixture(): QuickProfile {
   return {
@@ -492,5 +515,26 @@ describe("custom profile reconciliation", () => {
         },
       }),
     ).toBeNull();
+  });
+});
+
+
+describe("legacy scene overlap feature settings", () => {
+  it.each([false, true])("migrates the old key without replacing an explicit new choice (%s)", (hasNewChoice) => {
+    const legacy = { provider: "openrouter", model: "legacy-vision" };
+    const current = { provider: "openrouter", model: "current-vision" };
+    useSettingsStore.setState({
+      featureModelConfig: {
+        ...DEFAULT_FEATURE_MODEL_SETTINGS,
+        featureModels: {
+          SCENE_OVERLAP: legacy,
+          ...(hasNewChoice ? { SCENE_OVERLAP_ANALYSIS: current } : {}),
+        },
+      },
+    });
+    useSettingsStore.getState().hydrateFeatureModelConfigFromBackend({ providerChannels: {}, providerKeys: {}, mediaModels: {} }, "overlap-migration");
+    const models = useSettingsStore.getState().featureModelConfig.featureModels;
+    expect(models.SCENE_OVERLAP_ANALYSIS).toEqual(hasNewChoice ? current : legacy);
+    expect(models.SCENE_OVERLAP).toBeUndefined();
   });
 });

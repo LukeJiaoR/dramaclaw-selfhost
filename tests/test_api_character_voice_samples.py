@@ -546,41 +546,6 @@ async def test_delete_character_voice_sample_clears_age_slot(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_generated_voice_saves_the_adopted_prompt(tmp_path, monkeypatch):
-    from novelvideo.api.routes import characters
-
-    character = NovelCharacter(name="秦", voice_prompt="提取阶段的声线提示词")
-    store = _CharacterStore([character])
-    _patch_project(monkeypatch, characters, tmp_path, store)
-
-    async def fake_generate_voice_design_audio(*, description: str, preview_text: str):
-        assert description == "用户最终采用的声线提示词"
-        assert preview_text == "试听台词"
-        return b"generated mp3"
-
-    monkeypatch.setattr(
-        characters,
-        "generate_voice_design_audio",
-        fake_generate_voice_design_audio,
-    )
-
-    response = await characters.generate_character_voice_sample(
-        project="demo",
-        name="秦",
-        slot="default",
-        body=VoiceDesignRequest(
-            description="用户最终采用的声线提示词",
-            preview_text="试听台词",
-        ),
-        user={"username": "admin"},
-    )
-
-    assert response["ok"] is True
-    assert character.voice_prompt == "用户最终采用的声线提示词"
-    assert store.updates[-1][1]["voice_prompt"] == "用户最终采用的声线提示词"
-
-
-@pytest.mark.asyncio
 async def test_upload_then_delete_same_voice_slot_cannot_resurrect_file(
     tmp_path, monkeypatch
 ):
@@ -815,3 +780,38 @@ async def test_upload_then_trim_same_voice_slot_uses_uploaded_file(
     assert character.reference_audio_sha256 == hashlib.sha256(
         b"trimmed-uploaded"
     ).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_generated_voice_saves_the_adopted_prompt(tmp_path, monkeypatch):
+    from novelvideo.api.routes import characters
+
+    character = NovelCharacter(name="秦", voice_prompt="提取阶段的声线提示词")
+    store = _CharacterStore([character])
+    _patch_project(monkeypatch, characters, tmp_path, store)
+
+    async def fake_generate_voice_design_audio(*, description: str, preview_text: str):
+        assert description == "用户最终采用的声线提示词"
+        assert preview_text == "试听台词"
+        return b"generated mp3"
+
+    monkeypatch.setattr(
+        characters,
+        "generate_voice_design_audio",
+        fake_generate_voice_design_audio,
+    )
+
+    response = await characters.generate_character_voice_sample(
+        project="demo",
+        name="秦",
+        slot="default",
+        body=VoiceDesignRequest(
+            description="用户最终采用的声线提示词",
+            preview_text="试听台词",
+        ),
+        user={"username": "admin"},
+    )
+
+    assert response["ok"] is True
+    assert character.voice_prompt == "用户最终采用的声线提示词"
+    assert store.updates[-1][1]["voice_prompt"] == "用户最终采用的声线提示词"

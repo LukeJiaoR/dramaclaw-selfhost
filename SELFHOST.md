@@ -86,5 +86,12 @@ and keep credentials in local configuration or a secret manager. Files such as
 `.env`, SQLite databases, logs, generated output, and browser artifacts are
 ignored and must not be committed.
 
-The older NewAPI compose files remain available for upstream compatibility,
-but Provider Hub does not require NewAPI.
+Upstream retired `docker-compose.selfhosted.yml`; use the maintained
+`docker-compose.yml` or `docker-compose.release.yml`. Provider Hub runs separately.
+The source compose file also expects the upstream `dramaclaw-gateway` sibling
+checkout; see README for the current source-build setup.
+
+The sample `.env.example` explicitly selects Provider Hub for character, sketch,
+render, prop and scene images. Without those overrides, upstream official image
+defaults remain unchanged. Configure text/vision via the custom gateway settings;
+official mode retains upstream BrainClaw defaults.

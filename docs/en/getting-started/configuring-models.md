@@ -17,6 +17,12 @@ After startup, open `http://localhost:8080` and go to **Settings → Models & Ch
 
 Enable the intended mode after configuring it. New jobs read the latest mode, key, and mappings. Jobs already running do not switch gateways midway.
 
+## Agent model
+
+The Xia Director Agent can either follow the active gateway mode or use an independent third-party endpoint. Under **Agent model**, select **Third party** and provide an OpenAI-compatible Base URL, API Key, and model name. The endpoint must support the OpenAI Responses API and tool calls. This setting affects the Agent only; image, video, audio, embedding, and other feature-model routes continue to use the selected gateway mode.
+
+Secrets remain in the local CE settings database and are returned to the browser only as a masked preview. Changing the third-party endpoint requires entering the API Key again, which prevents a saved credential from being sent to a different host accidentally. Select **Follow current channel** to restore the existing Official, Custom, or Hybrid routing behavior.
+
 ## Official mode
 
 Official mode is the shortest setup path:
@@ -151,7 +157,10 @@ Click **Manage Channels** to open the provider catalog supported by the current 
 Provider selectors for feature, embedding, and media models are filtered by their purpose. For example, video models list video-capable providers, while text features list text-capable providers. Existing selections and providers with temporarily unavailable capability metadata remain visible for inspection and correction instead of disappearing after an upgrade.
 
 - **Save Channels** stores CE’s local channel presets.
-- **Update NewAPI Channel** immediately replaces the matching NewAPI channel key and Base URL.
+- **Update NewAPI Channel** creates the channel on first use, then updates its key and Base URL while preserving model mappings.
+- **Fetch models** retrieves upstream model names after the channel is synced and displays the count. Feature, embedding, media, and bulk model inputs offer searchable dropdown selection; save the mapping after choosing a model. Updating channel configuration clears the cached list; reopen a model dropdown or click the fetch button to refresh it.
+- Manual entry remains available when the upstream has no model-list endpoint, returns an empty list, or discovery fails. The list does not identify model capabilities; choose a model suitable for the task. ComfyUI continues to use Workflow configuration.
+- OpenAI channels request `GET {Base URL}/v1/models` with the saved upstream key. Do not repeat the trailing `/v1` in the Base URL. Other channels use NewAPI's provider-specific adapter.
 - **Base URL Override** is normally empty. Set it only for a custom proxy or when required by the provider.
 
 Before removing a regular provider, the confirmation shows how many feature-model, media-model, and embedding mappings are affected. Removing a saved provider immediately persists the remaining provider list. If that request fails, the local configuration is retained. Removing the final regular provider persists an empty list, so it does not return after refresh. ComfyUI keeps its dedicated cleanup confirmation described below.
@@ -160,12 +169,13 @@ After a profile is saved, a channel key should show “Saved” and a masked pre
 
 #### Feature models
 
-DramaClaw uses stable logical names such as `DC-scene-builder-LLM` and `DC-freezone-vision-LLM`. In Custom mode, keep those internal names and map them to real upstream models in NewAPI.
+DramaClaw uses stable logical names such as `DC-character-builder-LLM`, `DC-scene-builder-LLM` and `DC-freezone-vision-LLM`. In Custom mode, keep those internal names and map them to real upstream models in NewAPI.
 
 - Text features can use text-only models.
 - Vision features send images or video and require a suitable multimodal model.
 - Bulk fill changes drafts only; click Save Mapping afterward.
 - Hermes may use a separate model. Other `DC-*-LLM` mappings can share one upstream model or be overridden individually.
+- After an upgrade that adds a feature row (for example `DC-character-builder-LLM` in v2.0.3), the new row starts empty and is not written to NewAPI until you pick a model and click Save Mapping, or re-apply a quick profile. Until then that feature fails with `No available channel for model DC-...`.
 
 #### Embedding
 
@@ -263,6 +273,7 @@ Enter Cloud name, API Key, API Secret, and an optional folder. Find them under *
 | No “Saved” badge after saving a key | The value may still be a browser draft. Save/update that channel or reapply the complete profile, and ensure the running image contains the latest code. |
 | Adding a media model says its provider key is missing | The provider channel was not persisted to NewAPI. Save/update the channel before saving media models. |
 | NewAPI reports `No available channel for model ...` | Check the logical mapping, channel status, upstream model name, and group. |
+| Structured steps fail with `Exceeded maximum output retries` behind a Codex-backed relay (Codex2API etc.) | The relay drops `tool_calls` on `/v1/chat/completions`. Enable **ChatCompletions → Responses Compatibility** for that channel in the NewAPI admin. See the [troubleshooting guide](../guides/troubleshooting.md#model--gateway). |
 | Local NewAPI initialization fails | Check the NewAPI service, SQLite mount, directory permissions, and `NEWAPI_PROVISIONER_ENABLED`. |
 | A new model is absent from XiaHua | Verify it is enabled, has the correct media type, the complete configuration was saved, and the page was refreshed. |
 | Controls do not match model capabilities | Check the media model `config`, especially resolutions, ratios, modes, and reference limits. |

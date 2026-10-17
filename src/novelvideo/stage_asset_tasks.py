@@ -288,10 +288,12 @@ def resolve_scene_360_image_model(provider: str = "", model: str = "") -> str:
     if resolved_provider == "provider_hub":
         return os.environ.get("PROVIDER_HUB_IMAGE_MODEL") or "DC-image"
     if resolved_provider == "newapi":
+        from novelvideo.config import NEWAPI_IMAGE_MODEL
+
         return (
             os.environ.get("SCENE_360_IMAGE_MODEL")
             or os.environ.get("NEWAPI_IMAGE_MODEL")
-            or "gpt-image-2"
+            or NEWAPI_IMAGE_MODEL
         )
     if resolved_provider == "openrouter":
         return (
@@ -1216,6 +1218,10 @@ def run_scene_360(
         resolve_organization_egress_context,
     )
 
+    from novelvideo.director_world.scene_analysis_gateway import (
+        scene_analysis_gateway_configured,
+    )
+
     def report(progress: float, message: str) -> None:
         if progress_callback:
             progress_callback(progress, message)
@@ -1307,7 +1313,6 @@ def run_scene_360(
     spatial_contract_path = ""
     spatial_contract_model = (
         os.environ.get("SCENE_SPATIAL_CONTRACT_MODEL")
-        or os.environ.get("OPENROUTER_VISION_MODEL")
         or SPATIAL_CONTRACT_DEFAULT_MODEL
     )
     pano_correction_payload: dict[str, Any] | None = None
@@ -1351,7 +1356,11 @@ def run_scene_360(
                     not analysis_path.exists()
                     or analysis_path.stat().st_mtime < latest_input_mtime
                 )
-                if needs_analysis:
+                if (
+                    needs_analysis
+                    and not is_org
+                    and scene_analysis_gateway_configured()
+                ):
                     report(0.12, "分析 master/reverse 侧边 overlap 和 continuation...")
                     analyzer_cmd = [
                         sys.executable,
@@ -1408,7 +1417,11 @@ def run_scene_360(
                         SPATIAL_CONTRACT_SCHEMA_VERSION,
                     )
                 )
-                if needs_contract:
+                if (
+                    needs_contract
+                    and not is_org
+                    and scene_analysis_gateway_configured()
+                ):
                     report(
                         0.14,
                         f"分析 master/reverse 空间合同 ({spatial_contract_model})...",

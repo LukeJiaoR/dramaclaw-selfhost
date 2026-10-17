@@ -313,10 +313,8 @@ def _newapi_safe_request_context(
     payload: dict[str, object],
     prompt: str,
 ) -> dict[str, object]:
-    reference_images = payload.get("image")
-    reference_image_count = (
-        len(reference_images) if isinstance(reference_images, list) else 0
-    )
+    reference_images = payload.get("image") or payload.get("images")
+    reference_image_count = len(reference_images) if isinstance(reference_images, list) else 0
     raw_metadata = payload.get("metadata")
     metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     geometry_metadata = {
@@ -2275,7 +2273,6 @@ def crop_sketch_panels(
     from novelvideo.generators.grid_splitter import _trim_outer_border
     import numpy as np
 
-
     def _trim_panel(panel_img):
         """裁掉单个 panel 的白边。"""
         gray_arr = np.array(panel_img.convert("L"))
@@ -3183,6 +3180,7 @@ async def _generate_image(
     elif generator.provider == "newapi":
         ref_bytes = [(Path(path).read_bytes(), path) for path in ref_paths]
         trace: dict[str, str] = {}
+        delivery_state: dict[str, bool | str] = {}
         image_bytes, _, error_detail = await _call_newapi_image_api(
             api_key=generator.api_key,
             model=generator.model,
@@ -3198,8 +3196,11 @@ async def _generate_image(
             base_url=generator.base_url,
             trace=trace,
             egress_context=context,
+            delivery_path=output_path,
+            delivery_state=delivery_state,
+            read_copied_bytes=False,
         )
-        if not image_bytes:
+        if not image_bytes and not delivery_state.get("copied"):
             raise ValueError(
                 f"DramaClawAPI image generation failed: {error_detail or 'empty image'}"
             )
@@ -3243,7 +3244,8 @@ async def _generate_image(
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_bytes(image_bytes)
+    if not (generator.provider == "newapi" and delivery_state.get("copied")):
+        output.write_bytes(image_bytes)
     await _complete_organization_image_egress(
         organization_egress,
         trace=trace if generator.provider == "newapi" else {},
@@ -3626,7 +3628,9 @@ async def _call_openai_image_api(
         effective_base_url = str(base_url or "").strip().rstrip("/")
         if not effective_base_url and model == PROVIDER_HUB_IMAGE_MODEL:
             effective_base_url = PROVIDER_HUB_BASE_URL
-        client_kwargs: dict[str, object] = {"api_key": api_key, "timeout": 660.0, "max_retries": 0}
+        # Hub adapters may wait for long-running local image workflows.
+        timeout = 660.0 if effective_base_url == PROVIDER_HUB_BASE_URL.rstrip("/") else 300.0
+        client_kwargs: dict[str, object] = {"api_key": api_key, "timeout": timeout, "max_retries": 0}
         if effective_base_url:
             client_kwargs["base_url"] = effective_base_url
         client = AsyncOpenAI(**client_kwargs)
@@ -3742,6 +3746,10 @@ async def _call_newapi_image_api(
     base_url: str | None = None,
     trace: dict[str, str] | None = None,
     egress_context: TrustedEgressContext | None = None,
+    delivery_path: str | Path | None = None,
+    delivery_state: dict[str, bool | str] | None = None,
+    before_delivery_copy: Callable[[], None] | None = None,
+    read_copied_bytes: bool = True,
 ) -> tuple[bytes | None, str, str]:
     """Call newAPI's OpenAI-compatible Images API."""
     import httpx
@@ -3751,12 +3759,15 @@ async def _call_newapi_image_api(
         return None, "", "DramaClawAPI API key is missing"
 
     image_config = image_config or {}
-    aspect_ratio = (
-        str(image_config.get("aspect_ratio") or "1:1").strip().lower() or "1:1"
-    )
-    image_size = normalize_image_size(
-        str(image_config.get("image_size") or "1K"), "newapi"
-    )
+    reference_image_format = str(
+        image_config.get("reference_image_format")
+        or os.environ.get("NEWAPI_IMAGE_EDIT_REFERENCE_FORMAT")
+        or "dc-media"
+    ).strip().lower()
+    if reference_images and reference_image_format not in {"dc-media", "images"}:
+        return None, "", "Unsupported reference image format; use dc-media or images"
+    aspect_ratio = str(image_config.get("aspect_ratio") or "1:1").strip().lower() or "1:1"
+    image_size = normalize_image_size(str(image_config.get("image_size") or "1K"), "newapi")
     request_schema = image_config.get("request_schema") or {}
     from novelvideo.media_model_request_schema import normalize_media_resolution_value
 
@@ -3767,7 +3778,7 @@ async def _call_newapi_image_api(
         "model": model,
         "prompt": prompt,
         "n": 1,
-        "response_format": "b64_json",
+        "response_format": "url",
         "watermark": False,
         "metadata": metadata,
     }
@@ -3813,12 +3824,18 @@ async def _call_newapi_image_api(
         try:
             relay_helper = _relay_reference_images_for_newapi
             if relay_helper is _ORIGINAL_RELAY_REFERENCE_IMAGES_FOR_NEWAPI:
-                payload["image"] = await relay_helper(
+                relayed_images = await relay_helper(
                     reference_images,
                     egress_context=context,
                 )
             else:
-                payload["image"] = await relay_helper(reference_images)
+                relayed_images = await relay_helper(reference_images)
+            # DC-Media uses image: [URL]; Cockpit's JSON edit parser accepts
+            # images: [{image_url: URL}]. Select explicitly per deployment.
+            if reference_image_format == "images":
+                payload["images"] = [{"image_url": url} for url in relayed_images]
+            else:
+                payload["image"] = relayed_images
         except Exception as exc:
             if context is not None and context.is_organization:
                 # The organization path hides `exc` because an arbitrary
@@ -4014,6 +4031,28 @@ async def _call_newapi_image_api(
                 )
 
             first = data[0] or {}
+            if delivery_path is not None:
+                from novelvideo.media_archive_copy import copy_archived_result
+
+                if await copy_archived_result(
+                    first.get("archive"), delivery_path, before_copy=before_delivery_copy
+                ):
+                    await _confirm(
+                        reservation_id,
+                        provider_request_id=provider_request_id,
+                        response_id=response_id,
+                    )
+                    if not read_copied_bytes:
+                        if delivery_state is not None:
+                            delivery_state["copied"] = True
+                            delivery_state["sha256"] = str(
+                                first["archive"].get("sha256") or ""
+                            )
+                        return None, "", ""
+                    image_bytes = Path(delivery_path).read_bytes()
+                    if delivery_state is not None:
+                        delivery_state["copied"] = True
+                    return image_bytes, "", ""
             image_b64 = first.get("b64_json") or ""
             if image_b64:
                 image_bytes = base64.b64decode(image_b64)
@@ -4164,6 +4203,9 @@ async def _call_newapi_image_api_with_egress(
     image_config: dict | None = None,
     base_url: str | None = None,
     egress_context: TrustedEgressContext | None = None,
+    delivery_path: str | Path | None = None,
+    delivery_state: dict[str, bool | str] | None = None,
+    read_copied_bytes: bool = True,
 ) -> tuple[bytes | None, str, str]:
     """grid 家族的出网闸门（OI-52）：把 `_generate_image` 已验证的形状装到叶子外围。
 
@@ -4187,6 +4229,9 @@ async def _call_newapi_image_api_with_egress(
             reference_images=reference_images,
             image_config=image_config,
             base_url=base_url,
+            delivery_path=delivery_path,
+            delivery_state=delivery_state,
+            read_copied_bytes=read_copied_bytes,
         )
 
     from novelvideo.model_gateway_runtime import next_model_gateway_business_task_id
@@ -4237,19 +4282,32 @@ async def _call_newapi_image_api_with_egress(
             base_url=state.credential.base_url,
             trace=trace,
             egress_context=context,
+            delivery_path=delivery_path,
+            delivery_state=delivery_state,
+            read_copied_bytes=read_copied_bytes,
         )
     except Exception:
         await _mark_unknown()
         raise
-    if not image_bytes:
+    if not image_bytes and not (delivery_state and delivery_state.get("copied")):
         # 叶子把传输失败压成 `(None, "", error)`，操作已经出过网但没有可用结果，
         # 只能落 unknown——不能当没发生过，否则重试会以同键再 claim 一次。
         await _mark_unknown()
         return image_bytes, text, error
+    digest = (
+        hashlib.sha256(image_bytes).hexdigest()
+        if image_bytes
+        else str(delivery_state.get("sha256") or "")
+    )
+    if len(digest) != 64 or any(
+        char not in "0123456789abcdef" for char in digest.lower()
+    ):
+        with Path(delivery_path).open("rb") as copied_file:
+            digest = hashlib.file_digest(copied_file, "sha256").hexdigest()
     await _complete_organization_image_egress(
         state,
         trace=trace,
-        result_ref=f"image:sha256:{hashlib.sha256(image_bytes).hexdigest()}",
+        result_ref=f"image:sha256:{digest}",
     )
     return image_bytes, text, error
 
@@ -4835,7 +4893,8 @@ class NanoBananaGridGenerator:
                     else:
                         temp_dir = Path("output")
                     temp_dir.mkdir(parents=True, exist_ok=True)
-                    sub_sketch_path = str(temp_dir / "temp_sub_sketch.jpg")
+                    temp_stem = Path(output_path).stem if output_path else uuid.uuid4().hex[:12]
+                    sub_sketch_path = str(temp_dir / f"temp_sub_sketch_{temp_stem}.jpg")
 
                     target_aspect = None
                     if sketch_aspect_padding and mode_key:
@@ -5244,6 +5303,8 @@ class NanoBananaGridGenerator:
                         "model_params": self.newapi_model_params,
                     },
                     base_url=self.base_url,
+                    delivery_path=output_path,
+                    delivery_state=(image_delivery_state := {}),
                 )
                 if not image_bytes:
                     message = "DramaClawAPI Images 未返回图像数据"
@@ -5357,8 +5418,9 @@ class NanoBananaGridGenerator:
                 output_dir = os.path.dirname(output_path)
                 if output_dir:
                     os.makedirs(output_dir, exist_ok=True)
-                with open(output_path, "wb") as f:
-                    f.write(image_bytes)
+                if not (self.provider == "newapi" and image_delivery_state.get("copied")):
+                    with open(output_path, "wb") as f:
+                        f.write(image_bytes)
                 print(f"[NanoBananaPro] 网格图已保存: {output_path}")
 
                 # 5.1 后处理：移除面板间缝隙并覆盖
@@ -5367,8 +5429,9 @@ class NanoBananaGridGenerator:
                     from PIL import Image as PILImage
 
                     grid_img = PILImage.open(output_path)
-                    grid_img = remove_grid_gaps(grid_img, rows, cols)
-                    grid_img.save(output_path)
+                    processed_grid = remove_grid_gaps(grid_img, rows, cols)
+                    if processed_grid is not grid_img:
+                        processed_grid.save(output_path)
                     # 更新 image_bytes 以保持返回值一致
                     with open(output_path, "rb") as f:
                         image_bytes = f.read()
@@ -5576,6 +5639,8 @@ class NanoBananaGridGenerator:
                         "quality": self.openai_sketch_image_quality,
                     },
                     base_url=self.base_url,
+                    delivery_path=output_path,
+                    delivery_state=(image_delivery_state := {}),
                 )
                 if not image_bytes:
                     return GridGenerationResult(
@@ -5619,8 +5684,9 @@ class NanoBananaGridGenerator:
             # 保存网格图
             if output_path:
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                with open(output_path, "wb") as f:
-                    f.write(image_bytes)
+                if not (self.provider == "newapi" and image_delivery_state.get("copied")):
+                    with open(output_path, "wb") as f:
+                        f.write(image_bytes)
 
                 # Gap removal 后处理
                 try:
@@ -5628,8 +5694,9 @@ class NanoBananaGridGenerator:
                     from PIL import Image as PILImage
 
                     grid_img = PILImage.open(output_path)
-                    grid_img = remove_grid_gaps(grid_img, rows, cols)
-                    grid_img.save(output_path)
+                    processed_grid = remove_grid_gaps(grid_img, rows, cols)
+                    if processed_grid is not grid_img:
+                        processed_grid.save(output_path)
                     with open(output_path, "rb") as f:
                         image_bytes = f.read()
                 except Exception as e:
@@ -5846,6 +5913,8 @@ class NanoBananaGridGenerator:
                         "quality": self.openai_image_quality,
                     },
                     base_url=self.base_url,
+                    delivery_path=output_path,
+                    delivery_state=(image_delivery_state := {}),
                 )
                 if not image_bytes:
                     return GridGenerationResult(
@@ -5913,8 +5982,9 @@ class NanoBananaGridGenerator:
             output_dir = os.path.dirname(output_path)
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
-            with open(output_path, "wb") as f:
-                f.write(image_bytes)
+            if not (self.provider == "newapi" and image_delivery_state.get("copied")):
+                with open(output_path, "wb") as f:
+                    f.write(image_bytes)
 
             generation_time = time.time() - start_time
             print(f"[Reformat] 完成 → {output_path}，耗时 {generation_time:.1f}s")
@@ -7121,7 +7191,6 @@ class NanoBananaGridGenerator:
 
         # 1. 查找覆盖当前 beat 范围的草图文件
         try:
-
             beat_range_start = beat_start_index + 1  # 1-based
             beat_range_end = beat_start_index + len(beats)
 
@@ -7440,10 +7509,14 @@ CRITICAL: Keep exact composition from sketch. Only add color, texture, and light
                         "quality": self.openai_image_quality,
                     },
                     base_url=self.base_url,
+                    delivery_path=output_path,
+                    delivery_state=(image_delivery_state := {}),
+                    read_copied_bytes=False,
                 )
-                if image_bytes:
-                    with open(output_path, "wb") as f:
-                        f.write(image_bytes)
+                if image_bytes or image_delivery_state.get("copied"):
+                    if not image_delivery_state.get("copied"):
+                        with open(output_path, "wb") as f:
+                            f.write(image_bytes)
                     return output_path
                 if error_detail:
                     print(f"[DramaClawAPI Render] 失败: {error_detail}")
@@ -7663,8 +7736,11 @@ CRITICAL: The output must look like a higher-resolution vertical crop/extension 
                         "quality": self.openai_image_quality,
                     },
                     base_url=self.base_url,
+                    delivery_path=output_path + ".tmp.png",
+                    delivery_state=(image_delivery_state := {}),
+                    read_copied_bytes=False,
                 )
-                if not image_bytes:
+                if not image_bytes and not image_delivery_state.get("copied"):
                     raise ValueError(
                         f"DramaClawAPI Images 未返回图像数据: {newapi_error}"
                         if newapi_error
@@ -7672,8 +7748,9 @@ CRITICAL: The output must look like a higher-resolution vertical crop/extension 
                     )
 
                 temp_path = output_path + ".tmp.png"
-                with open(temp_path, "wb") as f:
-                    f.write(image_bytes)
+                if not image_delivery_state.get("copied"):
+                    with open(temp_path, "wb") as f:
+                        f.write(image_bytes)
                 img = Image.open(temp_path)
                 img = img.resize(
                     (target_width, target_height), Image.Resampling.LANCZOS
@@ -7861,6 +7938,8 @@ OUTPUT: Single high-quality image, no watermarks, no text overlays.
                         "quality": self.openai_image_quality,
                     },
                     base_url=self.base_url,
+                    delivery_path=output_path,
+                    delivery_state=(image_delivery_state := {}),
                 )
                 if not image_bytes and error_detail:
                     print(f"[StylePreview] DramaClawAPI 失败详情: {error_detail}")
@@ -7911,8 +7990,9 @@ OUTPUT: Single high-quality image, no watermarks, no text overlays.
                 output_dir = os.path.dirname(output_path)
                 if output_dir:
                     os.makedirs(output_dir, exist_ok=True)
-                with open(output_path, "wb") as f:
-                    f.write(image_bytes)
+                if not (self.provider == "newapi" and image_delivery_state.get("copied")):
+                    with open(output_path, "wb") as f:
+                        f.write(image_bytes)
                 print(f"[StylePreview] 预览图已保存: {output_path}")
 
             generation_time = time.time() - start_time
@@ -8018,6 +8098,7 @@ async def regenerate_selected_beats(
     sketch_aspect_padding: bool = False,
     force_image_size: Optional[str] = None,
     generator_config: Optional[dict] = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> List[GridGenerationResult]:
     """再生选中的 beats（支持 render 和 sketch 模式）。
 
@@ -8050,9 +8131,11 @@ async def regenerate_selected_beats(
         f"splits={grid_splits}, aspect_ratio={aspect_ratio}"
     )
 
-    generator = create_grid_generator(api_key, config=generator_config)
-    results = []
+    jobs: list[
+        tuple[int, str, list[dict], list[int], str, int, int, int, dict[int, str] | None]
+    ] = []
     beat_offset = 0
+    regen_id = uuid.uuid4().hex
 
     for grid_idx, split_mk in enumerate(grid_splits, start=1):
         split_cfg = REGEN_MODE_CONFIGS[split_mk]
@@ -8062,7 +8145,9 @@ async def regenerate_selected_beats(
         beat_offset += grid_beat_count
 
         # 输出路径
-        output_path = str(Path(output_dir) / f"regen_{mode_key}_g{grid_idx:02d}.png")
+        output_path = str(
+            Path(output_dir) / f"regen_{mode_key}_g{grid_idx:02d}_{regen_id}.png"
+        )
 
         # 提取 beat 编号用于 location_beat_numbers
         beat_numbers = [_generation_beat_number(b, i) for i, b in enumerate(grid_beats)]
@@ -8082,37 +8167,81 @@ async def regenerate_selected_beats(
                 if int(beat_num) in {int(value) for value in beat_numbers}
             }
 
-        result = await generator.generate_grid(
-            beats=grid_beats,
-            character_map=character_map,
-            scene_menu=scene_menu,
-            prop_menu=prop_menu,
-            sketch_colors=sketch_colors,
-            style=style,
-            output_path=output_path,
-            ethnicity=ethnicity,
-            rows=g_rows,
-            cols=g_cols,
-            sketch=is_sketch,
-            sketch_dir=sketch_dir if not is_sketch else "",
-            location_beat_numbers=beat_numbers,
-            mode_key=split_mk,
-            beat_sketch_paths=grid_beat_sketch_paths,
-            scene_refs_override=scene_refs_override,
-            prop_refs_override=prop_refs_override,
-            sketch_aspect_padding=sketch_aspect_padding,
-            force_image_size=force_image_size,
+        jobs.append(
+            (
+                grid_idx,
+                split_mk,
+                grid_beats,
+                beat_numbers,
+                output_path,
+                beat_offset - grid_beat_count,
+                g_rows,
+                g_cols,
+                grid_beat_sketch_paths,
+            )
         )
-        result.beat_start_index = beat_offset - grid_beat_count
+
+    async def generate_job(
+        job: tuple[int, str, list[dict], list[int], str, int, int, int, dict | None],
+    ) -> tuple[int, GridGenerationResult]:
+        (
+            grid_idx,
+            split_mk,
+            grid_beats,
+            beat_numbers,
+            output_path,
+            beat_start_index,
+            g_rows,
+            g_cols,
+            grid_beat_sketch_paths,
+        ) = job
+        generator = create_grid_generator(api_key, config=generator_config)
+        temp_sketch_path = (
+            Path(output_path).parent / f"temp_sub_sketch_{Path(output_path).stem}.jpg"
+        )
+        try:
+            result = await generator.generate_grid(
+                beats=grid_beats,
+                character_map=character_map,
+                scene_menu=scene_menu,
+                prop_menu=prop_menu,
+                sketch_colors=sketch_colors,
+                style=style,
+                output_path=output_path,
+                ethnicity=ethnicity,
+                rows=g_rows,
+                cols=g_cols,
+                sketch=is_sketch,
+                sketch_dir=sketch_dir if not is_sketch else "",
+                location_beat_numbers=beat_numbers,
+                mode_key=split_mk,
+                beat_sketch_paths=grid_beat_sketch_paths,
+                scene_refs_override=scene_refs_override,
+                prop_refs_override=prop_refs_override,
+                sketch_aspect_padding=sketch_aspect_padding,
+                force_image_size=force_image_size,
+            )
+        finally:
+            temp_sketch_path.unlink(missing_ok=True)
+        result.beat_start_index = beat_start_index
         result.beat_count = len(grid_beats)
         result.grid_rows = g_rows
         result.grid_cols = g_cols
-        results.append(result)
 
         if result.success:
             print(f"[RegenBeats] Grid {grid_idx} 成功: {result.grid_image_path}")
         else:
             print(f"[RegenBeats] Grid {grid_idx} 失败: {result.error}")
+        return grid_idx, result
+
+    indexed_results: list[tuple[int, GridGenerationResult]] = []
+    for completed, job in enumerate(jobs, start=1):
+        indexed_results.append(await generate_job(job))
+        if progress_callback:
+            progress_callback(completed, len(jobs))
+
+    indexed_results.sort(key=lambda item: item[0])
+    results = [result for _grid_idx, result in indexed_results]
 
     return results
 

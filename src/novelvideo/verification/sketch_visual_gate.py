@@ -200,6 +200,26 @@ def _resolve_gate_backend() -> tuple[str, str, str]:
         )
         return explicit_provider, explicit_key, model
 
+    nb_provider = (os.environ.get("NANOBANANA_PROVIDER") or "").strip().lower()
+    openrouter_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if nb_provider == "openrouter" and openrouter_key:
+        return (
+            "openrouter",
+            openrouter_key,
+            explicit_model or DEFAULT_GATE_MODEL_OPENROUTER,
+        )
+
+    for var in ("GOOGLE_AI_API_KEY", "GOOGLE_API_KEY"):
+        value = (os.environ.get(var) or "").strip()
+        if value:
+            return "google", value, explicit_model or DEFAULT_GATE_MODEL_GOOGLE
+
+    if openrouter_key:
+        return (
+            "openrouter",
+            openrouter_key,
+            explicit_model or DEFAULT_GATE_MODEL_OPENROUTER,
+        )
     try:
         from novelvideo.llm_gateway import get_llm_gateway_credentials
 

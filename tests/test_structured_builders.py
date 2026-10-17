@@ -79,6 +79,18 @@ def _candidate(name, *, quotes=(), aliases=(), gender="", description=""):
     )
 
 
+def _disable_appearance_enrichment(monkeypatch) -> None:
+    """Keep extraction/run-state tests independent from the appearance model."""
+
+    async def no_appearance_enrichment(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        "novelvideo.structured_extraction.enrich_character_appearances",
+        no_appearance_enrichment,
+    )
+
+
 # ── name normalization ──────────────────────────────────────────────────────
 
 
@@ -489,8 +501,23 @@ async def test_extraction_is_bounded_but_not_serial():
 
 
 @pytest.fixture
-async def structured_store(tmp_path):
+async def structured_store(tmp_path, monkeypatch):
     from novelvideo.sqlite_store import SQLiteStore
+    from novelvideo import structured_extraction
+
+    # Build/replay tests exercise extraction evidence and persistence. Optional
+    # appearance enrichment must not construct a real credentialed model.
+    class EmptyAppearanceAgent:
+        async def run(self, _prompt):
+            return SimpleNamespace(
+                output=structured_extraction.CharacterAppearanceList(characters=[])
+            )
+
+    monkeypatch.setattr(
+        structured_extraction,
+        "_create_character_appearance_agent",
+        lambda agent=None: agent if agent is not None else EmptyAppearanceAgent(),
+    )
 
     state_dir = tmp_path / "user" / "structured"
     state_dir.mkdir(parents=True)
@@ -613,6 +640,7 @@ async def test_character_build_propagates_the_full_source_language(
 async def test_character_build_publishes_and_records_evidence(
     structured_store, monkeypatch
 ):
+    _disable_appearance_enrichment(monkeypatch)
     from novelvideo import structured_builders
     from novelvideo.structured_ingest import ingest_source_text_structured
 
@@ -690,6 +718,7 @@ async def test_completed_chunks_are_replayed_instead_of_re_billed(
     structured_store, monkeypatch
 ):
     """A retry or a second click must not pay for every chunk again."""
+    _disable_appearance_enrichment(monkeypatch)
     from novelvideo import structured_builders
     from novelvideo.structured_extraction import extract_characters_from_chunks
     from novelvideo.structured_ingest import ingest_source_text_structured
@@ -735,6 +764,7 @@ async def test_completed_chunks_are_replayed_instead_of_re_billed(
 
 async def test_a_failed_chunk_leaves_the_run_partial(structured_store, monkeypatch):
     """A partial run must not look finished to the next build."""
+    _disable_appearance_enrichment(monkeypatch)
     from novelvideo import structured_builders
     from novelvideo.structured_extraction import extract_characters_from_chunks
     from novelvideo.structured_ingest import ingest_source_text_structured
@@ -786,6 +816,7 @@ async def test_a_failed_chunk_leaves_the_run_partial(structured_store, monkeypat
 async def test_a_partial_run_never_stores_its_cast_as_the_final_result(
     structured_store, monkeypatch
 ):
+    _disable_appearance_enrichment(monkeypatch)
     """The replay guard only checks that nothing is still pending.
 
     So once the failed chunks succeed on a later attempt, an artifact written by
@@ -902,6 +933,7 @@ async def test_reuse_key_separates_drama_from_narrated(structured_store, tmp_pat
 async def test_evidence_is_backfilled_when_the_characters_already_exist(
     structured_store, monkeypatch
 ):
+    _disable_appearance_enrichment(monkeypatch)
     """Publishing characters and writing evidence are two steps.
 
     If the first succeeds and the second fails, a retry finds the characters
@@ -1320,6 +1352,9 @@ def _patched_extract(monkeypatch, agent):
         "novelvideo.structured_extraction.extract_characters_from_chunks", fake
     )
 
+    # These tests exercise extraction, evidence, replay, and run-state
+    # behavior. Character appearance enrichment has focused tests below.
+    _disable_appearance_enrichment(monkeypatch)
 
 async def test_a_chunk_that_failed_is_retried_while_others_are_not(
     structured_store, monkeypatch
@@ -1606,6 +1641,14 @@ async def test_a_completed_build_replays_without_any_model_call(
         "novelvideo.structured_extraction.extract_characters_from_chunks", fake
     )
 
+    async def no_appearance_enrichment(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        "novelvideo.structured_extraction.enrich_character_appearances",
+        no_appearance_enrichment,
+    )
+
     await structured_builders.build_characters_structured(store)
     assert extraction.calls, "the first build should have done real work"
     assert adjudicator.calls == 1
@@ -1672,6 +1715,14 @@ async def test_replaying_a_build_cannot_split_an_alias_back_into_a_character(
 
     monkeypatch.setattr(
         "novelvideo.structured_extraction.extract_characters_from_chunks", fake
+    )
+
+    async def no_appearance_enrichment(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        "novelvideo.structured_extraction.enrich_character_appearances",
+        no_appearance_enrichment,
     )
 
     await structured_builders.build_characters_structured(store)
@@ -2734,3 +2785,89 @@ async def test_a_resumed_build_keeps_the_narrator_the_first_attempt_nominated(
 
     assert set(second) == {"郑家悦", "林某"}
     assert [n for n, a in second.items() if a.is_main] == ["郑家悦"]
+
+
+# ── structured output failures: diagnostics ────────────────────────────────
+
+
+class ExplodingAgent:
+    """Raises PydanticAI's output-retry error, optionally with a cause."""
+
+    def __init__(self, cause: BaseException | None = None):
+        self.cause = cause
+        self.calls = 0
+
+    async def run(self, prompt: str):
+        from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+        self.calls += 1
+        exc = UnexpectedModelBehavior("Exceeded maximum output retries (2)")
+        if self.cause is not None:
+            raise exc from self.cause
+        raise exc
+
+
+async def test_failure_log_names_the_underlying_cause():
+    """'Exceeded maximum output retries' alone is useless; the cause must be logged."""
+    chunk = _chunk("林默走进屋子。")
+    primary = ExplodingAgent(cause=ValueError("characters.0.evidence: Field required"))
+    logs: list[str] = []
+
+    merged, failures = await extract_characters_from_chunks(
+        [chunk], agent=primary, source_text=chunk.text, on_log=logs.append, adjudicate=False
+    )
+
+    assert merged == [] and len(failures) == 1
+    assert any("characters.0.evidence: Field required" in line for line in logs)
+    assert any("Exceeded maximum output retries" in line for line in logs)
+
+
+def test_describe_output_failure_includes_retry_prompts():
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+    from pydantic_ai.messages import ModelRequest, RetryPromptPart
+
+    from novelvideo.structured_extraction import describe_output_failure
+
+    messages = [
+        ModelRequest(parts=[RetryPromptPart(content="Please call the final_result tool")]),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content=[
+                        {
+                            "type": "missing",
+                            "loc": ("characters", 0, "evidence"),
+                            "msg": "Field required",
+                            "input": {},
+                        }
+                    ]
+                )
+            ]
+        ),
+    ]
+    exc = UnexpectedModelBehavior("Exceeded maximum output retries (2)")
+
+    text = describe_output_failure(exc, messages)
+
+    assert "Exceeded maximum output retries (2)" in text
+    assert "final_result" in text
+    assert "Field required" in text
+
+
+async def test_appearance_receives_verified_quotes_from_real_extraction_merge():
+    from novelvideo.structured_extraction import (
+        character_appearance_cache_key,
+        enrich_character_appearances,
+    )
+
+    quote = "林默黑发披肩，站在门口。"
+    chunk = _chunk(quote)
+    merged = merge_character_candidates(
+        [(chunk, ChunkCharacterOutput(characters=[_candidate("林默", quotes=[quote])]))]
+    )
+    agent = FakeAppearanceAgent({"林默": _appearance("林默")})
+    await enrich_character_appearances(merged, agent=agent)
+    assert quote in agent.prompts[0]
+    before = character_appearance_cache_key(merged[0])
+    merged[0].evidence[0]["evidence_text"] = "林默短发利落，走进房间。"
+    assert character_appearance_cache_key(merged[0]) != before

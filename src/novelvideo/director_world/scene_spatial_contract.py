@@ -14,7 +14,12 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont
 
 from novelvideo.config import OUTPUT_DIR
-from novelvideo.llm_gateway import call_llm_gateway
+from novelvideo.director_world.scene_analysis_gateway import (
+    SPATIAL_MODEL_ENV,
+    SPATIAL_MODEL,
+    analyze_scene_references,
+    resolve_scene_analysis_model,
+)
 
 # Demo defaults for standalone/manual runs. In production stage_asset_tasks
 # always passes absolute --master/--reverse/--output-dir, so these are never used.
@@ -24,7 +29,7 @@ DEFAULT_SCENE_DIR = PROJECT_DIR / "assets/scenes" / DEFAULT_SCENE_NAME
 DEFAULT_MASTER = DEFAULT_SCENE_DIR / "master.png"
 DEFAULT_REVERSE = DEFAULT_SCENE_DIR / "reverse_master.png"
 DEFAULT_OUTPUT_DIR = DEFAULT_SCENE_DIR / "scene_spatial_contract"
-DEFAULT_MODEL = "DC-scene-spatial-contract-LLM"
+DEFAULT_MODEL = SPATIAL_MODEL
 SPATIAL_CONTRACT_SCHEMA_VERSION = "scene_spatial_contract_v8_topology_only_locks"
 
 
@@ -289,25 +294,16 @@ of inventing a confident wall.
 """.strip()
 
 
-async def ask_openrouter(
-    *,
-    image_path: Path,
-    prompt: str,
-    api_key: str,
-    model: str,
-    max_tokens: int,
-    base_url: str | None = None,
+async def ask_gateway(
+    *, image_path: Path, prompt: str, model: str | None = None, max_tokens: int
 ) -> str:
-    return await call_llm_gateway(
+    return await analyze_scene_references(
+        image_path=image_path,
         prompt=prompt,
-        image_paths=[image_path],
+        model_env=SPATIAL_MODEL_ENV,
+        default_model=DEFAULT_MODEL,
         model=model,
-        api_key_override=api_key or None,
-        base_url_override=base_url,
-        temperature=0.0,
         max_tokens=max_tokens,
-        response_format={"type": "json_object"},
-        timeout_seconds=120.0,
     )
 
 
@@ -1009,6 +1005,9 @@ async def run(args: argparse.Namespace, *, egress_context=None) -> None:
 
     require_direct_model_egress_allowed(egress_context)
     load_env()
+    args.model = resolve_scene_analysis_model(
+        SPATIAL_MODEL_ENV, DEFAULT_MODEL, args.model
+    )
     master = repo_path(args.master)
     reverse = repo_path(args.reverse)
     output_dir = repo_path(args.output_dir)
@@ -1029,13 +1028,9 @@ async def run(args: argparse.Namespace, *, egress_context=None) -> None:
         prompt, encoding="utf-8"
     )
 
-    raw_text = await ask_openrouter(
+    raw_text = await ask_gateway(
         image_path=sheet_path,
         prompt=prompt,
-        api_key=args.api_key,
-        base_url=(args.base_url or "https://openrouter.ai/api/v1")
-        if args.api_key
-        else None,
         model=args.model,
         max_tokens=max(4000, int(args.max_tokens)),
     )
@@ -1052,7 +1047,7 @@ async def run(args: argparse.Namespace, *, egress_context=None) -> None:
         "reverse": str(reverse),
         "sheet": str(sheet_path),
         "overlap_analysis": str(overlap_analysis_path) if overlap_analysis_path else "",
-        "provider": "provider_hub",
+        "provider": "openrouter",
         "model": args.model,
     }
     contract_path = output_dir / "scene_spatial_contract.json"
@@ -1081,19 +1076,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default=(
-            os.environ.get("SCENE_SPATIAL_CONTRACT_MODEL")
-            or os.environ.get("OPENROUTER_VISION_MODEL")
-            or DEFAULT_MODEL
-        ),
+        default=(os.environ.get(SPATIAL_MODEL_ENV) or ""),
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
         default=int(os.environ.get("SCENE_SPATIAL_CONTRACT_MAX_TOKENS") or "16000"),
     )
-    parser.add_argument("--api-key", default="")
-    parser.add_argument("--base-url", default="")
     return parser.parse_args()
 
 

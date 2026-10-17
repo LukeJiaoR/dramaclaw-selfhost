@@ -23,6 +23,7 @@ import {
 const listTasks = vi.fn();
 const awaitTaskCompletion = vi.fn();
 const fetchFreezoneTextGenerateResult = vi.fn();
+const resumePersistedHtmlGeneration = vi.fn();
 
 vi.mock("@/api/tasks", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/api/tasks")>();
@@ -38,6 +39,11 @@ vi.mock("@/api/ops", () => ({
   fetchFreezoneReversePromptResult: vi.fn(),
   fetchFreezoneStoryScriptResult: vi.fn(),
   fetchFreezoneTextGenerateResult: (...args: unknown[]) => fetchFreezoneTextGenerateResult(...args),
+}));
+
+vi.mock("@/features/canvas/application/workflowHtmlRuntime", () => ({
+  resumePersistedHtmlGeneration: (...args: unknown[]) =>
+    resumePersistedHtmlGeneration(...args),
 }));
 
 const TASK_KEY = "freezone_image:job-9";
@@ -68,6 +74,38 @@ function resumableTextNode(extra: Record<string, unknown> = {}): CanvasNode {
       generationTaskKey: "freezone_text_generate:text-job-1",
       generationTaskType: "freezone_text_generate",
       generationTaskJobId: "text-job-1",
+      ...extra,
+    },
+  } as unknown as CanvasNode;
+}
+
+function resumableHtmlNode(extra: Record<string, unknown> = {}): CanvasNode {
+  return {
+    id: "html-1",
+    type: CANVAS_NODE_TYPES.htmlArtifact,
+    position: { x: 0, y: 0 },
+    data: {
+      isGenerating: true,
+      generationTaskKey: "freezone_text_generate:html-job-1",
+      generationTaskType: "freezone_text_generate",
+      generationTaskJobId: "html-job-1",
+      htmlGenerationTitle: "Landing page",
+      htmlGenerationPhase: "generating",
+      ...extra,
+    },
+  } as unknown as CanvasNode;
+}
+
+function resumableComposeNode(extra: Record<string, unknown> = {}): CanvasNode {
+  return {
+    id: "compose-1",
+    type: CANVAS_NODE_TYPES.videoCompose,
+    position: { x: 0, y: 0 },
+    data: {
+      isGenerating: true,
+      generationTaskKey: "task:freezone_video_compose:project:demo:0:compose-job-1",
+      generationTaskType: "freezone_video_compose",
+      generationTaskJobId: "compose-job-1",
       ...extra,
     },
   } as unknown as CanvasNode;
@@ -188,6 +226,76 @@ describe("恢复路径：文本任务按任务类型取回结果", () => {
   });
 });
 
+describe("恢复路径：HTML 文本任务保存为 Artifact", () => {
+  it("刷新后走 HTML 完成器，不把源码写进普通 content 字段", async () => {
+    const taskKey = "freezone_text_generate:html-job-1";
+    listTasks.mockResolvedValue([{ task_key: taskKey, status: "running" }]);
+    awaitTaskCompletion.mockResolvedValue({
+      task_key: taskKey,
+      status: "completed",
+      result: { output_format: "json" },
+    });
+    resumePersistedHtmlGeneration.mockResolvedValue(undefined);
+    const updateNodeData = vi.fn();
+
+    await resumeNodeGeneration({
+      node: resumableHtmlNode(),
+      projectId: "demo",
+      canvasId: "canvas-1",
+      updateNodeData,
+    });
+
+    expect(resumePersistedHtmlGeneration).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nodeId: "html-1",
+        projectId: "demo",
+        canvasId: "canvas-1",
+        jobId: "html-job-1",
+        taskKey,
+      }),
+    );
+    expect(fetchFreezoneTextGenerateResult).not.toHaveBeenCalled();
+    expect(updateNodeData.mock.calls.some(([, value]) => "content" in value)).toBe(false);
+  });
+});
+
+describe("恢复路径：视频合成结果回写原节点", () => {
+  it("刷新后把已完成任务的成片和封面写回合成节点", async () => {
+    const node = resumableComposeNode();
+    const taskKey = String(node.data.generationTaskKey);
+    listTasks.mockResolvedValue([{ task_key: taskKey, status: "completed" }]);
+    awaitTaskCompletion.mockResolvedValue({
+      task_key: taskKey,
+      status: "completed",
+      result: {
+        output_url: "/static/project/freezone/compose-job-1.mp4",
+        cover_url: "/static/project/freezone/compose-job-1.png",
+      },
+    });
+    const updateNodeData = vi.fn();
+
+    await resumeNodeGeneration({
+      node,
+      projectId: "demo",
+      updateNodeData,
+    });
+
+    const calls = updateNodeData.mock.calls;
+    const patch = calls[calls.length - 1]?.[1] as Record<string, unknown>;
+    expect(patch).toMatchObject({
+      resultVideoUrl: "/static/project/freezone/compose-job-1.mp4",
+      previewImageUrl: "/static/project/freezone/compose-job-1.png",
+      resultVideoTaskKey: taskKey,
+      resultVideoJobId: "compose-job-1",
+      isGenerating: false,
+      generationTaskKey: null,
+      generationTaskType: null,
+      generationTaskJobId: null,
+      generationError: null,
+    });
+  });
+});
+
 describe("恢复路径：旧会话的 generationJobId 不许抢跑", () => {
   it("旧 session jobId + 完整 descriptor：不轮询，清死 id，resume 独占", () => {
     const node = resumableNode({
@@ -245,5 +353,49 @@ describe("恢复路径：旧会话的 generationJobId 不许抢跑", () => {
 
     expect(nodeOwnsLiveGenerationJob(node)).toBe(false);
     expect(staleGenerationJobPatch(node)).toBeNull();
+  });
+});
+
+describe("恢复路径：旧任务不能覆盖同一节点的新任务", () => {
+  it("旧视频结果晚到时保留新任务的生成态和句柄", async () => {
+    const oldTaskKey = "freezone_video_upscale:old-job";
+    const newTaskKey = "freezone_video_upscale:new-job";
+    const node = {
+      ...resumableNode(),
+      type: CANVAS_NODE_TYPES.video,
+      data: {
+        isGenerating: true,
+        generationTaskKey: oldTaskKey,
+        generationTaskType: "freezone_video_upscale",
+        generationTaskJobId: "old-job",
+        videoUrl: "previous.mp4",
+      },
+    } as unknown as CanvasNode;
+    const currentData = { ...node.data } as Record<string, unknown>;
+    listTasks.mockResolvedValue([{ task_key: oldTaskKey, status: "running" }]);
+    let finishOldTask!: (value: unknown) => void;
+    awaitTaskCompletion.mockImplementation(() => new Promise((resolve) => {
+      finishOldTask = resolve;
+    }));
+    const updateNodeData = vi.fn();
+
+    const pending = resumeNodeGeneration({
+      node,
+      projectId: "demo",
+      updateNodeData,
+      getNodeData: () => currentData,
+    });
+    await vi.waitFor(() => expect(awaitTaskCompletion).toHaveBeenCalledOnce());
+    currentData.generationTaskKey = newTaskKey;
+    finishOldTask({
+      task_key: oldTaskKey,
+      status: "completed",
+      result: { output_url: "previous.mp4" },
+    });
+    await pending;
+
+    expect(updateNodeData).not.toHaveBeenCalled();
+    expect(currentData.generationTaskKey).toBe(newTaskKey);
+    expect(currentData.isGenerating).toBe(true);
   });
 });

@@ -17,8 +17,16 @@ def task_backend() -> str:
 
 
 def edition() -> str:
+    """Resolve CE by default; a control-plane DSN selects EE when unspecified.
+
+    Preserve explicit values so bootstrap can reject conflicting or invalid
+    configuration instead of silently falling back to a different edition.
+    """
     _load_env()
-    return os.environ.get("ST_EDITION", "").strip().lower()
+    configured = os.environ.get("ST_EDITION", "").strip().lower()
+    if configured:
+        return configured
+    return "ee" if os.environ.get("ST_CONTROL_PLANE_DSN", "").strip() else "ce"
 
 
 def is_ce() -> bool:
@@ -27,6 +35,15 @@ def is_ce() -> bool:
 
 def is_ce_effective() -> bool:
     return edition() == "ce" and not os.environ.get("ST_CONTROL_PLANE_DSN", "").strip()
+
+
+def uses_local_ce_runtime() -> bool:
+    """Return whether local CE-owned settings should back the current process.
+
+    The CE checkout historically runs without requiring ``ST_EDITION=ce``.
+    An explicit EE edition or a control-plane DSN selects the EE boundary.
+    """
+    return edition() != "ee" and not os.environ.get("ST_CONTROL_PLANE_DSN", "").strip()
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

@@ -167,8 +167,12 @@ def _install_ports(monkeypatch, credential_port, operation_port) -> None:
 
 
 @pytest.mark.asyncio
-async def test_audio_runner_propagates_same_trusted_context_to_beat_leaf(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("kind", "forwarded"),
+    [("organization", True), ("platform", False), ("local", False)],
+)
+async def test_audio_runner_forwards_only_organization_context_to_beat_leaf(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str, forwarded: bool
 ) -> None:
     from novelvideo.egress_context import (
         TRUSTED_EGRESS_CONTEXT_KEY,
@@ -178,7 +182,7 @@ async def test_audio_runner_propagates_same_trusted_context_to_beat_leaf(
     import novelvideo.audio.indextts2_beat_audio_task as beat_task
     import novelvideo.sqlite_store as sqlite_store
 
-    context = _context()
+    context = _context(kind)
     captured: dict = {}
 
     class Store:
@@ -232,7 +236,8 @@ async def test_audio_runner_propagates_same_trusted_context_to_beat_leaf(
 
     await audio_runner._run_indextts2_audio(envelope, ctx)
 
-    assert captured["egress_context"] is context
+    # 与 freezone 的叶子分发同理：平台与本地任务不带组织出网身份，否则 IndexTTS2 会判 ORG_EGRESS_DENIED。
+    assert captured.get("egress_context") is (context if forwarded else None)
 
 
 @pytest.mark.asyncio
@@ -279,6 +284,58 @@ async def test_eg15a_organization_uses_exact_gateway_credential_after_claim(
     assert captured["headers"]["Authorization"] == "Bearer org-secret-key"
     assert credential_port.admissions[0].credential == _context().credential
     assert operation_port.specs[0].credential_version == 3
+
+
+@pytest.mark.asyncio
+async def test_freezone_newapi_audio_treats_trusted_platform_context_as_platform_egress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from novelvideo.freezone import audio_node
+
+    events: list[str] = []
+    captured: dict = {}
+    monkeypatch.setattr(
+        "novelvideo.config.get_newapi_runtime_credentials",
+        lambda **_kwargs: ("platform-secret", "https://platform.example/v1"),
+    )
+    monkeypatch.setattr(
+        "httpx.AsyncClient",
+        lambda **_kwargs: _AsyncClient(events, [_Response()], captured),
+    )
+
+    output_path = tmp_path / "platform-music.mp3"
+    await audio_node._write_newapi_audio_speech(
+        output_path=output_path,
+        model="LingShan-MU-11",
+        input_text="quiet piano",
+        egress_context=_context("platform"),
+        business_task_id="music-1",
+    )
+
+    assert output_path.read_bytes() == b"audio"
+    assert events == ["post"]
+    assert captured["endpoint"] == "https://platform.example/v1/audio/speech"
+    assert captured["headers"]["Authorization"] == "Bearer platform-secret"
+
+
+@pytest.mark.asyncio
+async def test_freezone_newapi_audio_still_rejects_untrusted_egress_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from novelvideo.freezone import audio_node
+
+    monkeypatch.setattr(
+        "httpx.AsyncClient",
+        lambda **_kwargs: pytest.fail("untrusted context must not reach transport"),
+    )
+
+    with pytest.raises(RuntimeError, match="ORG_EGRESS_DENIED"):
+        await audio_node._write_newapi_audio_speech(
+            output_path=tmp_path / "forged.mp3",
+            model="LingShan-MU-11",
+            input_text="quiet piano",
+            egress_context=SimpleNamespace(is_organization=False),
+        )
 
 
 @pytest.mark.asyncio

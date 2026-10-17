@@ -9,6 +9,8 @@ on:
 
 jobs:
   sync:
+    # These destinations belong to upstream, never to a selfhost fork.
+    if: ${{ github.repository == 'dramaclaw/dramaclaw' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
 

@@ -109,6 +109,7 @@ export class BillingRuleNotConfiguredError extends BackendStatusError {
 // i18n-exempt-start
 function queueLabelForPlainMessage(queueKind: string): string {
   if (queueKind === "default") return "默认";
+  if (queueKind === "image") return "图片";
   if (queueKind === "video") return "视频";
   if (queueKind === "world") return "世界";
   if (queueKind === "ffmpeg") return "合成";
@@ -238,6 +239,18 @@ export function errorFromBackendBody(status: number, body: unknown, fallback: st
   if (typeof detail === "string" && detail.trim()) {
     return new BackendStatusError(detail, status, body);
   }
+  // FastAPI HTTPException 带结构化 detail（如技能接口的 SkillErrorEnvelope）。
+  if (detail && typeof detail === "object") {
+    const { message: detailMessage, user_action_hint: hint } = detail as {
+      message?: unknown;
+      user_action_hint?: unknown;
+    };
+    if (typeof detailMessage === "string" && detailMessage.trim()) {
+      const text =
+        typeof hint === "string" && hint.trim() ? `${detailMessage} ${hint}` : detailMessage;
+      return new BackendStatusError(text, status, body);
+    }
+  }
   return null;
 }
 
@@ -255,7 +268,9 @@ async function safeJsonFromResponse(response: Response): Promise<unknown> {
 
 async function backendError(error: unknown): Promise<Error | null> {
   if (!(error instanceof HTTPError)) return null;
-  const body = await safeJsonFromResponse(error.response);
+  // ky 2 会先把错误响应体解析到 error.data（此时 response 已读完），与 api/client 的 beforeError 一致。
+  const data = (error as HTTPError & { data?: unknown }).data;
+  const body = data !== undefined ? data : await safeJsonFromResponse(error.response);
   return errorFromBackendBody(error.response.status, body, error.message);
 }
 
@@ -289,7 +304,12 @@ export async function jsonWithBackendError<T>(request: Promise<Response>): Promi
  * to tell the two apart so users don't read a policy block as "try again in a
  * bit". Order matters: check the policy signal before the bare-429 signal.
  */
-export type GatewayErrorKind = "channel_policy" | "rate_limit";
+export type GatewayErrorKind =
+  | "channel_policy"
+  | "rate_limit"
+  | "input_content_policy"
+  | "output_content_policy"
+  | "content_policy";
 
 function parseJsonValueAt(text: string, start: number): unknown | null {
   const opener = text[start];
@@ -437,6 +457,20 @@ export function classifyGatewayError(
   if (/channel[_-]?policy/i.test(raw) || /_skipped\b/i.test(raw)) {
     return "channel_policy";
   }
+  if (/InputImageSensitiveContentDetected/i.test(raw)) {
+    return "input_content_policy";
+  }
+  if (/Output(?:Video|Image)SensitiveContentDetected/i.test(raw)) {
+    return "output_content_policy";
+  }
+  if (
+    /content[_-]?policy[_-]?violation/i.test(raw)
+    || /moderation[_-]?blocked/i.test(raw)
+    || /failed safety review/i.test(raw)
+    || /内容未通过安全审核/i.test(raw)
+  ) {
+    return "content_policy";
+  }
   // Genuine upstream limit. `HTTP 429` is how run_core stamps the status.
   if (/\bHTTP 429\b/.test(raw) || /\b429\b.*rate/i.test(raw)) {
     return "rate_limit";
@@ -464,6 +498,12 @@ export function humanizeTaskError(
   switch (classifyGatewayError(raw)) {
     case "channel_policy":
       return t("common.generationChannelPolicyBlocked", { defaultValue: fallback });
+    case "input_content_policy":
+      return t("common.generationInputContentPolicyBlocked", { defaultValue: fallback });
+    case "output_content_policy":
+      return t("common.generationOutputContentPolicyBlocked", { defaultValue: fallback });
+    case "content_policy":
+      return t("common.generationContentPolicyBlocked", { defaultValue: fallback });
     case "rate_limit":
       return t("common.generationRateLimited", { defaultValue: fallback });
     default:
@@ -503,9 +543,7 @@ export function backendErrorToastMessage(error: unknown, t: TFunction): string {
     });
   }
   if (error instanceof Error && error.message) {
-    const reviewMessage = humanReviewAssetMessage(error.message, t);
-    if (reviewMessage) return reviewMessage;
-    return providerErrorMessage(error.message) ?? error.message;
+    return humanizeTaskError(error.message, t);
   }
   return t("common.error");
 }
