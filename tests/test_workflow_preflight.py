@@ -41,7 +41,7 @@ def test_recommended_model_materializes_one_scoped_catalog_configuration():
     catalog = [
         {"id": "first-but-not-default", "ratioOptions": ["9:16"],
          "resolutionOptions": ["1K"], "qualityOptions": ["medium"]},
-        {"id": "LingShan-G2", "aliases": ["newapi_gpt_image2"],
+        {"id": "DC-image", "aliases": ["provider_hub_image"],
          "ratioOptions": ["9:16"], "resolutionOptions": ["2K", "1K"],
          "qualityOptions": ["high", "medium"]},
     ]
@@ -52,7 +52,7 @@ def test_recommended_model_materializes_one_scoped_catalog_configuration():
     )
     assert result["status"] == "ready"
     assert plan["nodes"][0]["data"] == {
-        "model": "LingShan-G2", "aspectRatio": "9:16", "size": "1K",
+        "model": "DC-image", "aspectRatio": "9:16", "size": "1K",
         "quality": "medium", "count": 1,
     }
 
@@ -65,7 +65,7 @@ def test_recommended_model_rejects_incompatible_explicit_ratio():
     result = evaluate_workflow_preflight(
         {"plan": plan},
         model_responses={"imageGenNode": {"ok": True, "data": [{
-            "id": "LingShan-G2", "aliases": ["newapi_gpt_image2"],
+            "id": "DC-image", "aliases": ["provider_hub_image"],
             "ratioOptions": ["9:16"], "resolutionOptions": ["1K"],
         }]}},
         limits={"ok": True, "data": {"default": {"limit": 2, "remaining": 1}}},
@@ -85,7 +85,7 @@ def test_recommended_model_keeps_explicit_catalog_supported_tenant_options():
     result = evaluate_workflow_preflight(
         {"plan": plan},
         model_responses={"imageGenNode": {"ok": True, "data": [{
-            "id": "LingShan-G2", "aliases": ["newapi_gpt_image2"],
+            "id": "DC-image", "aliases": ["provider_hub_image"],
             "ratioOptions": ["21:9"], "resolutionOptions": ["3K"],
             "qualityOptions": ["ultra"],
         }]}},
@@ -93,7 +93,7 @@ def test_recommended_model_keeps_explicit_catalog_supported_tenant_options():
     )
     assert result["status"] == "ready"
     assert plan["nodes"][0]["data"] == {
-        "model": "LingShan-G2", "aspectRatio": "21:9",
+        "model": "DC-image", "aspectRatio": "21:9",
         "size": "3K", "quality": "ultra", "count": 1,
     }
 
@@ -173,14 +173,14 @@ def test_recommended_image_without_catalog_ratio_options_still_resolves():
     result = evaluate_workflow_preflight(
         {"plan": plan},
         model_responses={"imageGenNode": {"ok": True, "data": [{
-            "id": "LingShan-G2", "aliases": ["newapi_gpt_image2"],
+            "id": "DC-image", "aliases": ["provider_hub_image"],
             "resolutionOptions": ["1K"], "qualityOptions": ["medium"],
         }]}},
         limits={"ok": True, "data": {"default": {"limit": 2, "remaining": 1}}},
     )
     assert result["status"] == "ready", result["blockers"]
     assert plan["nodes"][0]["data"] == {
-        "model": "LingShan-G2", "aspectRatio": "9:16", "size": "1K",
+        "model": "DC-image", "aspectRatio": "9:16", "size": "1K",
         "quality": "medium", "count": 1,
     }
 

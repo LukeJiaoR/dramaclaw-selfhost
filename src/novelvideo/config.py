@@ -1068,13 +1068,15 @@ SCENE_ASSET_PROVIDER = os.environ.get("SCENE_ASSET_PROVIDER") or NANOBANANA_PROV
 SCENE_ASSET_MODEL = os.environ.get("SCENE_ASSET_MODEL", "")
 OPENAI_IMAGE_QUALITY = os.environ.get("OPENAI_IMAGE_QUALITY", "medium")
 OPENAI_SKETCH_IMAGE_QUALITY = os.environ.get("OPENAI_SKETCH_IMAGE_QUALITY", "low")
+# Selfhost product default, shared by pipeline fallbacks and Freezone entrypoints.
+SELFHOST_DEFAULT_IMAGE_SELECTION = "provider_hub_image"
 _DEFAULT_SKETCH_SELECTION_EXPLICIT = "DEFAULT_SKETCH_IMAGE_SELECTION" in os.environ
 _DEFAULT_RENDER_SELECTION_EXPLICIT = "DEFAULT_RENDER_IMAGE_SELECTION" in os.environ
 DEFAULT_SKETCH_IMAGE_SELECTION = os.environ.get(
-    "DEFAULT_SKETCH_IMAGE_SELECTION", "newapi_gpt_image2"
+    "DEFAULT_SKETCH_IMAGE_SELECTION", SELFHOST_DEFAULT_IMAGE_SELECTION
 )
 DEFAULT_RENDER_IMAGE_SELECTION = os.environ.get(
-    "DEFAULT_RENDER_IMAGE_SELECTION", "newapi_gpt_image2"
+    "DEFAULT_RENDER_IMAGE_SELECTION", SELFHOST_DEFAULT_IMAGE_SELECTION
 )
 CHARACTER_IMAGE_SELECTION = os.environ.get(
     "CHARACTER_IMAGE_SELECTION"
@@ -1222,7 +1224,7 @@ def _default_image_generation_selection(fallback: str | None = None) -> str:
         fallback,
         DEFAULT_SKETCH_IMAGE_SELECTION,
         DEFAULT_RENDER_IMAGE_SELECTION,
-        "newapi_gpt_image2",
+        SELFHOST_DEFAULT_IMAGE_SELECTION,
         *VISIBLE_IMAGE_GENERATION_SELECTION_KEYS,
     ):
         selection = _visible_image_generation_selection(candidate)

@@ -18,6 +18,9 @@ from typing import Any, Iterable
 
 from PIL import Image
 
+from novelvideo.config import (
+    SELFHOST_DEFAULT_IMAGE_SELECTION as FREEZONE_PRESET_DEFAULT_IMAGE_MODEL,
+)
 from novelvideo.config import IMAGE_DEFAULT_STYLE as PROP_REF_DEFAULT_STYLE
 from novelvideo.freezone.skill_registry import SKILL_SCHEMA_VERSION
 from novelvideo.generators.nanobanana_prop import build_prop_reference_prompt
@@ -48,7 +51,6 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm"}
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg"}
 TEXT_EXTS = {".json", ".txt", ".md"}
-FREEZONE_PRESET_DEFAULT_IMAGE_MODEL = "newapi_gpt_image2"
 FREEZONE_PRESET_IMAGE_ASPECT_RATIOS = (
     "1:1",
     "16:9",

@@ -21,7 +21,10 @@ from novelvideo.api.schemas import (
     FreezoneRelightRequest,
     FreezoneTemplateEditRequest,
 )
-from novelvideo.config import IMAGE_GENERATION_SELECTIONS
+from novelvideo.config import (
+    IMAGE_GENERATION_SELECTIONS,
+    SELFHOST_DEFAULT_IMAGE_SELECTION as FREEZONE_DEFAULT_IMAGE_SELECTION,
+)
 from novelvideo.freezone.paths import resolve_static_url_to_path, safe_upload_filename, uploads_dir
 from novelvideo.freezone.style_templates import (
     get_style_manifest_version,
@@ -32,8 +35,10 @@ from novelvideo.task_identity import task_state_key
 
 logger = logging.getLogger(__name__)
 
-FREEZONE_DEFAULT_IMAGE_SELECTION = "newapi_gpt_image2"
 FREEZONE_DEFAULT_IMAGE_MODEL = FREEZONE_DEFAULT_IMAGE_SELECTION
+FREEZONE_DEFAULT_IMAGE_PROVIDER = IMAGE_GENERATION_SELECTIONS[
+    FREEZONE_DEFAULT_IMAGE_SELECTION
+]["provider"]
 SUPPORTED_FREEZONE_IMAGE_PROVIDERS = {
     "huimeng",
     "newapi",
@@ -67,7 +72,7 @@ def resolve_freezone_image_provider(
         normalized = provider.strip().lower()
         if normalized not in SUPPORTED_FREEZONE_IMAGE_PROVIDERS:
             if not strict:
-                return "newapi"
+                return FREEZONE_DEFAULT_IMAGE_PROVIDER
             raise HTTPException(
                 400,
                 "unsupported freezone image provider: "
@@ -75,7 +80,7 @@ def resolve_freezone_image_provider(
             )
         return normalized
 
-    return "newapi"
+    return FREEZONE_DEFAULT_IMAGE_PROVIDER
 
 
 def new_freezone_job_id() -> str:
